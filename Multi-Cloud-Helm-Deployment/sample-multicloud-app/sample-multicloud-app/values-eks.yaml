@@ -1,0 +1,19 @@
+# EKS profile — routes through the AWS Load Balancer Controller (ALB).
+#
+# PREREQUISITE: the AWS Load Balancer Controller must already be installed
+# in the cluster (its own Helm chart: eks/aws-load-balancer-controller),
+# with IRSA (IAM Roles for Service Accounts) configured so the controller
+# can provision ALBs/NLBs on your behalf. This chart does not install the
+# controller itself.
+
+ingress:
+  controller: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    # alb.ingress.kubernetes.io/certificate-arn: "<acm-certificate-arn>"
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: "<waf-acl-arn>"
+
+# target-type: ip means the ALB targets pod IPs directly — a plain
+# ClusterIP Service (the default) works fine, no NodePort needed.

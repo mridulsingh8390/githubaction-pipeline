@@ -1,0 +1,63 @@
+# Default values — cloud-agnostic. Override with -f values-<provider>.yaml
+# or --set ingress.controller=<agic|alb|gce|nginx> to target a specific
+# provider's native ingress controller instead.
+
+replicaCount: 2
+
+image:
+  repository: "" # e.g. myacr.azurecr.io/my-app — set via --set image.repository
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+containerPort: 8080
+
+service:
+  type: ClusterIP
+  port: 80
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 70
+
+ingress:
+  enabled: true
+  # Which ingress controller's conventions to use for annotations/class.
+  # One of: nginx | agic | alb | gce
+  # Default is nginx — the only option that requires no cloud-specific
+  # controller to already be installed/provisioned in the cluster.
+  controller: nginx
+  host: "app.example.com"
+  path: /
+  tls:
+    enabled: false
+    secretName: ""
+  # Extra annotations merged on top of (and overriding) the controller
+  # preset below. Use this for things like TLS cert issuer annotations,
+  # WAF policy references, etc.
+  annotations: {}
+
+# Extra annotations applied to the Service, used only when needed by a
+# specific controller (e.g. GKE container-native load balancing).
+serviceAnnotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  # Annotations for cloud workload identity binding — e.g.
+  # eks.amazonaws.com/role-arn (EKS/IRSA), iam.gke.io/gcp-service-account
+  # (GKE Workload Identity), azure.workload.identity/client-id (AKS).
+  annotations: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

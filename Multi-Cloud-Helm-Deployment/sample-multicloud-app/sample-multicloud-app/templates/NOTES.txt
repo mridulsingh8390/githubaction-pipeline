@@ -1,0 +1,20 @@
+{{ .Chart.Name }} deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Ingress controller profile in use: {{ .Values.ingress.controller }}
+
+{{- if .Values.ingress.enabled }}
+Ingress host: {{ .Values.ingress.host }}
+
+IMPORTANT: this chart assumes an IngressClass named
+"{{ include "sample-multicloud-app.ingressClassName" . }}" already exists in
+this cluster (created when you installed AGIC / AWS Load Balancer Controller
+/ ingress-nginx, or built-in for GKE's "gce" class). If your cluster's
+IngressClass has a different name, override it or edit
+templates/_helpers.tpl.
+
+Check propagation with:
+  kubectl get ingress {{ include "sample-multicloud-app.fullname" . }} -n {{ .Release.Namespace }}
+{{- else }}
+Ingress is disabled (ingress.enabled=false) — access the app via
+`kubectl port-forward` or a LoadBalancer/NodePort Service instead.
+{{- end }}

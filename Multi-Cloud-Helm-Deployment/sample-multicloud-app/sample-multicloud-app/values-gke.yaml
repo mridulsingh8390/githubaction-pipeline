@@ -1,0 +1,19 @@
+# GKE profile — routes through GKE's built-in Ingress-GCE controller,
+# which provisions a native GCP HTTP(S) Load Balancer.
+#
+# NO SEPARATE INSTALL NEEDED: unlike AGIC/ALB, this controller ships
+# enabled by default on standard GKE clusters (VPC-native / IP-alias
+# clusters) — nothing extra to provision here.
+
+ingress:
+  controller: gce
+  annotations:
+    kubernetes.io/ingress.allow-http: "true"
+    # networking.gke.io/managed-certificates: "<managed-cert-name>"   # for GKE-managed TLS certs
+    # networking.gke.io/v1beta1.FrontendConfig: "<frontendconfig-name>" # for HTTPS redirect / SSL policy
+    # kubernetes.io/ingress.class: "gce"   # implied automatically by the annotations below
+
+# Enables container-native load balancing (NEGs) so the GCP load balancer
+# targets pod IPs directly instead of requiring a NodePort Service.
+serviceAnnotations:
+  cloud.google.com/neg: '{"ingress": true}'

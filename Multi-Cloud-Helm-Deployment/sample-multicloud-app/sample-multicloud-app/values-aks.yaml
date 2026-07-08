@@ -1,0 +1,15 @@
+# AKS profile — routes through the Application Gateway Ingress Controller (AGIC).
+#
+# PREREQUISITE: AGIC must already be running in the cluster. Either enable
+# the AKS add-on:
+#   az aks enable-addons --addons ingress-appgw --resource-group <rg> \
+#     --name <cluster> --appgw-id <application-gateway-resource-id>
+# or install the AGIC Helm chart separately pointing at an existing
+# Application Gateway. This chart does not install AGIC itself.
+
+ingress:
+  controller: agic
+  annotations:
+    appgw.ingress.kubernetes.io/backend-protocol: "http"
+    appgw.ingress.kubernetes.io/request-timeout: "30"
+    # appgw.ingress.kubernetes.io/waf-policy-for-path: "<resource-id-of-waf-policy>"

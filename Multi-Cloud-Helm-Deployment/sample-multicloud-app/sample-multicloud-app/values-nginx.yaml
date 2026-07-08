@@ -1,0 +1,16 @@
+# NGINX Ingress Controller profile — cloud-agnostic, identical behavior on
+# AKS, EKS, or GKE. This is also the chart's default, kept here explicitly
+# so you can pass -f values-nginx.yaml to force it regardless of provider.
+#
+# PREREQUISITE: the ingress-nginx controller must already be installed in
+# the cluster:
+#   helm install ingress-nginx ingress-nginx/ingress-nginx \
+#     --namespace ingress-nginx --create-namespace
+# This chart does not install the controller itself.
+
+ingress:
+  controller: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    # nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    # cert-manager.io/cluster-issuer: "letsencrypt-prod"   # if using cert-manager for TLS

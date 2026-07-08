@@ -1,0 +1,350 @@
+name: Multi-Cloud Kubernetes Cluster Creation (AKS / EKS / GKE)
+
+# Creates a cluster on AKS, EKS, or GKE based on clusterProvider, then
+# optionally installs an ingress controller so the deploy-multicloud-helm.yml
+# pipeline (and sample-multicloud-app chart) work immediately afterward.
+#
+# NOTE ON GITHUB ACTIONS UI LIMITATION:
+# workflow_dispatch forms cannot show/hide fields conditionally. All
+# provider-specific inputs are always visible; fill in only the block
+# matching your chosen provider.
+#
+# REQUIRED SECRETS (only the set matching your provider is needed):
+#   AKS: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   EKS: AWS_CLUSTER_ADMIN_ROLE_ARN (needs broad EKS/EC2/IAM permissions —
+#        cluster creation is more privileged than deploy/upgrade)
+#   GKE: GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT
+
+on:
+  workflow_dispatch:
+    inputs:
+      clusterProvider:
+        description: "Which managed Kubernetes service to create a cluster on"
+        required: true
+        type: choice
+        default: "aks"
+        options:
+          - aks
+          - eks
+          - gke
+      kubernetesVersion:
+        description: "Kubernetes version to pin (blank = provider default/latest). Recommend an OLDER version if you plan to test the upgrade pipeline afterward."
+        required: false
+        default: ""
+        type: string
+      nodeCount:
+        description: "Number of worker nodes"
+        required: false
+        default: "2"
+        type: string
+      ingressController:
+        description: "Ingress controller to install after cluster creation"
+        required: true
+        type: choice
+        default: "nginx"
+        options:
+          - nginx
+          - native
+          - none
+
+      # --- AKS-specific ---
+      aksResourceGroup:
+        description: "[AKS] Resource group to create/use"
+        required: false
+        type: string
+      aksClusterName:
+        description: "[AKS] Cluster name"
+        required: false
+        type: string
+      aksLocation:
+        description: "[AKS] Azure region"
+        required: false
+        default: "eastus"
+        type: string
+      aksNodeVmSize:
+        description: "[AKS] Node VM size"
+        required: false
+        default: "Standard_DS2_v2"
+        type: string
+
+      # --- EKS-specific ---
+      eksClusterName:
+        description: "[EKS] Cluster name"
+        required: false
+        type: string
+      awsRegion:
+        description: "[EKS] AWS region"
+        required: false
+        default: "us-east-1"
+        type: string
+      eksNodeType:
+        description: "[EKS] Node instance type"
+        required: false
+        default: "t3.medium"
+        type: string
+
+      # --- GKE-specific ---
+      gkeClusterName:
+        description: "[GKE] Cluster name"
+        required: false
+        type: string
+      gkeLocation:
+        description: "[GKE] Zone or region (e.g. us-central1-a)"
+        required: false
+        default: "us-central1-a"
+        type: string
+      gcpProject:
+        description: "[GKE] GCP project ID"
+        required: false
+        type: string
+      gkeMachineType:
+        description: "[GKE] Node machine type"
+        required: false
+        default: "e2-medium"
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: cluster-create-${{ inputs.clusterProvider }}-${{ inputs.aksClusterName }}${{ inputs.eksClusterName }}${{ inputs.gkeClusterName }}
+  cancel-in-progress: false
+
+jobs:
+  create-cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: cluster-create-approval # configure required reviewers in repo settings; remove this block if unattended creation is fine
+    steps:
+      - name: Validate required inputs for selected provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.clusterProvider }}" in
+            aks)
+              [ -n "${{ inputs.aksResourceGroup }}" ] && [ -n "${{ inputs.aksClusterName }}" ] || { echo "::error::aksResourceGroup and aksClusterName are required for AKS."; exit 1; }
+              ;;
+            eks)
+              [ -n "${{ inputs.eksClusterName }}" ] || { echo "::error::eksClusterName is required for EKS."; exit 1; }
+              ;;
+            gke)
+              [ -n "${{ inputs.gkeClusterName }}" ] && [ -n "${{ inputs.gcpProject }}" ] || { echo "::error::gkeClusterName and gcpProject are required for GKE."; exit 1; }
+              ;;
+          esac
+
+      - name: Azure login (OIDC)
+        if: inputs.clusterProvider == 'aks'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: AWS login (OIDC)
+        if: inputs.clusterProvider == 'eks'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CLUSTER_ADMIN_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: GCP login (Workload Identity Federation)
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install eksctl
+        if: inputs.clusterProvider == 'eks'
+        run: |
+          curl -sL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" | tar xz -C /tmp
+          sudo mv /tmp/eksctl /usr/local/bin
+
+      # ============================================================
+      # CLUSTER CREATION
+      # ============================================================
+      - name: Create AKS cluster
+        if: inputs.clusterProvider == 'aks'
+        shell: bash
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+          LOCATION: ${{ inputs.aksLocation }}
+          VM_SIZE: ${{ inputs.aksNodeVmSize }}
+          NODE_COUNT: ${{ inputs.nodeCount }}
+          K8S_VERSION: ${{ inputs.kubernetesVersion }}
+        run: |
+          set -euo pipefail
+          az group create --name "$RG" --location "$LOCATION"
+
+          VERSION_FLAG=""
+          [ -n "$K8S_VERSION" ] && VERSION_FLAG="--kubernetes-version $K8S_VERSION"
+
+          az aks create \
+            --resource-group "$RG" \
+            --name "$CLUSTER" \
+            --location "$LOCATION" \
+            $VERSION_FLAG \
+            --node-count "$NODE_COUNT" \
+            --node-vm-size "$VM_SIZE" \
+            --generate-ssh-keys \
+            --enable-oidc-issuer \
+            --enable-workload-identity
+
+          az aks get-credentials --resource-group "$RG" --name "$CLUSTER" --overwrite-existing
+
+      - name: Create EKS cluster
+        if: inputs.clusterProvider == 'eks'
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+          NODE_TYPE: ${{ inputs.eksNodeType }}
+          NODE_COUNT: ${{ inputs.nodeCount }}
+          K8S_VERSION: ${{ inputs.kubernetesVersion }}
+        run: |
+          set -euo pipefail
+          VERSION_FLAG=""
+          [ -n "$K8S_VERSION" ] && VERSION_FLAG="--version $K8S_VERSION"
+
+          # --with-oidc sets up the IAM OIDC provider on the cluster, which
+          # is a prerequisite for IRSA (used later if ingressController=native).
+          eksctl create cluster \
+            --name "$CLUSTER" \
+            --region "$REGION" \
+            $VERSION_FLAG \
+            --nodegroup-name "${CLUSTER}-ng" \
+            --node-type "$NODE_TYPE" \
+            --nodes "$NODE_COUNT" \
+            --managed \
+            --with-oidc
+
+      - name: Create GKE cluster
+        if: inputs.clusterProvider == 'gke'
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+          MACHINE_TYPE: ${{ inputs.gkeMachineType }}
+          NODE_COUNT: ${{ inputs.nodeCount }}
+          K8S_VERSION: ${{ inputs.kubernetesVersion }}
+        run: |
+          set -euo pipefail
+          VERSION_FLAG=""
+          [ -n "$K8S_VERSION" ] && VERSION_FLAG="--cluster-version=$K8S_VERSION"
+
+          gcloud container clusters create "$CLUSTER" \
+            --zone "$LOCATION" \
+            --project "$PROJECT" \
+            $VERSION_FLAG \
+            --num-nodes "$NODE_COUNT" \
+            --machine-type "$MACHINE_TYPE" \
+            --release-channel None \
+            --no-enable-autoupgrade \
+            --enable-ip-alias \
+            --workload-pool="${PROJECT}.svc.id.goog"
+
+          gcloud container clusters get-credentials "$CLUSTER" --zone "$LOCATION" --project "$PROJECT"
+
+      # ============================================================
+      # INGRESS CONTROLLER SETUP
+      # ============================================================
+      - name: Install GKE auth plugin
+        if: inputs.clusterProvider == 'gke'
+        run: sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk-gke-gcloud-auth-plugin
+
+      - name: Setup kubectl
+        if: inputs.ingressController != 'none'
+        uses: azure/setup-kubectl@v4
+
+      - name: Setup Helm
+        if: inputs.ingressController == 'nginx'
+        uses: azure/setup-helm@v4
+
+      - name: Install NGINX Ingress Controller
+        if: inputs.ingressController == 'nginx'
+        run: |
+          set -euo pipefail
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+          helm repo update
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+            --namespace ingress-nginx --create-namespace \
+            --wait --timeout 10m
+
+      - name: Enable AGIC add-on (AKS native ingress)
+        if: inputs.ingressController == 'native' && inputs.clusterProvider == 'aks'
+        shell: bash
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+        run: |
+          set -euo pipefail
+          # Creates a new Application Gateway automatically in this subnet range.
+          az aks enable-addons \
+            --resource-group "$RG" \
+            --name "$CLUSTER" \
+            --addons ingress-appgw \
+            --appgw-subnet-cidr "10.2.0.0/16"
+
+      - name: Install AWS Load Balancer Controller (EKS native ingress)
+        if: inputs.ingressController == 'native' && inputs.clusterProvider == 'eks'
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+        run: |
+          set -euo pipefail
+          curl -o iam-policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+
+          POLICY_ARN="$(aws iam create-policy \
+            --policy-name AWSLoadBalancerControllerIAMPolicy-${CLUSTER} \
+            --policy-document file://iam-policy.json \
+            --query 'Policy.Arn' --output text 2>/dev/null || \
+            aws iam list-policies --query "Policies[?PolicyName=='AWSLoadBalancerControllerIAMPolicy-${CLUSTER}'].Arn" --output text)"
+
+          eksctl create iamserviceaccount \
+            --cluster="$CLUSTER" \
+            --region="$REGION" \
+            --namespace=kube-system \
+            --name=aws-load-balancer-controller \
+            --attach-policy-arn="$POLICY_ARN" \
+            --approve \
+            --override-existing-serviceaccounts
+
+          VPC_ID="$(aws eks describe-cluster --name "$CLUSTER" --region "$REGION" --query 'cluster.resourcesVpcConfig.vpcId' --output text)"
+
+          helm repo add eks https://aws.github.io/eks-charts
+          helm repo update
+          helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+            --namespace kube-system \
+            --set clusterName="$CLUSTER" \
+            --set serviceAccount.create=false \
+            --set serviceAccount.name=aws-load-balancer-controller \
+            --set region="$REGION" \
+            --set vpcId="$VPC_ID" \
+            --wait --timeout 10m
+
+      - name: GKE native ingress note
+        if: inputs.ingressController == 'native' && inputs.clusterProvider == 'gke'
+        run: echo "GKE's Ingress-GCE controller is built in by default on standard clusters — nothing to install."
+
+      - name: Cluster creation summary
+        if: always()
+        run: |
+          {
+            echo "## Cluster Creation Summary"
+            echo ""
+            echo "- Provider: \`${{ inputs.clusterProvider }}\`"
+            echo "- Ingress controller: \`${{ inputs.ingressController }}\`"
+            echo "- Node count: \`${{ inputs.nodeCount }}\`"
+            echo ""
+            echo "Use this cluster's name/resource-group/region/project as inputs to the"
+            echo "deploy-multicloud-helm.yml and k8s-multicloud-upgrade-pipeline.yml workflows."
+          } >> "$GITHUB_STEP_SUMMARY"

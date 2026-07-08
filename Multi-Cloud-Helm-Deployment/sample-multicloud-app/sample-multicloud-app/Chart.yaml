@@ -1,0 +1,9 @@
+apiVersion: v2
+name: sample-multicloud-app
+description: >-
+  Sample application Helm chart demonstrating provider-aware ingress
+  (AGIC on AKS, AWS Load Balancer Controller on EKS, GCE Ingress on GKE,
+  with an NGINX Ingress Controller profile as a cloud-agnostic default).
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
