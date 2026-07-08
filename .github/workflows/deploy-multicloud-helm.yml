@@ -1,0 +1,228 @@
+name: Multi-Cloud Kubernetes Helm Deploy (AKS / EKS / GKE)
+
+# Select clusterProvider = aks | eks | gke. Only cluster-context setup
+# (login + credentials) differs per provider — everything after that
+# (Helm install, rollout verification) is identical across all three.
+#
+# NOTE ON GITHUB ACTIONS UI LIMITATION:
+# workflow_dispatch forms cannot show/hide fields conditionally. All
+# provider-specific inputs are always visible; fill in only the block
+# matching your chosen provider.
+#
+# REQUIRED SECRETS (only the set matching your provider is needed):
+#   AKS: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   EKS: AWS_DEPLOY_ROLE_ARN (OIDC role with eks:DescribeCluster + cluster RBAC access)
+#   GKE: GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT
+
+on:
+  workflow_dispatch:
+    inputs:
+      clusterProvider:
+        description: "Which managed Kubernetes service to deploy to"
+        required: true
+        type: choice
+        default: "aks"
+        options:
+          - aks
+          - eks
+          - gke
+
+      # --- AKS-specific ---
+      aksResourceGroup:
+        description: "[AKS] Resource group"
+        required: false
+        type: string
+      aksClusterName:
+        description: "[AKS] Cluster name"
+        required: false
+        type: string
+
+      # --- EKS-specific ---
+      eksClusterName:
+        description: "[EKS] Cluster name"
+        required: false
+        type: string
+      awsRegion:
+        description: "[EKS] AWS region"
+        required: false
+        default: "us-east-1"
+        type: string
+
+      # --- GKE-specific ---
+      gkeClusterName:
+        description: "[GKE] Cluster name"
+        required: false
+        type: string
+      gkeLocation:
+        description: "[GKE] Zone or region (e.g. us-central1-a or us-central1)"
+        required: false
+        type: string
+      gcpProject:
+        description: "[GKE] GCP project ID"
+        required: false
+        type: string
+
+      # --- Common deployment inputs ---
+      namespace:
+        description: "Kubernetes namespace"
+        required: true
+        default: "default"
+        type: string
+      imageName:
+        description: "Container image repository/name"
+        required: true
+        type: string
+      imageTag:
+        description: "Container image tag (avoid 'latest' for production deploys)"
+        required: true
+        default: "latest"
+        type: string
+      helmReleaseName:
+        description: "Helm release name"
+        required: true
+        default: "my-app"
+        type: string
+      helmChartPath:
+        description: "Path to Helm chart in repo"
+        required: true
+        default: "./helm/my-app"
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: multicloud-deploy-${{ inputs.clusterProvider }}-${{ inputs.aksClusterName }}${{ inputs.eksClusterName }}${{ inputs.gkeClusterName }}-${{ inputs.namespace }}-${{ inputs.helmReleaseName }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: multicloud-deploy-prod # configure required reviewers in repo settings; remove this block entirely for non-prod use
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate required inputs for selected provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.clusterProvider }}" in
+            aks)
+              [ -n "${{ inputs.aksResourceGroup }}" ] && [ -n "${{ inputs.aksClusterName }}" ] || { echo "::error::aksResourceGroup and aksClusterName are required for AKS."; exit 1; }
+              ;;
+            eks)
+              [ -n "${{ inputs.eksClusterName }}" ] || { echo "::error::eksClusterName is required for EKS."; exit 1; }
+              ;;
+            gke)
+              [ -n "${{ inputs.gkeClusterName }}" ] && [ -n "${{ inputs.gkeLocation }}" ] && [ -n "${{ inputs.gcpProject }}" ] || { echo "::error::gkeClusterName, gkeLocation, and gcpProject are required for GKE."; exit 1; }
+              ;;
+          esac
+
+      - name: Reject mutable 'latest' tag
+        if: inputs.imageTag == 'latest'
+        run: |
+          echo "::error::Refusing to deploy 'latest' — specify an immutable image tag (version or digest) for reproducible deploys."
+          exit 1
+
+      - name: Azure login (OIDC)
+        if: inputs.clusterProvider == 'aks'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: AWS login (OIDC)
+        if: inputs.clusterProvider == 'eks'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: GCP login (Workload Identity Federation)
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install GKE auth plugin
+        if: inputs.clusterProvider == 'gke'
+        run: sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk-gke-gcloud-auth-plugin
+
+      - name: Set AKS context
+        if: inputs.clusterProvider == 'aks'
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ inputs.aksResourceGroup }}
+          cluster-name: ${{ inputs.aksClusterName }}
+
+      - name: Set EKS context
+        if: inputs.clusterProvider == 'eks'
+        env:
+          EKS_CLUSTER: ${{ inputs.eksClusterName }}
+          AWS_REGION_IN: ${{ inputs.awsRegion }}
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION_IN"
+
+      - name: Set GKE context
+        if: inputs.clusterProvider == 'gke'
+        env:
+          GKE_CLUSTER: ${{ inputs.gkeClusterName }}
+          GKE_LOCATION: ${{ inputs.gkeLocation }}
+          GCP_PROJECT: ${{ inputs.gcpProject }}
+          USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
+        run: gcloud container clusters get-credentials "$GKE_CLUSTER" --location "$GKE_LOCATION" --project "$GCP_PROJECT"
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4 # provider-agnostic — just installs the helm binary
+
+      - name: Helm upgrade/install
+        env:
+          RELEASE: ${{ inputs.helmReleaseName }}
+          CHART_PATH: ${{ inputs.helmChartPath }}
+          NAMESPACE: ${{ inputs.namespace }}
+          IMAGE_NAME: ${{ inputs.imageName }}
+          IMAGE_TAG: ${{ inputs.imageTag }}
+        run: |
+          set -euo pipefail
+          # --create-namespace handles namespace creation, no separate step needed.
+          # --atomic auto-rolls-back to the last good revision if this fails,
+          # rather than leaving the release in a failed/pending-upgrade state.
+          helm upgrade --install "$RELEASE" "$CHART_PATH" \
+            --namespace "$NAMESPACE" \
+            --create-namespace \
+            --set image.repository="$IMAGE_NAME" \
+            --set image.tag="$IMAGE_TAG" \
+            --atomic --wait --timeout 10m
+
+      - name: Verify rollout
+        env:
+          RELEASE: ${{ inputs.helmReleaseName }}
+          NAMESPACE: ${{ inputs.namespace }}
+        run: |
+          set -euo pipefail
+          # Adjust the label selector if your chart doesn't set the standard
+          # app.kubernetes.io/instance label.
+          kubectl rollout status deployment -n "$NAMESPACE" -l app.kubernetes.io/instance="$RELEASE" --timeout=60s
+          kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/instance="$RELEASE"
+
+      - name: Deployment summary
+        run: |
+          {
+            echo "## Multi-Cloud Helm Deployment Completed"
+            echo ""
+            echo "- Provider: \`${{ inputs.clusterProvider }}\`"
+            echo "- Namespace: \`${{ inputs.namespace }}\`"
+            echo "- Helm Release: \`${{ inputs.helmReleaseName }}\`"
+            echo "- Chart Path: \`${{ inputs.helmChartPath }}\`"
+            echo "- Image: \`${{ inputs.imageName }}:${{ inputs.imageTag }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
