@@ -1,0 +1,448 @@
+name: Multi-Category Security Scan Pipeline
+
+# Tool set:
+#   - Docker category:       Trivy, Dockle (no secrets needed)
+#   - Host/Network category: Nmap, Nuclei, OWASP ZAP (no secrets needed)
+#   - Cloud category:        AWS / Azure / GCP scan via ScoutSuite
+#     (this one unavoidably needs credentials — you cannot authenticate
+#     to a cloud account without a role ARN / client ID / service account,
+#     so secrets are required here even though every other category is
+#     secret-free)
+#
+# Previously dropped and still excluded: DockerShield (placeholder, tool
+# never confirmed), Wiz, Burp Suite, Nessus, OpenVAS (need tokens/servers),
+# Grype, Lynis, Nikto, Black Duck, Snyk, Dependency/SCA category.
+#
+# NOTE ON GITHUB ACTIONS UI LIMITATION:
+# workflow_dispatch forms cannot show/hide fields conditionally based on
+# another field's value (no cascading dropdowns). All inputs below are
+# always visible when triggering manually. "scanCategory" picks which
+# job runs; ignore checkboxes belonging to a category you didn't select.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scanCategory:
+        description: "Which category to scan"
+        required: true
+        type: choice
+        default: "docker"
+        options:
+          - docker
+          - host_network
+          - cloud
+          - codebase
+
+      # --- Docker image scan options (scanCategory = docker) ---
+      imageRef:
+        description: "[Docker] Image to scan (repo:tag) — required, no default"
+        required: true
+        type: string
+      runTrivy:
+        description: "[Docker] Run Trivy"
+        required: false
+        default: true
+        type: boolean
+      runDockle:
+        description: "[Docker] Run Dockle"
+        required: false
+        default: true
+        type: boolean
+
+      # --- Host/network scan options (scanCategory = host_network) ---
+      targets:
+        description: "[Host/Network] Comma-separated hosts/IPs/CIDRs/URLs"
+        required: true
+        type: string
+      runNmap:
+        description: "[Host/Network] Run Nmap (port/service discovery)"
+        required: false
+        default: true
+        type: boolean
+      runNuclei:
+        description: "[Host/Network] Run Nuclei (template-based vuln scan)"
+        required: false
+        default: true
+        type: boolean
+      runZap:
+        description: "[Host/Network] Run OWASP ZAP (assumes at least one target is a URL)"
+        required: false
+        default: true
+        type: boolean
+
+      # --- Cloud platform scan options (scanCategory = cloud) ---
+      cloudProvider:
+        description: "[Cloud] Provider to scan (requires provider credentials configured as repo/org secrets)"
+        required: false
+        default: "aws"
+        type: choice
+        options:
+          - aws
+          - azure
+          - gcp
+      cloudRunImageScan:
+        description: "[Cloud] Also pull and Trivy-scan an image from the provider's registry (CVE/severity check)"
+        required: false
+        default: false
+        type: boolean
+      cloudImageRef:
+        description: "[Cloud] Full image ref in the provider's registry (e.g. <acct>.dkr.ecr.<region>.amazonaws.com/repo:tag, <name>.azurecr.io/repo:tag, <region>-docker.pkg.dev/<project>/repo:tag)"
+        required: false
+        default: ""
+        type: string
+
+      # --- Codebase scan options (scanCategory = codebase) ---
+      runGitleaks:
+        description: "[Codebase] Run Gitleaks (secrets scan across full git history)"
+        required: false
+        default: true
+        type: boolean
+      runSemgrep:
+        description: "[Codebase] Run Semgrep (SAST — static code analysis)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  security-events: write
+  id-token: write # needed for AWS/Azure/GCP OIDC login in the cloud job
+
+concurrency:
+  group: security-scan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================
+  # CATEGORY: DOCKER IMAGE SCAN
+  # ============================================================
+  docker-scan:
+    name: Docker Image Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: inputs.scanCategory == 'docker'
+    outputs:
+      trivy_status: ${{ steps.collect.outputs.trivy_status }}
+      dockle_status: ${{ steps.collect.outputs.dockle_status }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull image
+        env:
+          IMAGE_REF: ${{ inputs.imageRef }}
+        run: docker pull "$IMAGE_REF"
+
+      - name: Trivy scan
+        id: trivy
+        if: inputs.runTrivy == true
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          image-ref: ${{ inputs.imageRef }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Upload Trivy SARIF
+        if: inputs.runTrivy == true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Dockle scan
+        id: dockle
+        if: inputs.runDockle == true
+        continue-on-error: true
+        env:
+          IMAGE_REF: ${{ inputs.imageRef }}
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            goodwithtech/dockle:latest --exit-code 1 --exit-level warn "$IMAGE_REF" \
+            | tee dockle-results.txt
+
+      - name: Collect results
+        id: collect
+        if: always()
+        run: |
+          {
+            if [ "${{ inputs.runTrivy }}" = "true" ]; then
+              echo "trivy_status=${{ steps.trivy.outcome == 'success' && 'PASS' || 'FAIL' }}"
+            else
+              echo "trivy_status=SKIPPED"
+            fi
+            if [ "${{ inputs.runDockle }}" = "true" ]; then
+              echo "dockle_status=${{ steps.dockle.outcome == 'success' && 'PASS' || 'FAIL' }}"
+            else
+              echo "dockle_status=SKIPPED"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+  # ============================================================
+  # CATEGORY: HOST & NETWORK SCAN
+  # ============================================================
+  host-network-scan:
+    name: Host & Network Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: inputs.scanCategory == 'host_network'
+    outputs:
+      nmap_status: ${{ steps.collect.outputs.nmap_status }}
+      nuclei_status: ${{ steps.collect.outputs.nuclei_status }}
+      zap_status: ${{ steps.collect.outputs.zap_status }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Nmap scan
+        id: nmap
+        if: inputs.runNmap == true
+        continue-on-error: true
+        env:
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y nmap
+          IFS=',' read -ra HOSTS <<< "$TARGETS"
+          for H in "${HOSTS[@]}"; do
+            nmap -sV -T4 "$H" | tee -a nmap-results.txt
+          done
+
+      - name: Nuclei scan
+        id: nuclei
+        if: inputs.runNuclei == true
+        continue-on-error: true
+        uses: projectdiscovery/nuclei-action@main
+        with:
+          target: ${{ inputs.targets }}
+
+      - name: ZAP scan
+        id: zap
+        if: inputs.runZap == true
+        continue-on-error: true
+        uses: zaproxy/action-full-scan@v0.12.0
+        with:
+          target: ${{ inputs.targets }}
+          cmd_options: '-a'
+
+      - name: Collect results
+        id: collect
+        if: always()
+        run: |
+          {
+            [ "${{ inputs.runNmap }}" = "true" ] && echo "nmap_status=${{ steps.nmap.outcome == 'success' && 'PASS' || 'FAIL' }}" || echo "nmap_status=SKIPPED"
+            [ "${{ inputs.runNuclei }}" = "true" ] && echo "nuclei_status=${{ steps.nuclei.outcome == 'success' && 'PASS' || 'FAIL' }}" || echo "nuclei_status=SKIPPED"
+            [ "${{ inputs.runZap }}" = "true" ] && echo "zap_status=${{ steps.zap.outcome == 'success' && 'PASS' || 'FAIL' }}" || echo "zap_status=SKIPPED"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload raw results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: host-network-scan-results
+          path: nmap-results.txt
+          if-no-files-found: ignore
+
+  # ============================================================
+  # CATEGORY: CLOUD PLATFORM SCAN
+  # ============================================================
+  cloud-scan:
+    name: Cloud Platform Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: inputs.scanCategory == 'cloud'
+    outputs:
+      cloud_status: ${{ steps.collect.outputs.cloud_status }}
+      cloud_provider: ${{ inputs.cloudProvider }}
+      cloud_image_trivy_status: ${{ steps.collect.outputs.cloud_image_trivy_status }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: AWS login (OIDC)
+        if: inputs.cloudProvider == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_SCAN_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Azure login (OIDC)
+        if: inputs.cloudProvider == 'azure'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: GCP login (Workload Identity Federation)
+        if: inputs.cloudProvider == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Run ScoutSuite scan
+        id: scoutsuite
+        continue-on-error: true
+        env:
+          PROVIDER: ${{ inputs.cloudProvider }}
+        run: |
+          pip install scoutsuite
+          case "$PROVIDER" in
+            aws)   scout aws   --no-browser --report-dir scout-report ;;
+            azure) scout azure --no-browser --report-dir scout-report --cli ;;
+            gcp)   scout gcp   --no-browser --report-dir scout-report ;;
+          esac
+
+      # Logs into the provider's container registry using the same
+      # credentials from the login step above, so no extra secrets needed.
+      - name: Cloud registry login (for image scan)
+        id: registry_login
+        if: inputs.cloudRunImageScan == true && inputs.cloudImageRef != ''
+        continue-on-error: true
+        env:
+          PROVIDER: ${{ inputs.cloudProvider }}
+          IMAGE_REF: ${{ inputs.cloudImageRef }}
+        run: |
+          set -euo pipefail
+          case "$PROVIDER" in
+            aws)
+              REGISTRY="$(echo "$IMAGE_REF" | cut -d'/' -f1)"
+              REGION="$(echo "$REGISTRY" | cut -d'.' -f4)"
+              aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+              ;;
+            azure)
+              REGISTRY_NAME="$(echo "$IMAGE_REF" | cut -d'.' -f1 | cut -d'/' -f1)"
+              az acr login --name "$REGISTRY_NAME"
+              ;;
+            gcp)
+              REGISTRY="$(echo "$IMAGE_REF" | cut -d'/' -f1)"
+              gcloud auth configure-docker "$REGISTRY" --quiet
+              ;;
+          esac
+
+      - name: Pull cloud image
+        id: pull_cloud_image
+        if: inputs.cloudRunImageScan == true && inputs.cloudImageRef != ''
+        continue-on-error: true
+        env:
+          IMAGE_REF: ${{ inputs.cloudImageRef }}
+        run: docker pull "$IMAGE_REF"
+
+      - name: Trivy scan (cloud registry image)
+        id: cloud_image_trivy
+        if: inputs.cloudRunImageScan == true && inputs.cloudImageRef != ''
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ inputs.cloudImageRef }}
+          format: 'sarif'
+          output: 'cloud-image-trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Upload cloud image Trivy SARIF
+        if: inputs.cloudRunImageScan == true && inputs.cloudImageRef != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'cloud-image-trivy-results.sarif'
+
+      - name: Collect results
+        id: collect
+        if: always()
+        run: |
+          {
+            echo "cloud_status=${{ steps.scoutsuite.outcome == 'success' && 'PASS' || 'FAIL' }}"
+            if [ "${{ inputs.cloudRunImageScan }}" = "true" ] && [ -n "${{ inputs.cloudImageRef }}" ]; then
+              echo "cloud_image_trivy_status=${{ steps.cloud_image_trivy.outcome == 'success' && 'PASS' || 'FAIL' }}"
+            else
+              echo "cloud_image_trivy_status=SKIPPED"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload cloud scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-scan-report-${{ inputs.cloudProvider }}
+          path: scout-report
+          if-no-files-found: ignore
+
+  # ============================================================
+  # CATEGORY: CODEBASE SCAN (secrets + SAST)
+  # ============================================================
+  codebase-scan:
+    name: Codebase Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: inputs.scanCategory == 'codebase'
+    outputs:
+      gitleaks_status: ${{ steps.collect.outputs.gitleaks_status }}
+      semgrep_status: ${{ steps.collect.outputs.semgrep_status }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # scan full git history for secrets
+
+      - name: Gitleaks scan
+        id: gitleaks
+        if: inputs.runGitleaks == true
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # auto-provided, not a user secret
+
+      - name: Semgrep scan
+        id: semgrep
+        if: inputs.runSemgrep == true
+        continue-on-error: true
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+
+      - name: Collect results
+        id: collect
+        if: always()
+        run: |
+          {
+            [ "${{ inputs.runGitleaks }}" = "true" ] && echo "gitleaks_status=${{ steps.gitleaks.outcome == 'success' && 'PASS' || 'FAIL' }}" || echo "gitleaks_status=SKIPPED"
+            [ "${{ inputs.runSemgrep }}" = "true" ] && echo "semgrep_status=${{ steps.semgrep.outcome == 'success' && 'PASS' || 'FAIL' }}" || echo "semgrep_status=SKIPPED"
+          } >> "$GITHUB_OUTPUT"
+
+  # ============================================================
+  # FINAL REPORT
+  # ============================================================
+  report:
+    name: Scan Summary
+    runs-on: ubuntu-latest
+    needs: [docker-scan, host-network-scan, cloud-scan, codebase-scan]
+    if: always()
+    steps:
+      - name: Build summary table
+        run: |
+          {
+            echo "## Security Scan Summary"
+            echo ""
+            echo "**Category selected:** \`${{ inputs.scanCategory }}\`"
+            echo ""
+            echo "| Category | Tool | Status |"
+            echo "|---|---|---|"
+
+            if [ "${{ inputs.scanCategory }}" = "docker" ]; then
+              echo "| Docker | Trivy | ${{ needs.docker-scan.outputs.trivy_status || 'N/A' }} |"
+              echo "| Docker | Dockle | ${{ needs.docker-scan.outputs.dockle_status || 'N/A' }} |"
+            elif [ "${{ inputs.scanCategory }}" = "host_network" ]; then
+              echo "| Host/Network | Nmap | ${{ needs.host-network-scan.outputs.nmap_status || 'N/A' }} |"
+              echo "| Host/Network | Nuclei | ${{ needs.host-network-scan.outputs.nuclei_status || 'N/A' }} |"
+              echo "| Host/Network | OWASP ZAP | ${{ needs.host-network-scan.outputs.zap_status || 'N/A' }} |"
+            elif [ "${{ inputs.scanCategory }}" = "cloud" ]; then
+              echo "| Cloud (${{ needs.cloud-scan.outputs.cloud_provider }}) | ScoutSuite (posture) | ${{ needs.cloud-scan.outputs.cloud_status || 'N/A' }} |"
+              echo "| Cloud (${{ needs.cloud-scan.outputs.cloud_provider }}) | Trivy (registry image CVE/severity) | ${{ needs.cloud-scan.outputs.cloud_image_trivy_status || 'N/A' }} |"
+            elif [ "${{ inputs.scanCategory }}" = "codebase" ]; then
+              echo "| Codebase | Gitleaks | ${{ needs.codebase-scan.outputs.gitleaks_status || 'N/A' }} |"
+              echo "| Codebase | Semgrep | ${{ needs.codebase-scan.outputs.semgrep_status || 'N/A' }} |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Print table to logs too
+        run: cat "$GITHUB_STEP_SUMMARY"
