@@ -1,0 +1,106 @@
+name: AKS Cluster Info
+
+# Standalone read-only AKS diagnostic pipeline — no dependency on any other
+# pipeline or repo. Drop this into any project for a quick cluster snapshot
+# without needing kubectl access locally.
+#
+# REQUIRED SECRETS: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+# (same OIDC federated credential as upgrade-aks.yml — reuse it, no new
+# setup needed if you've already wired that one up)
+
+on:
+  workflow_dispatch:
+    inputs:
+      aksResourceGroup:
+        description: "AKS resource group"
+        required: true
+        type: string
+      aksClusterName:
+        description: "AKS cluster name"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  aks-info:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Get AKS credentials
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+        run: |
+          az aks get-credentials \
+            --resource-group "$RG" \
+            --name "$CLUSTER" \
+            --overwrite-existing
+
+      - name: Fetch cluster information
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+        run: |
+          echo "========== AKS CLUSTER INFO =========="
+          az aks show \
+            --resource-group "$RG" \
+            --name "$CLUSTER" \
+            --query "{ClusterName:name, Location:location, KubernetesVersion:kubernetesVersion, NodeResourceGroup:nodeResourceGroup, PowerState:powerState.code, ProvisioningState:provisioningState}" \
+            -o table
+
+      - name: Fetch node pool information
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+        run: |
+          echo "========== NODE POOLS =========="
+          az aks nodepool list \
+            --cluster-name "$CLUSTER" \
+            --resource-group "$RG" \
+            --query "[].{Name:name, Version:orchestratorVersion, Mode:mode, Count:count, VmSize:vmSize}" \
+            -o table
+
+      - name: Fetch worker node details
+        run: |
+          echo "========== WORKER NODE DETAILS =========="
+          kubectl get nodes -o wide
+
+      - name: Detailed node info
+        run: |
+          echo "========== NODE VERSION DETAILS =========="
+          kubectl get nodes -o custom-columns=\
+NAME:.metadata.name,\
+STATUS:.status.conditions[-1].type,\
+K8S_VERSION:.status.nodeInfo.kubeletVersion,\
+OS_IMAGE:.status.nodeInfo.osImage,\
+CONTAINER_RUNTIME:.status.nodeInfo.containerRuntimeVersion
+
+      - name: Summary
+        run: |
+          {
+            echo "## AKS Cluster Info"
+            echo ""
+            echo "- Cluster: \`${{ inputs.aksClusterName }}\`"
+            echo "- Resource Group: \`${{ inputs.aksResourceGroup }}\`"
+            echo ""
+            echo "Full details in the job logs above."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# --- OIDC setup notes ---
+# Reuses the same federated credential as upgrade-aks.yml's branch-based
+# subject (this pipeline has no environment: block, so it authenticates
+# via the branch subject, e.g. repo:<owner>/<repo>:ref:refs/heads/main).
+# No additional Azure setup needed if that credential already exists.

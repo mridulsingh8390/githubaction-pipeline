@@ -1,0 +1,465 @@
+name: AKS Cluster Upgrade Pipeline
+
+# Standalone AKS upgrade pipeline — no dependency on any other pipeline or
+# repo. Drop this into any project that needs AKS upgrades.
+#
+# REQUIRED SECRETS: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+# (OIDC federated credential — see setup notes at the bottom of this file)
+#
+# REQUIRED GITHUB ENVIRONMENTS (create under Settings → Environments):
+#   aks-upgrade-control-plane
+#   aks-upgrade-worker-nodes
+#
+# Two separate approval gates (control plane vs worker nodes) so you can
+# assign different reviewers to each if you want. System node pools are
+# upgraded before user node pools within the worker-nodes stage.
+
+on:
+  workflow_dispatch:
+    inputs:
+      aksResourceGroup:
+        description: "AKS resource group"
+        required: true
+        type: string
+      aksClusterName:
+        description: "AKS cluster name"
+        required: true
+        type: string
+      targetKubernetesVersion:
+        description: "Target Kubernetes version. Leave blank to auto-pick the latest allowed upgrade."
+        required: false
+        default: ""
+        type: string
+      controlPlaneOnly:
+        description: "Upgrade only the control plane"
+        required: false
+        default: false
+        type: boolean
+      nodePoolName:
+        description: "Specific node pool to upgrade (blank = all system pools, then all user pools)"
+        required: false
+        default: ""
+        type: string
+      maxSurge:
+        description: "Node pool max surge (e.g. 33% or 1)"
+        required: false
+        default: "33%"
+        type: string
+      drainTimeoutMinutes:
+        description: "Drain timeout in minutes"
+        required: false
+        default: "30"
+        type: string
+      nodeSoakDurationMinutes:
+        description: "Minutes to wait after each node is upgraded before moving to the next (lets new nodes settle before continuing)"
+        required: false
+        default: "5"
+        type: string
+      createSnapshot:
+        description: "Create a pre-upgrade cluster snapshot (non-fatal if permission is missing)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: aks-upgrade-${{ inputs.aksResourceGroup }}-${{ inputs.aksClusterName }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan Upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      currentVersion: ${{ steps.discover.outputs.currentVersion }}
+      selectedVersion: ${{ steps.discover.outputs.selectedVersion }}
+      hasUpgrade: ${{ steps.discover.outputs.hasUpgrade }}
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate cluster exists and is healthy
+        shell: bash
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+        run: |
+          set -euo pipefail
+          if ! az aks show --name "$CLUSTER" --resource-group "$RG" &>/dev/null; then
+            echo "::error::Cluster '$CLUSTER' not found in resource group '$RG'."
+            exit 1
+          fi
+
+          INFO="$(az aks show --name "$CLUSTER" --resource-group "$RG" \
+            --query "{powerState:powerState.code, provisioningState:provisioningState}" -o json)"
+          POWER_STATE="$(echo "$INFO" | jq -r '.powerState')"
+          PROV_STATE="$(echo "$INFO" | jq -r '.provisioningState')"
+
+          echo "Power state: $POWER_STATE / Provisioning state: $PROV_STATE"
+          [ "$POWER_STATE" = "Running" ] || { echo "::error::Cluster is not Running (state=$POWER_STATE)."; exit 1; }
+          [ "$PROV_STATE" = "Succeeded" ] || { echo "::error::Cluster provisioning state is $PROV_STATE, expected Succeeded."; exit 1; }
+
+      - name: Discover current & available versions
+        id: discover
+        shell: bash
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+          TARGET_INPUT: ${{ inputs.targetKubernetesVersion }}
+        run: |
+          set -euo pipefail
+
+          CURR="$(az aks show -g "$RG" -n "$CLUSTER" --query kubernetesVersion -o tsv)"
+          echo "currentVersion=$CURR" >> "$GITHUB_OUTPUT"
+
+          az aks get-upgrades -g "$RG" -n "$CLUSTER" -o json > upgrades.json
+          mapfile -t UPGRADES < <(jq -r '.controlPlaneProfile.upgrades[]?.kubernetesVersion // empty' upgrades.json)
+
+          if [ "${#UPGRADES[@]}" -eq 0 ]; then
+            echo "No upgrades available."
+            echo "selectedVersion=$CURR" >> "$GITHUB_OUTPUT"
+            echo "hasUpgrade=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "$TARGET_INPUT" ]; then
+            CURR_MINOR="$(echo "$CURR" | cut -d. -f2)"
+            TARGET_MINOR="$(echo "$TARGET_INPUT" | cut -d. -f2)"
+            DIFF=$((TARGET_MINOR - CURR_MINOR))
+            if [ "$DIFF" -gt 1 ]; then
+              echo "::error::Cannot skip minor versions ($CURR -> $TARGET_INPUT). Kubernetes only supports upgrading one minor version at a time."
+              exit 1
+            fi
+            if [ "$DIFF" -lt 0 ]; then
+              echo "::error::Downgrade is not supported (target $TARGET_INPUT < current $CURR)."
+              exit 1
+            fi
+            if printf '%s\n' "${UPGRADES[@]}" | grep -qx "$TARGET_INPUT"; then
+              SELECTED="$TARGET_INPUT"
+            else
+              echo "::error::Requested target '$TARGET_INPUT' not in allowed upgrades: ${UPGRADES[*]}"
+              exit 1
+            fi
+          else
+            SELECTED="$(printf '%s\n' "${UPGRADES[@]}" | sort -V | tail -n1)"
+          fi
+
+          echo "selectedVersion=$SELECTED" >> "$GITHUB_OUTPUT"
+          if [ "$SELECTED" = "$CURR" ]; then
+            echo "hasUpgrade=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "hasUpgrade=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup kubectl
+        if: steps.discover.outputs.hasUpgrade == 'true'
+        uses: azure/setup-kubectl@v4
+
+      - name: Pre-upgrade health check (nodes + PDB scan)
+        if: steps.discover.outputs.hasUpgrade == 'true'
+        shell: bash
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+        run: |
+          set -euo pipefail
+          az aks get-credentials --name "$CLUSTER" --resource-group "$RG" --overwrite-existing
+
+          echo "--- Node status ---"
+          kubectl get nodes -o wide
+
+          NOT_READY="$(kubectl get nodes --no-headers | awk '$2!="Ready"' | wc -l)"
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "::error::$NOT_READY node(s) are not Ready. Aborting before upgrade."
+            kubectl get nodes --no-headers | awk '$2!="Ready"'
+            exit 1
+          fi
+
+          echo "--- Pod Disruption Budgets that may block draining (maxUnavailable=0) ---"
+          BLOCKING="$(kubectl get pdb --all-namespaces -o json 2>/dev/null | \
+            jq -r '.items[] | select((.spec.maxUnavailable == "0") or (.spec.maxUnavailable == 0)) | "\(.metadata.namespace)/\(.metadata.name)"')"
+          if [ -n "$BLOCKING" ]; then
+            echo "::warning::The following PDBs have maxUnavailable=0 and may stall node draining:"
+            echo "$BLOCKING" | sed 's/^/  - /'
+          else
+            echo "No drain-blocking PDBs detected."
+          fi
+
+      - name: Publish plan summary
+        shell: bash
+        run: |
+          {
+            echo "## AKS Upgrade Plan"
+            echo ""
+            echo "- Resource Group: \`${{ inputs.aksResourceGroup }}\`"
+            echo "- Cluster: \`${{ inputs.aksClusterName }}\`"
+            echo "- Current Version: \`${{ steps.discover.outputs.currentVersion }}\`"
+            echo "- Selected Target: \`${{ steps.discover.outputs.selectedVersion }}\`"
+            echo "- Upgrade Available: \`${{ steps.discover.outputs.hasUpgrade }}\`"
+            echo "- Control Plane Only: \`${{ inputs.controlPlaneOnly }}\`"
+            echo "- Node Pool Input: \`${{ inputs.nodePoolName || 'all pools (system first, then user)' }}\`"
+            echo ""
+            if [ "${{ steps.discover.outputs.hasUpgrade }}" = "false" ]; then
+              echo "> No upgrade available. Approving the upgrade stage is unnecessary."
+            else
+              echo "> Review this plan and any PDB warnings above, then approve the **upgrade-control-plane** environment job."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  upgrade-control-plane:
+    name: Upgrade Control Plane (approval required)
+    runs-on: ubuntu-latest
+    needs: plan
+    if: needs.plan.outputs.hasUpgrade == 'true'
+    timeout-minutes: 60
+    environment:
+      name: aks-upgrade-control-plane
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Pre-upgrade snapshot
+        if: inputs.createSnapshot == true
+        shell: bash
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+        run: |
+          set -euo pipefail
+          CLUSTER_ID="$(az aks show --name "$CLUSTER" --resource-group "$RG" --query id -o tsv)"
+          LOCATION="$(az aks show --name "$CLUSTER" --resource-group "$RG" --query location -o tsv)"
+          SNAPSHOT_NAME="pre-upgrade-${CLUSTER}-$(date +%Y%m%d%H%M%S)"
+
+          az aks snapshot create \
+            --name "$SNAPSHOT_NAME" \
+            --resource-group "$RG" \
+            --cluster-id "$CLUSTER_ID" \
+            --location "$LOCATION" \
+            && echo "Snapshot created: $SNAPSHOT_NAME" \
+            || echo "::warning::Snapshot creation failed (non-fatal) — verify Microsoft.ContainerService/snapshots/write permission if you need this."
+
+      - name: Upgrade control plane
+        shell: bash
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+          TARGET: ${{ needs.plan.outputs.selectedVersion }}
+        run: |
+          set -euo pipefail
+          az aks upgrade -g "$RG" -n "$CLUSTER" --kubernetes-version "$TARGET" --control-plane-only --yes
+
+      - name: Control plane upgrade summary
+        run: |
+          {
+            echo "## Control Plane Upgrade Completed"
+            echo ""
+            echo "- Cluster: \`${{ inputs.aksClusterName }}\`"
+            echo "- From: \`${{ needs.plan.outputs.currentVersion }}\`"
+            echo "- To: \`${{ needs.plan.outputs.selectedVersion }}\`"
+            echo ""
+            if [ "${{ inputs.controlPlaneOnly }}" = "true" ]; then
+              echo "> controlPlaneOnly was set — worker node upgrade will be skipped."
+            else
+              echo "> Next: review and approve the **upgrade-worker-nodes** environment job to proceed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  upgrade-worker-nodes:
+    name: Upgrade Worker Nodes (separate approval required)
+    runs-on: ubuntu-latest
+    needs: [plan, upgrade-control-plane]
+    if: needs.plan.outputs.hasUpgrade == 'true' && inputs.controlPlaneOnly == false
+    timeout-minutes: 120
+    environment:
+      name: aks-upgrade-worker-nodes
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Upgrade node pools (system pools first, then user pools)
+        shell: bash
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+          TARGET: ${{ needs.plan.outputs.selectedVersion }}
+          POOL_INPUT: ${{ inputs.nodePoolName }}
+          MAX_SURGE: ${{ inputs.maxSurge }}
+          DRAIN_TIMEOUT: ${{ inputs.drainTimeoutMinutes }}
+          SOAK_MINUTES: ${{ inputs.nodeSoakDurationMinutes }}
+        run: |
+          set -euo pipefail
+
+          az aks nodepool list -g "$RG" --cluster-name "$CLUSTER" -o json > node-pools.json
+
+          upgrade_pool() {
+            local NAME="$1"
+            echo "--- Upgrading pool: $NAME ---"
+            az aks nodepool update -g "$RG" --cluster-name "$CLUSTER" -n "$NAME" \
+              --max-surge "$MAX_SURGE" --drain-timeout "$DRAIN_TIMEOUT" --node-soak-duration "$SOAK_MINUTES" \
+              || echo "::warning::Could not update surge/drain/soak settings for $NAME, continuing with existing config."
+            az aks nodepool upgrade -g "$RG" --cluster-name "$CLUSTER" -n "$NAME" \
+              --kubernetes-version "$TARGET" --yes
+          }
+
+          if [ -n "$POOL_INPUT" ]; then
+            upgrade_pool "$POOL_INPUT"
+          else
+            echo "=== System node pools ==="
+            mapfile -t SYSTEM_POOLS < <(jq -r '.[] | select(.mode=="System") | .name' node-pools.json)
+            for POOL in "${SYSTEM_POOLS[@]}"; do
+              upgrade_pool "$POOL"
+            done
+
+            echo "=== User node pools ==="
+            mapfile -t USER_POOLS < <(jq -r '.[] | select(.mode=="User") | .name' node-pools.json)
+            for POOL in "${USER_POOLS[@]}"; do
+              upgrade_pool "$POOL"
+            done
+          fi
+
+  post-upgrade-validation:
+    name: Post-Upgrade Validation
+    runs-on: ubuntu-latest
+    needs: [plan, upgrade-control-plane, upgrade-worker-nodes]
+    if: |
+      always() &&
+      needs.upgrade-control-plane.result == 'success' &&
+      (needs.upgrade-worker-nodes.result == 'success' || needs.upgrade-worker-nodes.result == 'skipped')
+    timeout-minutes: 15
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Post-upgrade validation
+        id: validate
+        shell: bash
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+        run: |
+          set -euo pipefail
+          az aks get-credentials -g "$RG" -n "$CLUSTER" --overwrite-existing
+
+          echo "Waiting for all nodes to be Ready (timeout 5 min)..."
+          kubectl wait --for=condition=ready nodes --all --timeout=300s || {
+            echo "::warning::Not all nodes reported Ready within 5 minutes."
+            kubectl get nodes
+          }
+
+          echo "--- Node status ---"
+          kubectl get nodes -o wide
+
+          NOT_READY="$(kubectl get nodes --no-headers | awk '$2!="Ready"' | wc -l)"
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "::error::$NOT_READY node(s) are not Ready after upgrade"
+            kubectl get nodes --no-headers | awk '$2!="Ready"'
+            exit 1
+          fi
+          echo "All nodes Ready."
+
+          echo "--- Non-healthy pods ---"
+          NON_HEALTHY="$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | grep -v -E '\s(Running|Completed|Succeeded)\s' | wc -l)"
+          if [ "$NON_HEALTHY" -gt 0 ]; then
+            echo "::warning::$NON_HEALTHY pod(s) are not in Running/Completed state:"
+            kubectl get pods --all-namespaces | grep -v -E '\s(Running|Completed|Succeeded)\s'
+          else
+            echo "All pods healthy."
+          fi
+
+          FINAL_VERSION="$(az aks show -g "$RG" -n "$CLUSTER" --query kubernetesVersion -o tsv)"
+          echo "finalVersion=$FINAL_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate upgrade report
+        if: always()
+        shell: bash
+        env:
+          RG: ${{ inputs.aksResourceGroup }}
+          CLUSTER: ${{ inputs.aksClusterName }}
+        run: |
+          NODE_POOL_TABLE="$(az aks nodepool list --cluster-name "$CLUSTER" --resource-group "$RG" \
+            --query "[].{Name:name, Version:orchestratorVersion, Mode:mode, Count:count}" -o table 2>/dev/null || echo "Unable to fetch node pool details")"
+
+          cat > upgrade-report.md << REPORT
+          # AKS Cluster Upgrade Report
+
+          ## Run Info
+          - **Triggered by**: ${{ github.actor }}
+          - **Run ID**: ${{ github.run_id }}
+          - **Timestamp**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          ## Cluster
+          | Field | Value |
+          |---|---|
+          | Cluster Name | ${{ inputs.aksClusterName }} |
+          | Resource Group | ${{ inputs.aksResourceGroup }} |
+          | Previous Version | ${{ needs.plan.outputs.currentVersion }} |
+          | Target Version | ${{ needs.plan.outputs.selectedVersion }} |
+          | Final Version | ${{ steps.validate.outputs.finalVersion || '(not reached)' }} |
+          | Job Status | ${{ job.status }} |
+
+          ## Upgrade Configuration
+          | Setting | Value |
+          |---|---|
+          | Control Plane Only | ${{ inputs.controlPlaneOnly }} |
+          | Max Surge | ${{ inputs.maxSurge }} |
+          | Drain Timeout | ${{ inputs.drainTimeoutMinutes }} minutes |
+          | Node Soak Duration | ${{ inputs.nodeSoakDurationMinutes }} minutes |
+          | Snapshot Created | ${{ inputs.createSnapshot }} |
+
+          ## Node Pool Details After Upgrade
+          ${NODE_POOL_TABLE}
+
+          ## Recovery (if upgrade failed mid-way)
+          1. Check cluster state: \`az aks show -n ${{ inputs.aksClusterName }} -g ${{ inputs.aksResourceGroup }}\`
+          2. Check node pool states: \`az aks nodepool list --cluster-name ${{ inputs.aksClusterName }} -g ${{ inputs.aksResourceGroup }} -o table\`
+          3. If control plane upgraded but worker nodes failed: re-run this pipeline with \`controlPlaneOnly=true\` first to confirm control plane is stable, then re-approve the worker-nodes stage.
+          4. Restore from snapshot if needed: \`az aks snapshot list -g ${{ inputs.aksResourceGroup }} -o table\`
+          REPORT
+
+          cat upgrade-report.md
+          echo "$(cat upgrade-report.md)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload upgrade report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aks-upgrade-report-${{ inputs.aksClusterName }}-${{ github.run_id }}
+          path: upgrade-report.md
+          retention-days: 90
+
+# --- OIDC setup notes (one-time, per project) ---
+# az ad app create --display-name "github-actions-aks-upgrade"
+# az ad sp create --id <appId>
+# az role assignment create --assignee <appId> --role Contributor --scope /subscriptions/<sub-id>
+# az ad app federated-credential create --id <appId> --parameters '{
+#   "name": "gh-env-aks-upgrade-control-plane",
+#   "issuer": "https://token.actions.githubusercontent.com",
+#   "subject": "repo:<owner>/<repo>:environment:aks-upgrade-control-plane",
+#   "audiences": ["api://AzureADTokenExchange"]
+# }'
+# (repeat federated-credential creation for subject environment:aks-upgrade-worker-nodes,
+#  and for the plan/validation jobs which have no environment — use
+#  "repo:<owner>/<repo>:ref:refs/heads/<branch>" as the subject instead)

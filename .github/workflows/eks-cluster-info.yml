@@ -1,0 +1,101 @@
+name: EKS Cluster Info
+
+# Standalone read-only EKS diagnostic pipeline — no dependency on any other
+# pipeline or repo. Drop this into any project for a quick cluster snapshot
+# without needing kubectl access locally.
+#
+# REQUIRED SECRET: AWS_EKS_ROLE_ARN (same OIDC role as upgrade-eks.yml —
+# reuse it, no new setup needed if you've already wired that one up)
+
+on:
+  workflow_dispatch:
+    inputs:
+      eksClusterName:
+        description: "EKS cluster name"
+        required: true
+        type: string
+      awsRegion:
+        description: "AWS region"
+        required: false
+        default: "us-east-1"
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  eks-info:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: AWS login (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_EKS_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Get EKS credentials
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+        run: aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
+
+      - name: Fetch cluster information
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+        run: |
+          echo "========== EKS CLUSTER INFO =========="
+          aws eks describe-cluster --name "$CLUSTER" --region "$REGION" \
+            --query "cluster.{ClusterName:name, Status:status, Version:version, Endpoint:endpoint, PlatformVersion:platformVersion}" \
+            --output table
+
+      - name: Fetch node group information
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+        run: |
+          echo "========== NODE GROUPS =========="
+          mapfile -t GROUPS < <(aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --query 'nodegroups[]' --output text | tr '\t' '\n')
+          for GROUP in "${GROUPS[@]}"; do
+            echo "--- $GROUP ---"
+            aws eks describe-nodegroup --cluster-name "$CLUSTER" --nodegroup-name "$GROUP" --region "$REGION" \
+              --query "nodegroup.{Name:nodegroupName, Status:status, Version:version, InstanceTypes:instanceTypes, DesiredSize:scalingConfig.desiredSize}" \
+              --output table
+          done
+
+      - name: Fetch worker node details
+        run: |
+          echo "========== WORKER NODE DETAILS =========="
+          kubectl get nodes -o wide
+
+      - name: Detailed node info
+        run: |
+          echo "========== NODE VERSION DETAILS =========="
+          kubectl get nodes -o custom-columns=\
+NAME:.metadata.name,\
+STATUS:.status.conditions[-1].type,\
+K8S_VERSION:.status.nodeInfo.kubeletVersion,\
+OS_IMAGE:.status.nodeInfo.osImage,\
+CONTAINER_RUNTIME:.status.nodeInfo.containerRuntimeVersion
+
+      - name: Summary
+        run: |
+          {
+            echo "## EKS Cluster Info"
+            echo ""
+            echo "- Cluster: \`${{ inputs.eksClusterName }}\`"
+            echo "- Region: \`${{ inputs.awsRegion }}\`"
+            echo ""
+            echo "Full details in the job logs above."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# --- OIDC setup notes ---
+# Reuses the same federated role trust as upgrade-eks.yml's branch-based
+# subject (this pipeline has no environment: block, so it authenticates
+# via the branch subject, e.g. repo:<owner>/<repo>:ref:refs/heads/main).
+# No additional AWS setup needed if that trust policy subject already exists.

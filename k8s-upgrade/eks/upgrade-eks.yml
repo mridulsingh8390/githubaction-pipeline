@@ -1,0 +1,462 @@
+name: EKS Cluster Upgrade Pipeline
+
+# Standalone EKS upgrade pipeline — no dependency on any other pipeline or
+# repo. Drop this into any project that needs EKS upgrades.
+#
+# REQUIRED SECRET: AWS_EKS_ROLE_ARN (OIDC role with eks:UpdateClusterVersion,
+# eks:UpdateNodegroupVersion, eks:DescribeUpdate, eks:DescribeCluster,
+# eks:ListNodegroups, eks:DescribeNodegroup)
+#
+# REQUIRED GITHUB ENVIRONMENTS (create under Settings → Environments):
+#   eks-upgrade-control-plane
+#   eks-upgrade-worker-nodes
+#
+# FEATURE PARITY NOTES vs. the AKS version of this pipeline — EKS genuinely
+# lacks native equivalents for a few things, so these are honest substitutes,
+# not disguised gaps:
+#   - No cluster snapshot API exists for EKS (control plane is fully managed
+#     by AWS, no user-triggerable snapshot). Substituted with a pre-upgrade
+#     STATE DUMP (cluster + node group config as JSON) uploaded as an
+#     artifact — useful for audit/rollback reference, NOT a restorable backup.
+#   - No per-node soak duration exists in the EKS API. Substituted with a
+#     coarser sleep BETWEEN node groups (interGroupSoakMinutes), not
+#     per-node like AKS's --node-soak-duration.
+#   - EKS node groups have no System/User "mode" field like AKS pools do —
+#     there's no built-in ordering concept to preserve, so groups are
+#     upgraded in listing order (or just the one you name).
+#   - EKS only allows one minor-version jump per upgrade call (API-enforced).
+#     If targetKubernetesVersion is blank, this pipeline auto-computes
+#     current+1 minor.
+
+on:
+  workflow_dispatch:
+    inputs:
+      eksClusterName:
+        description: "EKS cluster name"
+        required: true
+        type: string
+      awsRegion:
+        description: "AWS region"
+        required: false
+        default: "us-east-1"
+        type: string
+      targetKubernetesVersion:
+        description: "Target Kubernetes version. Leave blank to auto-pick current+1 minor."
+        required: false
+        default: ""
+        type: string
+      controlPlaneOnly:
+        description: "Upgrade only the control plane"
+        required: false
+        default: false
+        type: boolean
+      nodeGroupName:
+        description: "Specific node group to upgrade (blank = all node groups)"
+        required: false
+        default: ""
+        type: string
+      maxUnavailablePercentage:
+        description: "Max unavailable percentage during node group upgrade"
+        required: false
+        default: "33"
+        type: string
+      interGroupSoakMinutes:
+        description: "Minutes to wait after each node group finishes before starting the next (coarser than AKS's per-node soak — EKS has no per-node equivalent)"
+        required: false
+        default: "5"
+        type: string
+      createStateDump:
+        description: "Capture a pre-upgrade cluster/node-group state dump as an artifact (NOT a restorable snapshot — EKS has no snapshot API)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: eks-upgrade-${{ inputs.eksClusterName }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan Upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      currentVersion: ${{ steps.discover.outputs.currentVersion }}
+      selectedVersion: ${{ steps.discover.outputs.selectedVersion }}
+      hasUpgrade: ${{ steps.discover.outputs.hasUpgrade }}
+    steps:
+      - name: AWS login (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_EKS_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: Validate cluster exists and is active
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+        run: |
+          set -euo pipefail
+          STATUS="$(aws eks describe-cluster --name "$CLUSTER" --region "$REGION" --query 'cluster.status' --output text 2>/dev/null || echo "NOT_FOUND")"
+          if [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "::error::Cluster '$CLUSTER' not found in region '$REGION'."
+            exit 1
+          fi
+          [ "$STATUS" = "ACTIVE" ] || { echo "::error::Cluster status is $STATUS, expected ACTIVE."; exit 1; }
+
+      - name: Discover current & available versions
+        id: discover
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+          TARGET_INPUT: ${{ inputs.targetKubernetesVersion }}
+        run: |
+          set -euo pipefail
+
+          CURR="$(aws eks describe-cluster --name "$CLUSTER" --region "$REGION" --query 'cluster.version' --output text)"
+          echo "currentVersion=$CURR" >> "$GITHUB_OUTPUT"
+
+          NEXT_MINOR="$(echo "$CURR" | awk -F. '{print $1"."($2+1)}')"
+
+          if [ -n "$TARGET_INPUT" ]; then
+            SELECTED="$TARGET_INPUT"
+            CURR_MINOR="$(echo "$CURR" | cut -d. -f2)"
+            TARGET_MINOR="$(echo "$SELECTED" | cut -d. -f2)"
+            DIFF=$((TARGET_MINOR - CURR_MINOR))
+            if [ "$DIFF" -gt 1 ]; then
+              echo "::warning::EKS only supports upgrading one minor version at a time. $CURR -> $SELECTED may be rejected by the API."
+            elif [ "$DIFF" -lt 0 ]; then
+              echo "::error::Downgrade is not supported (target $SELECTED < current $CURR)."
+              exit 1
+            fi
+          else
+            SELECTED="$NEXT_MINOR"
+          fi
+
+          echo "selectedVersion=$SELECTED" >> "$GITHUB_OUTPUT"
+          if [ "$SELECTED" = "$CURR" ]; then
+            echo "hasUpgrade=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "hasUpgrade=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup kubectl
+        if: steps.discover.outputs.hasUpgrade == 'true'
+        uses: azure/setup-kubectl@v4
+
+      - name: Pre-upgrade health check (nodes + PDB scan)
+        if: steps.discover.outputs.hasUpgrade == 'true'
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
+
+          echo "--- Node status ---"
+          kubectl get nodes -o wide
+
+          NOT_READY="$(kubectl get nodes --no-headers | awk '$2!="Ready"' | wc -l)"
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "::error::$NOT_READY node(s) are not Ready. Aborting before upgrade."
+            kubectl get nodes --no-headers | awk '$2!="Ready"'
+            exit 1
+          fi
+
+          echo "--- Pod Disruption Budgets that may block draining (maxUnavailable=0) ---"
+          BLOCKING="$(kubectl get pdb --all-namespaces -o json 2>/dev/null | \
+            jq -r '.items[] | select((.spec.maxUnavailable == "0") or (.spec.maxUnavailable == 0)) | "\(.metadata.namespace)/\(.metadata.name)"')"
+          if [ -n "$BLOCKING" ]; then
+            echo "::warning::The following PDBs have maxUnavailable=0 and may stall node draining:"
+            echo "$BLOCKING" | sed 's/^/  - /'
+          else
+            echo "No drain-blocking PDBs detected."
+          fi
+
+      - name: Publish plan summary
+        shell: bash
+        run: |
+          {
+            echo "## EKS Upgrade Plan"
+            echo ""
+            echo "- Cluster: \`${{ inputs.eksClusterName }}\`"
+            echo "- Region: \`${{ inputs.awsRegion }}\`"
+            echo "- Current Version: \`${{ steps.discover.outputs.currentVersion }}\`"
+            echo "- Selected Target: \`${{ steps.discover.outputs.selectedVersion }}\`"
+            echo "- Upgrade Available: \`${{ steps.discover.outputs.hasUpgrade }}\`"
+            echo "- Control Plane Only: \`${{ inputs.controlPlaneOnly }}\`"
+            echo "- Node Group Input: \`${{ inputs.nodeGroupName || 'all node groups' }}\`"
+            echo ""
+            if [ "${{ steps.discover.outputs.hasUpgrade }}" = "false" ]; then
+              echo "> No upgrade available. Approving the upgrade stage is unnecessary."
+            else
+              echo "> Review this plan and any PDB warnings above, then approve the **upgrade-control-plane** environment job."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  upgrade-control-plane:
+    name: Upgrade Control Plane (approval required)
+    runs-on: ubuntu-latest
+    needs: plan
+    if: needs.plan.outputs.hasUpgrade == 'true'
+    timeout-minutes: 60
+    environment:
+      name: eks-upgrade-control-plane
+    steps:
+      - name: AWS login (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_EKS_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: Pre-upgrade state dump (NOT a restorable snapshot)
+        if: inputs.createStateDump == true
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+        run: |
+          set -euo pipefail
+          aws eks describe-cluster --name "$CLUSTER" --region "$REGION" > pre-upgrade-cluster-state.json
+          aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --query 'nodegroups[]' --output text | tr '\t' '\n' > nodegroup-names.txt
+          : > pre-upgrade-nodegroups-state.json
+          while read -r NG; do
+            aws eks describe-nodegroup --cluster-name "$CLUSTER" --nodegroup-name "$NG" --region "$REGION" >> pre-upgrade-nodegroups-state.json
+          done < nodegroup-names.txt
+          echo "State dump captured (cluster + $(wc -l < nodegroup-names.txt) node group(s))."
+
+      - name: Upload pre-upgrade state dump
+        if: inputs.createStateDump == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: eks-pre-upgrade-state-${{ inputs.eksClusterName }}-${{ github.run_id }}
+          path: |
+            pre-upgrade-cluster-state.json
+            pre-upgrade-nodegroups-state.json
+          if-no-files-found: ignore
+
+      - name: Upgrade control plane
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+          TARGET: ${{ needs.plan.outputs.selectedVersion }}
+        run: |
+          set -euo pipefail
+          UPDATE_ID="$(aws eks update-cluster-version --name "$CLUSTER" --region "$REGION" --kubernetes-version "$TARGET" --query 'update.id' --output text)"
+          echo "Started EKS control plane update: $UPDATE_ID"
+          STATUS="InProgress"
+          while [ "$STATUS" = "InProgress" ]; do
+            sleep 30
+            STATUS="$(aws eks describe-update --name "$CLUSTER" --region "$REGION" --update-id "$UPDATE_ID" --query 'update.status' --output text)"
+            echo "Status: $STATUS"
+          done
+          [ "$STATUS" = "Successful" ] || { echo "::error::EKS control plane update finished with status $STATUS"; exit 1; }
+
+      - name: Control plane upgrade summary
+        run: |
+          {
+            echo "## Control Plane Upgrade Completed"
+            echo ""
+            echo "- Cluster: \`${{ inputs.eksClusterName }}\`"
+            echo "- From: \`${{ needs.plan.outputs.currentVersion }}\`"
+            echo "- To: \`${{ needs.plan.outputs.selectedVersion }}\`"
+            echo ""
+            if [ "${{ inputs.controlPlaneOnly }}" = "true" ]; then
+              echo "> controlPlaneOnly was set — node group upgrade will be skipped."
+            else
+              echo "> Next: review and approve the **upgrade-worker-nodes** environment job to proceed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  upgrade-worker-nodes:
+    name: Upgrade Node Groups (separate approval required)
+    runs-on: ubuntu-latest
+    needs: [plan, upgrade-control-plane]
+    if: needs.plan.outputs.hasUpgrade == 'true' && inputs.controlPlaneOnly == false
+    timeout-minutes: 120
+    environment:
+      name: eks-upgrade-worker-nodes
+    steps:
+      - name: AWS login (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_EKS_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: Upgrade node groups
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+          TARGET: ${{ needs.plan.outputs.selectedVersion }}
+          GROUP_INPUT: ${{ inputs.nodeGroupName }}
+          MAX_UNAVAILABLE_PCT: ${{ inputs.maxUnavailablePercentage }}
+          SOAK_MINUTES: ${{ inputs.interGroupSoakMinutes }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$GROUP_INPUT" ]; then
+            GROUPS=("$GROUP_INPUT")
+          else
+            mapfile -t GROUPS < <(aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --query 'nodegroups[]' --output text | tr '\t' '\n')
+          fi
+
+          FIRST=true
+          for GROUP in "${GROUPS[@]}"; do
+            if [ "$FIRST" = false ] && [ "$SOAK_MINUTES" -gt 0 ]; then
+              echo "Soaking ${SOAK_MINUTES}m before next node group..."
+              sleep "$((SOAK_MINUTES * 60))"
+            fi
+            FIRST=false
+
+            echo "--- Upgrading node group: $GROUP ---"
+            aws eks update-nodegroup-config --cluster-name "$CLUSTER" --nodegroup-name "$GROUP" --region "$REGION" \
+              --update-config "maxUnavailablePercentage=${MAX_UNAVAILABLE_PCT}" \
+              || echo "::warning::Could not update surge config for $GROUP, continuing with existing config."
+
+            UPDATE_ID="$(aws eks update-nodegroup-version --cluster-name "$CLUSTER" --nodegroup-name "$GROUP" --region "$REGION" \
+              --kubernetes-version "$TARGET" --query 'update.id' --output text)"
+
+            STATUS="InProgress"
+            while [ "$STATUS" = "InProgress" ]; do
+              sleep 30
+              STATUS="$(aws eks describe-update --name "$CLUSTER" --nodegroup-name "$GROUP" --region "$REGION" --update-id "$UPDATE_ID" --query 'update.status' --output text)"
+              echo "  $GROUP status: $STATUS"
+            done
+            [ "$STATUS" = "Successful" ] || { echo "::error::EKS node group $GROUP update finished with status $STATUS"; exit 1; }
+          done
+
+  post-upgrade-validation:
+    name: Post-Upgrade Validation
+    runs-on: ubuntu-latest
+    needs: [plan, upgrade-control-plane, upgrade-worker-nodes]
+    if: |
+      always() &&
+      needs.upgrade-control-plane.result == 'success' &&
+      (needs.upgrade-worker-nodes.result == 'success' || needs.upgrade-worker-nodes.result == 'skipped')
+    timeout-minutes: 15
+    steps:
+      - name: AWS login (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_EKS_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Post-upgrade validation
+        id: validate
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
+
+          echo "Waiting for all nodes to be Ready (timeout 5 min)..."
+          kubectl wait --for=condition=ready nodes --all --timeout=300s || {
+            echo "::warning::Not all nodes reported Ready within 5 minutes."
+            kubectl get nodes
+          }
+
+          echo "--- Node status ---"
+          kubectl get nodes -o wide
+
+          NOT_READY="$(kubectl get nodes --no-headers | awk '$2!="Ready"' | wc -l)"
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "::error::$NOT_READY node(s) are not Ready after upgrade"
+            kubectl get nodes --no-headers | awk '$2!="Ready"'
+            exit 1
+          fi
+          echo "All nodes Ready."
+
+          echo "--- Non-healthy pods ---"
+          NON_HEALTHY="$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | grep -v -E '\s(Running|Completed|Succeeded)\s' | wc -l)"
+          if [ "$NON_HEALTHY" -gt 0 ]; then
+            echo "::warning::$NON_HEALTHY pod(s) are not in Running/Completed state:"
+            kubectl get pods --all-namespaces | grep -v -E '\s(Running|Completed|Succeeded)\s'
+          else
+            echo "All pods healthy."
+          fi
+
+          FINAL_VERSION="$(aws eks describe-cluster --name "$CLUSTER" --region "$REGION" --query 'cluster.version' --output text)"
+          echo "finalVersion=$FINAL_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate upgrade report
+        if: always()
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.eksClusterName }}
+          REGION: ${{ inputs.awsRegion }}
+        run: |
+          NODE_GROUP_TABLE="$(aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --query 'nodegroups[]' --output text 2>/dev/null | tr '\t' '\n' || echo "Unable to fetch node groups")"
+
+          cat > upgrade-report.md << REPORT
+          # EKS Cluster Upgrade Report
+
+          ## Run Info
+          - **Triggered by**: ${{ github.actor }}
+          - **Run ID**: ${{ github.run_id }}
+          - **Timestamp**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          ## Cluster
+          | Field | Value |
+          |---|---|
+          | Cluster Name | ${{ inputs.eksClusterName }} |
+          | Region | ${{ inputs.awsRegion }} |
+          | Previous Version | ${{ needs.plan.outputs.currentVersion }} |
+          | Target Version | ${{ needs.plan.outputs.selectedVersion }} |
+          | Final Version | ${{ steps.validate.outputs.finalVersion || '(not reached)' }} |
+          | Job Status | ${{ job.status }} |
+
+          ## Upgrade Configuration
+          | Setting | Value |
+          |---|---|
+          | Control Plane Only | ${{ inputs.controlPlaneOnly }} |
+          | Max Unavailable % | ${{ inputs.maxUnavailablePercentage }} |
+          | Inter-Group Soak | ${{ inputs.interGroupSoakMinutes }} minutes |
+          | State Dump Created | ${{ inputs.createStateDump }} (not a restorable snapshot — see pipeline notes) |
+
+          ## Node Groups
+          ${NODE_GROUP_TABLE}
+
+          ## Recovery (if upgrade failed mid-way)
+          1. Check cluster state: \`aws eks describe-cluster --name ${{ inputs.eksClusterName }} --region ${{ inputs.awsRegion }}\`
+          2. Check node group states: \`aws eks describe-nodegroup --cluster-name ${{ inputs.eksClusterName }} --nodegroup-name <name> --region ${{ inputs.awsRegion }}\`
+          3. If control plane upgraded but node groups failed: re-run this pipeline with \`controlPlaneOnly=true\` first to confirm control plane is stable, then re-approve the worker-nodes stage.
+          4. EKS has no snapshot/restore API — recovery from a bad node group upgrade means fixing forward (re-running the update) rather than rolling back, since AWS manages the control plane state directly.
+          REPORT
+
+          cat upgrade-report.md
+          echo "$(cat upgrade-report.md)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload upgrade report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eks-upgrade-report-${{ inputs.eksClusterName }}-${{ github.run_id }}
+          path: upgrade-report.md
+          retention-days: 90
+
+# --- OIDC setup notes (one-time, per project) ---
+# AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+# aws iam create-open-id-connect-provider --url https://token.actions.githubusercontent.com \
+#   --client-id-list sts.amazonaws.com \
+#   --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1   # (skip if already created for another workflow)
+#
+# Trust policy subjects needed: repo:<owner>/<repo>:ref:refs/heads/<branch>
+# (for plan/validation), plus repo:<owner>/<repo>:environment:eks-upgrade-control-plane
+# and repo:<owner>/<repo>:environment:eks-upgrade-worker-nodes
+#
+# Attach a policy granting: eks:UpdateClusterVersion, eks:UpdateNodegroupVersion,
+# eks:DescribeUpdate, eks:DescribeCluster, eks:ListNodegroups, eks:DescribeNodegroup

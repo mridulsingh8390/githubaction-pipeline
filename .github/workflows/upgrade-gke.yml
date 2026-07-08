@@ -1,0 +1,476 @@
+name: GKE Cluster Upgrade Pipeline
+
+# Standalone GKE upgrade pipeline — no dependency on any other pipeline or
+# repo. Drop this into any project that needs GKE upgrades.
+#
+# REQUIRED SECRETS: GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT
+#
+# REQUIRED GITHUB ENVIRONMENTS (create under Settings → Environments):
+#   gke-upgrade-control-plane
+#   gke-upgrade-worker-nodes
+#
+# FEATURE PARITY NOTES vs. the AKS version of this pipeline — GKE also
+# lacks native equivalents for a few things:
+#   - No cluster snapshot API exists for GKE (control plane is fully managed
+#     by Google, no user-triggerable snapshot). Substituted with a
+#     pre-upgrade STATE DUMP (cluster + node pool config as JSON) uploaded
+#     as an artifact — audit/rollback reference only, NOT a restorable backup.
+#   - No per-node soak duration exists in the GKE API. Substituted with a
+#     coarser sleep BETWEEN node pools (interPoolSoakMinutes).
+#   - GKE node pools have no System/User "mode" field like AKS pools do —
+#     pools are upgraded in listing order (or just the one you name).
+#   - maxSurgeUpgrade is GKE's native integer surge count (not a percentage
+#     — GKE doesn't support percentage-based surge like AKS does).
+
+on:
+  workflow_dispatch:
+    inputs:
+      gkeClusterName:
+        description: "GKE cluster name"
+        required: true
+        type: string
+      gkeLocation:
+        description: "Zone or region (e.g. us-central1-a)"
+        required: true
+        type: string
+      gcpProject:
+        description: "GCP project ID"
+        required: true
+        type: string
+      targetKubernetesVersion:
+        description: "Target Kubernetes version. Leave blank to auto-pick the latest allowed upgrade."
+        required: false
+        default: ""
+        type: string
+      controlPlaneOnly:
+        description: "Upgrade only the control plane"
+        required: false
+        default: false
+        type: boolean
+      nodePoolName:
+        description: "Specific node pool to upgrade (blank = all pools)"
+        required: false
+        default: ""
+        type: string
+      maxSurgeUpgrade:
+        description: "Max surge node count during node pool upgrade (integer, not percentage)"
+        required: false
+        default: "1"
+        type: string
+      interPoolSoakMinutes:
+        description: "Minutes to wait after each node pool finishes before starting the next (coarser than AKS's per-node soak — GKE has no per-node equivalent)"
+        required: false
+        default: "5"
+        type: string
+      createStateDump:
+        description: "Capture a pre-upgrade cluster/node-pool state dump as an artifact (NOT a restorable snapshot — GKE has no snapshot API)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: gke-upgrade-${{ inputs.gkeClusterName }}-${{ inputs.gkeLocation }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan Upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      currentVersion: ${{ steps.discover.outputs.currentVersion }}
+      selectedVersion: ${{ steps.discover.outputs.selectedVersion }}
+      hasUpgrade: ${{ steps.discover.outputs.hasUpgrade }}
+    steps:
+      - name: GCP login (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Validate cluster exists and is running
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+        run: |
+          set -euo pipefail
+          STATUS="$(gcloud container clusters describe "$CLUSTER" --location "$LOCATION" --project "$PROJECT" --format='value(status)' 2>/dev/null || echo "NOT_FOUND")"
+          if [ "$STATUS" = "NOT_FOUND" ]; then
+            echo "::error::Cluster '$CLUSTER' not found in location '$LOCATION'."
+            exit 1
+          fi
+          [ "$STATUS" = "RUNNING" ] || { echo "::error::Cluster status is $STATUS, expected RUNNING."; exit 1; }
+
+      - name: Discover current & available versions
+        id: discover
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+          TARGET_INPUT: ${{ inputs.targetKubernetesVersion }}
+        run: |
+          set -euo pipefail
+
+          CURR="$(gcloud container clusters describe "$CLUSTER" --location "$LOCATION" --project "$PROJECT" --format='value(currentMasterVersion)')"
+          echo "currentVersion=$CURR" >> "$GITHUB_OUTPUT"
+
+          gcloud container get-server-config --location "$LOCATION" --project "$PROJECT" --format=json > serverconfig.json
+          mapfile -t UPGRADES < <(jq -r '.validMasterVersions[]? // empty' serverconfig.json)
+
+          if [ "${#UPGRADES[@]}" -eq 0 ]; then
+            echo "No upgrades available."
+            echo "selectedVersion=$CURR" >> "$GITHUB_OUTPUT"
+            echo "hasUpgrade=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "$TARGET_INPUT" ]; then
+            if printf '%s\n' "${UPGRADES[@]}" | grep -qx "$TARGET_INPUT"; then
+              SELECTED="$TARGET_INPUT"
+            else
+              echo "::error::Requested target '$TARGET_INPUT' not in allowed upgrades: ${UPGRADES[*]}"
+              exit 1
+            fi
+          else
+            SELECTED="$(printf '%s\n' "${UPGRADES[@]}" | sort -V | tail -n1)"
+          fi
+
+          echo "selectedVersion=$SELECTED" >> "$GITHUB_OUTPUT"
+          if [ "$SELECTED" = "$CURR" ]; then
+            echo "hasUpgrade=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "hasUpgrade=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install GKE auth plugin
+        if: steps.discover.outputs.hasUpgrade == 'true'
+        run: sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk-gke-gcloud-auth-plugin
+
+      - name: Setup kubectl
+        if: steps.discover.outputs.hasUpgrade == 'true'
+        uses: azure/setup-kubectl@v4
+
+      - name: Pre-upgrade health check (nodes + PDB scan)
+        if: steps.discover.outputs.hasUpgrade == 'true'
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+          USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
+        run: |
+          set -euo pipefail
+          gcloud container clusters get-credentials "$CLUSTER" --location "$LOCATION" --project "$PROJECT"
+
+          echo "--- Node status ---"
+          kubectl get nodes -o wide
+
+          NOT_READY="$(kubectl get nodes --no-headers | awk '$2!="Ready"' | wc -l)"
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "::error::$NOT_READY node(s) are not Ready. Aborting before upgrade."
+            kubectl get nodes --no-headers | awk '$2!="Ready"'
+            exit 1
+          fi
+
+          echo "--- Pod Disruption Budgets that may block draining (maxUnavailable=0) ---"
+          BLOCKING="$(kubectl get pdb --all-namespaces -o json 2>/dev/null | \
+            jq -r '.items[] | select((.spec.maxUnavailable == "0") or (.spec.maxUnavailable == 0)) | "\(.metadata.namespace)/\(.metadata.name)"')"
+          if [ -n "$BLOCKING" ]; then
+            echo "::warning::The following PDBs have maxUnavailable=0 and may stall node draining:"
+            echo "$BLOCKING" | sed 's/^/  - /'
+          else
+            echo "No drain-blocking PDBs detected."
+          fi
+
+      - name: Publish plan summary
+        shell: bash
+        run: |
+          {
+            echo "## GKE Upgrade Plan"
+            echo ""
+            echo "- Cluster: \`${{ inputs.gkeClusterName }}\`"
+            echo "- Location: \`${{ inputs.gkeLocation }}\`"
+            echo "- Current Version: \`${{ steps.discover.outputs.currentVersion }}\`"
+            echo "- Selected Target: \`${{ steps.discover.outputs.selectedVersion }}\`"
+            echo "- Upgrade Available: \`${{ steps.discover.outputs.hasUpgrade }}\`"
+            echo "- Control Plane Only: \`${{ inputs.controlPlaneOnly }}\`"
+            echo "- Node Pool Input: \`${{ inputs.nodePoolName || 'all pools' }}\`"
+            echo ""
+            if [ "${{ steps.discover.outputs.hasUpgrade }}" = "false" ]; then
+              echo "> No upgrade available. Approving the upgrade stage is unnecessary."
+            else
+              echo "> Review this plan and any PDB warnings above, then approve the **upgrade-control-plane** environment job."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  upgrade-control-plane:
+    name: Upgrade Control Plane (approval required)
+    runs-on: ubuntu-latest
+    needs: plan
+    if: needs.plan.outputs.hasUpgrade == 'true'
+    timeout-minutes: 60
+    environment:
+      name: gke-upgrade-control-plane
+    steps:
+      - name: GCP login (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Pre-upgrade state dump (NOT a restorable snapshot)
+        if: inputs.createStateDump == true
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+        run: |
+          set -euo pipefail
+          gcloud container clusters describe "$CLUSTER" --location "$LOCATION" --project "$PROJECT" --format=json > pre-upgrade-cluster-state.json
+          gcloud container node-pools list --cluster "$CLUSTER" --location "$LOCATION" --project "$PROJECT" --format=json > pre-upgrade-nodepools-state.json
+          echo "State dump captured."
+
+      - name: Upload pre-upgrade state dump
+        if: inputs.createStateDump == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: gke-pre-upgrade-state-${{ inputs.gkeClusterName }}-${{ github.run_id }}
+          path: |
+            pre-upgrade-cluster-state.json
+            pre-upgrade-nodepools-state.json
+          if-no-files-found: ignore
+
+      - name: Upgrade control plane
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+          TARGET: ${{ needs.plan.outputs.selectedVersion }}
+        run: |
+          set -euo pipefail
+          gcloud container clusters upgrade "$CLUSTER" --master --cluster-version="$TARGET" \
+            --location="$LOCATION" --project="$PROJECT" --quiet
+
+      - name: Control plane upgrade summary
+        run: |
+          {
+            echo "## Control Plane Upgrade Completed"
+            echo ""
+            echo "- Cluster: \`${{ inputs.gkeClusterName }}\`"
+            echo "- From: \`${{ needs.plan.outputs.currentVersion }}\`"
+            echo "- To: \`${{ needs.plan.outputs.selectedVersion }}\`"
+            echo ""
+            if [ "${{ inputs.controlPlaneOnly }}" = "true" ]; then
+              echo "> controlPlaneOnly was set — node pool upgrade will be skipped."
+            else
+              echo "> Next: review and approve the **upgrade-worker-nodes** environment job to proceed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  upgrade-worker-nodes:
+    name: Upgrade Node Pools (separate approval required)
+    runs-on: ubuntu-latest
+    needs: [plan, upgrade-control-plane]
+    if: needs.plan.outputs.hasUpgrade == 'true' && inputs.controlPlaneOnly == false
+    timeout-minutes: 120
+    environment:
+      name: gke-upgrade-worker-nodes
+    steps:
+      - name: GCP login (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upgrade node pools
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+          TARGET: ${{ needs.plan.outputs.selectedVersion }}
+          POOL_INPUT: ${{ inputs.nodePoolName }}
+          MAX_SURGE: ${{ inputs.maxSurgeUpgrade }}
+          SOAK_MINUTES: ${{ inputs.interPoolSoakMinutes }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$POOL_INPUT" ]; then
+            POOLS=("$POOL_INPUT")
+          else
+            mapfile -t POOLS < <(gcloud container node-pools list --cluster "$CLUSTER" --location "$LOCATION" --project "$PROJECT" --format='value(name)')
+          fi
+
+          FIRST=true
+          for POOL in "${POOLS[@]}"; do
+            if [ "$FIRST" = false ] && [ "$SOAK_MINUTES" -gt 0 ]; then
+              echo "Soaking ${SOAK_MINUTES}m before next node pool..."
+              sleep "$((SOAK_MINUTES * 60))"
+            fi
+            FIRST=false
+
+            echo "--- Upgrading node pool: $POOL ---"
+            gcloud container node-pools update "$POOL" --cluster "$CLUSTER" --location "$LOCATION" --project "$PROJECT" \
+              --max-surge-upgrade="$MAX_SURGE" --max-unavailable-upgrade=0 --quiet \
+              || echo "::warning::Could not update surge config for $POOL, continuing with existing config."
+
+            gcloud container clusters upgrade "$CLUSTER" --node-pool="$POOL" --cluster-version="$TARGET" \
+              --location="$LOCATION" --project="$PROJECT" --quiet
+          done
+
+  post-upgrade-validation:
+    name: Post-Upgrade Validation
+    runs-on: ubuntu-latest
+    needs: [plan, upgrade-control-plane, upgrade-worker-nodes]
+    if: |
+      always() &&
+      needs.upgrade-control-plane.result == 'success' &&
+      (needs.upgrade-worker-nodes.result == 'success' || needs.upgrade-worker-nodes.result == 'skipped')
+    timeout-minutes: 15
+    steps:
+      - name: GCP login (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install GKE auth plugin
+        run: sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk-gke-gcloud-auth-plugin
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Post-upgrade validation
+        id: validate
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+          USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
+        run: |
+          set -euo pipefail
+          gcloud container clusters get-credentials "$CLUSTER" --location "$LOCATION" --project "$PROJECT"
+
+          echo "Waiting for all nodes to be Ready (timeout 5 min)..."
+          kubectl wait --for=condition=ready nodes --all --timeout=300s || {
+            echo "::warning::Not all nodes reported Ready within 5 minutes."
+            kubectl get nodes
+          }
+
+          echo "--- Node status ---"
+          kubectl get nodes -o wide
+
+          NOT_READY="$(kubectl get nodes --no-headers | awk '$2!="Ready"' | wc -l)"
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "::error::$NOT_READY node(s) are not Ready after upgrade"
+            kubectl get nodes --no-headers | awk '$2!="Ready"'
+            exit 1
+          fi
+          echo "All nodes Ready."
+
+          echo "--- Non-healthy pods ---"
+          NON_HEALTHY="$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | grep -v -E '\s(Running|Completed|Succeeded)\s' | wc -l)"
+          if [ "$NON_HEALTHY" -gt 0 ]; then
+            echo "::warning::$NON_HEALTHY pod(s) are not in Running/Completed state:"
+            kubectl get pods --all-namespaces | grep -v -E '\s(Running|Completed|Succeeded)\s'
+          else
+            echo "All pods healthy."
+          fi
+
+          FINAL_VERSION="$(gcloud container clusters describe "$CLUSTER" --location "$LOCATION" --project "$PROJECT" --format='value(currentMasterVersion)')"
+          echo "finalVersion=$FINAL_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate upgrade report
+        if: always()
+        shell: bash
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+        run: |
+          NODE_POOL_TABLE="$(gcloud container node-pools list --cluster "$CLUSTER" --location "$LOCATION" --project "$PROJECT" --format='table(name, version, status)' 2>/dev/null || echo "Unable to fetch node pools")"
+
+          cat > upgrade-report.md << REPORT
+          # GKE Cluster Upgrade Report
+
+          ## Run Info
+          - **Triggered by**: ${{ github.actor }}
+          - **Run ID**: ${{ github.run_id }}
+          - **Timestamp**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          ## Cluster
+          | Field | Value |
+          |---|---|
+          | Cluster Name | ${{ inputs.gkeClusterName }} |
+          | Location | ${{ inputs.gkeLocation }} |
+          | Previous Version | ${{ needs.plan.outputs.currentVersion }} |
+          | Target Version | ${{ needs.plan.outputs.selectedVersion }} |
+          | Final Version | ${{ steps.validate.outputs.finalVersion || '(not reached)' }} |
+          | Job Status | ${{ job.status }} |
+
+          ## Upgrade Configuration
+          | Setting | Value |
+          |---|---|
+          | Control Plane Only | ${{ inputs.controlPlaneOnly }} |
+          | Max Surge Upgrade | ${{ inputs.maxSurgeUpgrade }} |
+          | Inter-Pool Soak | ${{ inputs.interPoolSoakMinutes }} minutes |
+          | State Dump Created | ${{ inputs.createStateDump }} (not a restorable snapshot — see pipeline notes) |
+
+          ## Node Pools
+          ${NODE_POOL_TABLE}
+
+          ## Recovery (if upgrade failed mid-way)
+          1. Check cluster state: \`gcloud container clusters describe ${{ inputs.gkeClusterName }} --location ${{ inputs.gkeLocation }} --project ${{ inputs.gcpProject }}\`
+          2. Check node pool states: \`gcloud container node-pools list --cluster ${{ inputs.gkeClusterName }} --location ${{ inputs.gkeLocation }} --project ${{ inputs.gcpProject }}\`
+          3. If control plane upgraded but node pools failed: re-run this pipeline with \`controlPlaneOnly=true\` first to confirm control plane is stable, then re-approve the worker-nodes stage.
+          4. GKE has no snapshot/restore API — recovery from a bad node pool upgrade means fixing forward rather than rolling back, since Google manages the control plane state directly.
+          REPORT
+
+          cat upgrade-report.md
+          echo "$(cat upgrade-report.md)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload upgrade report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gke-upgrade-report-${{ inputs.gkeClusterName }}-${{ github.run_id }}
+          path: upgrade-report.md
+          retention-days: 90
+
+# --- OIDC setup notes (one-time, per project) ---
+# PROJECT_NUMBER=$(gcloud projects describe <project-id> --format='value(projectNumber)')
+# gcloud iam workload-identity-pools create github-pool --location=global
+# gcloud iam workload-identity-pools providers create-oidc github-provider \
+#   --location=global --workload-identity-pool=github-pool \
+#   --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
+#   --issuer-uri="https://token.actions.githubusercontent.com"
+# gcloud iam service-accounts create github-actions-sa
+# gcloud iam service-accounts add-iam-policy-binding \
+#   github-actions-sa@<project-id>.iam.gserviceaccount.com \
+#   --role=roles/iam.workloadIdentityUser \
+#   --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github-pool/attribute.repository/<owner>/<repo>"
+# gcloud projects add-iam-policy-binding <project-id> \
+#   --member="serviceAccount:github-actions-sa@<project-id>.iam.gserviceaccount.com" \
+#   --role=roles/container.admin

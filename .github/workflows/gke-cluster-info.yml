@@ -1,0 +1,109 @@
+name: GKE Cluster Info
+
+# Standalone read-only GKE diagnostic pipeline — no dependency on any other
+# pipeline or repo. Drop this into any project for a quick cluster snapshot
+# without needing kubectl access locally.
+#
+# REQUIRED SECRETS: GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT
+# (same OIDC identity as upgrade-gke.yml — reuse it, no new setup needed if
+# you've already wired that one up)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gkeClusterName:
+        description: "GKE cluster name"
+        required: true
+        type: string
+      gkeLocation:
+        description: "Zone or region (e.g. us-central1-a)"
+        required: true
+        type: string
+      gcpProject:
+        description: "GCP project ID"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  gke-info:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: GCP login (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install GKE auth plugin
+        run: sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk-gke-gcloud-auth-plugin
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Get GKE credentials
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+          USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
+        run: gcloud container clusters get-credentials "$CLUSTER" --location "$LOCATION" --project "$PROJECT"
+
+      - name: Fetch cluster information
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+        run: |
+          echo "========== GKE CLUSTER INFO =========="
+          gcloud container clusters describe "$CLUSTER" --location "$LOCATION" --project "$PROJECT" \
+            --format="table(name, location, currentMasterVersion, status, network, ipAllocationPolicy.useIpAliases)"
+
+      - name: Fetch node pool information
+        env:
+          CLUSTER: ${{ inputs.gkeClusterName }}
+          LOCATION: ${{ inputs.gkeLocation }}
+          PROJECT: ${{ inputs.gcpProject }}
+        run: |
+          echo "========== NODE POOLS =========="
+          gcloud container node-pools list --cluster "$CLUSTER" --location "$LOCATION" --project "$PROJECT" \
+            --format="table(name, version, status, config.machineType, initialNodeCount)"
+
+      - name: Fetch worker node details
+        run: |
+          echo "========== WORKER NODE DETAILS =========="
+          kubectl get nodes -o wide
+
+      - name: Detailed node info
+        run: |
+          echo "========== NODE VERSION DETAILS =========="
+          kubectl get nodes -o custom-columns=\
+NAME:.metadata.name,\
+STATUS:.status.conditions[-1].type,\
+K8S_VERSION:.status.nodeInfo.kubeletVersion,\
+OS_IMAGE:.status.nodeInfo.osImage,\
+CONTAINER_RUNTIME:.status.nodeInfo.containerRuntimeVersion
+
+      - name: Summary
+        run: |
+          {
+            echo "## GKE Cluster Info"
+            echo ""
+            echo "- Cluster: \`${{ inputs.gkeClusterName }}\`"
+            echo "- Location: \`${{ inputs.gkeLocation }}\`"
+            echo ""
+            echo "Full details in the job logs above."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# --- OIDC setup notes ---
+# Reuses the same Workload Identity Federation binding as upgrade-gke.yml's
+# branch-based subject (this pipeline has no environment: block, so it
+# authenticates via the branch subject). No additional GCP setup needed if
+# that binding already exists.
