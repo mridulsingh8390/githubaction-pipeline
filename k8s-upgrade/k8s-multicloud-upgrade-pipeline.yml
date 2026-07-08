@@ -1,0 +1,537 @@
+name: Multi-Cloud Kubernetes Upgrade Pipeline (AKS / EKS / GKE)
+
+# Select clusterProvider = aks | eks | gke. The same plan -> upgrade
+# (manual approval) flow runs for all three; every step branches on
+# the provider internally. Only fill in the input block matching your
+# chosen provider — the others are ignored.
+#
+# KNOWN PROVIDER DIFFERENCES (not fully unifiable):
+#   - EKS only allows a single minor-version jump per upgrade (API-enforced).
+#     If no target is given, this pipeline auto-computes current+1 minor.
+#   - drainTimeoutMinutes only has a direct CLI equivalent on AKS.
+#     EKS/GKE steps print a warning and fall back to provider defaults.
+#   - maxSurge as a percentage is native to AKS. For GKE it's converted to
+#     an integer surge count (not a true equivalent). EKS instead uses
+#     maxUnavailablePercentage on the node group's updateConfig.
+#
+# REQUIRED SECRETS (only the set matching your provider is needed):
+#   AKS: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   EKS: AWS_EKS_ROLE_ARN (OIDC role with eks:* + ec2 describe perms)
+#   GKE: GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT
+
+on:
+  workflow_dispatch:
+    inputs:
+      clusterProvider:
+        description: "Which managed Kubernetes service to upgrade"
+        required: true
+        type: choice
+        default: "aks"
+        options:
+          - aks
+          - eks
+          - gke
+
+      # --- AKS-specific ---
+      aksResourceGroup:
+        description: "[AKS] Resource group"
+        required: false
+        type: string
+      aksClusterName:
+        description: "[AKS] Cluster name"
+        required: false
+        type: string
+
+      # --- EKS-specific ---
+      eksClusterName:
+        description: "[EKS] Cluster name"
+        required: false
+        type: string
+      awsRegion:
+        description: "[EKS] AWS region"
+        required: false
+        default: "us-east-1"
+        type: string
+
+      # --- GKE-specific ---
+      gkeClusterName:
+        description: "[GKE] Cluster name"
+        required: false
+        type: string
+      gkeLocation:
+        description: "[GKE] Zone or region (e.g. us-central1-a or us-central1)"
+        required: false
+        type: string
+      gcpProject:
+        description: "[GKE] GCP project ID"
+        required: false
+        type: string
+
+      # --- Common ---
+      targetKubernetesVersion:
+        description: "Target Kubernetes version. Leave blank to auto-pick (latest allowed for AKS/GKE, current+1 minor for EKS)."
+        required: false
+        default: ""
+        type: string
+      controlPlaneOnly:
+        description: "Upgrade only the control plane"
+        required: false
+        default: false
+        type: boolean
+      nodePoolName:
+        description: "Specific node pool/group to upgrade (blank = all)"
+        required: false
+        default: ""
+        type: string
+      maxSurge:
+        description: "Max surge for node pool upgrades (percentage for AKS, integer count for GKE, ignored for EKS)"
+        required: false
+        default: "33%"
+        type: string
+      drainTimeoutMinutes:
+        description: "Drain timeout in minutes (AKS only — EKS/GKE use provider defaults)"
+        required: false
+        default: "30"
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: k8s-upgrade-${{ inputs.clusterProvider }}-${{ inputs.aksClusterName }}${{ inputs.eksClusterName }}${{ inputs.gkeClusterName }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan Upgrade
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      currentVersion: ${{ steps.discover.outputs.currentVersion }}
+      selectedVersion: ${{ steps.discover.outputs.selectedVersion }}
+      hasUpgrade: ${{ steps.discover.outputs.hasUpgrade }}
+    steps:
+      - name: Validate required inputs for selected provider
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.clusterProvider }}" in
+            aks)
+              [ -n "${{ inputs.aksResourceGroup }}" ] && [ -n "${{ inputs.aksClusterName }}" ] || { echo "::error::aksResourceGroup and aksClusterName are required for AKS."; exit 1; }
+              ;;
+            eks)
+              [ -n "${{ inputs.eksClusterName }}" ] || { echo "::error::eksClusterName is required for EKS."; exit 1; }
+              ;;
+            gke)
+              [ -n "${{ inputs.gkeClusterName }}" ] && [ -n "${{ inputs.gkeLocation }}" ] && [ -n "${{ inputs.gcpProject }}" ] || { echo "::error::gkeClusterName, gkeLocation, and gcpProject are required for GKE."; exit 1; }
+              ;;
+          esac
+
+      - name: Azure login (OIDC)
+        if: inputs.clusterProvider == 'aks'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: AWS login (OIDC)
+        if: inputs.clusterProvider == 'eks'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_EKS_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: GCP login (Workload Identity Federation)
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Discover current & available versions
+        id: discover
+        shell: bash
+        env:
+          PROVIDER: ${{ inputs.clusterProvider }}
+          TARGET_INPUT: ${{ inputs.targetKubernetesVersion }}
+          AKS_RG: ${{ inputs.aksResourceGroup }}
+          AKS_CLUSTER: ${{ inputs.aksClusterName }}
+          EKS_CLUSTER: ${{ inputs.eksClusterName }}
+          AWS_REGION_IN: ${{ inputs.awsRegion }}
+          GKE_CLUSTER: ${{ inputs.gkeClusterName }}
+          GKE_LOCATION: ${{ inputs.gkeLocation }}
+          GCP_PROJECT: ${{ inputs.gcpProject }}
+        run: |
+          set -euo pipefail
+          UPGRADES=()
+
+          case "$PROVIDER" in
+            aks)
+              CURR="$(az aks show -g "$AKS_RG" -n "$AKS_CLUSTER" --query kubernetesVersion -o tsv)"
+              az aks get-upgrades -g "$AKS_RG" -n "$AKS_CLUSTER" -o json > upgrades.json
+              mapfile -t UPGRADES < <(jq -r '.controlPlaneProfile.upgrades[]?.kubernetesVersion // empty' upgrades.json)
+              ;;
+            eks)
+              CURR="$(aws eks describe-cluster --name "$EKS_CLUSTER" --region "$AWS_REGION_IN" --query 'cluster.version' --output text)"
+              # EKS only supports one minor-version jump at a time.
+              NEXT_MINOR="$(echo "$CURR" | awk -F. '{print $1"."($2+1)}')"
+              UPGRADES=("$NEXT_MINOR")
+              ;;
+            gke)
+              CURR="$(gcloud container clusters describe "$GKE_CLUSTER" --location "$GKE_LOCATION" --project "$GCP_PROJECT" --format='value(currentMasterVersion)')"
+              gcloud container get-server-config --location "$GKE_LOCATION" --project "$GCP_PROJECT" --format=json > serverconfig.json
+              mapfile -t UPGRADES < <(jq -r '.validMasterVersions[]? // empty' serverconfig.json)
+              ;;
+          esac
+
+          echo "currentVersion=$CURR" >> "$GITHUB_OUTPUT"
+
+          if [ "${#UPGRADES[@]}" -eq 0 ]; then
+            echo "No upgrades available."
+            echo "selectedVersion=$CURR" >> "$GITHUB_OUTPUT"
+            echo "hasUpgrade=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -n "$TARGET_INPUT" ]; then
+            if [ "$PROVIDER" = "eks" ]; then
+              SELECTED="$TARGET_INPUT"
+              CURR_MINOR="$(echo "$CURR" | cut -d. -f2)"
+              TARGET_MINOR="$(echo "$SELECTED" | cut -d. -f2)"
+              if [ "$((TARGET_MINOR - CURR_MINOR))" -ne 1 ]; then
+                echo "::warning::EKS only supports upgrading one minor version at a time. $CURR -> $SELECTED may be rejected by the API."
+              fi
+            else
+              if printf '%s\n' "${UPGRADES[@]}" | grep -qx "$TARGET_INPUT"; then
+                SELECTED="$TARGET_INPUT"
+              else
+                echo "::error::Requested target '$TARGET_INPUT' not in allowed upgrades: ${UPGRADES[*]}"
+                exit 1
+              fi
+            fi
+          else
+            SELECTED="$(printf '%s\n' "${UPGRADES[@]}" | sort -V | tail -n1)"
+          fi
+
+          echo "selectedVersion=$SELECTED" >> "$GITHUB_OUTPUT"
+          if [ "$SELECTED" = "$CURR" ]; then
+            echo "hasUpgrade=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "hasUpgrade=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish plan summary
+        shell: bash
+        run: |
+          {
+            echo "## Kubernetes Upgrade Plan"
+            echo ""
+            echo "- Provider: \`${{ inputs.clusterProvider }}\`"
+            echo "- Current Version: \`${{ steps.discover.outputs.currentVersion }}\`"
+            echo "- Selected Target: \`${{ steps.discover.outputs.selectedVersion }}\`"
+            echo "- Upgrade Available: \`${{ steps.discover.outputs.hasUpgrade }}\`"
+            echo "- Control Plane Only: \`${{ inputs.controlPlaneOnly }}\`"
+            echo "- Node Pool Input: \`${{ inputs.nodePoolName || 'all pools' }}\`"
+            echo ""
+            if [ "${{ steps.discover.outputs.hasUpgrade }}" = "false" ]; then
+              echo "> No upgrade available. Approving the upgrade stage is unnecessary."
+            else
+              echo "> Review this plan, then approve the **upgrade** environment job."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  upgrade-control-plane:
+    name: Upgrade Control Plane (approval required)
+    runs-on: ubuntu-latest
+    needs: plan
+    if: needs.plan.outputs.hasUpgrade == 'true'
+    timeout-minutes: 60
+    environment:
+      name: k8s-upgrade-control-plane # configure required reviewers in repo settings
+    steps:
+      - name: Azure login (OIDC)
+        if: inputs.clusterProvider == 'aks'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: AWS login (OIDC)
+        if: inputs.clusterProvider == 'eks'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_EKS_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: GCP login (Workload Identity Federation)
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upgrade control plane
+        shell: bash
+        env:
+          PROVIDER: ${{ inputs.clusterProvider }}
+          TARGET: ${{ needs.plan.outputs.selectedVersion }}
+          AKS_RG: ${{ inputs.aksResourceGroup }}
+          AKS_CLUSTER: ${{ inputs.aksClusterName }}
+          EKS_CLUSTER: ${{ inputs.eksClusterName }}
+          AWS_REGION_IN: ${{ inputs.awsRegion }}
+          GKE_CLUSTER: ${{ inputs.gkeClusterName }}
+          GKE_LOCATION: ${{ inputs.gkeLocation }}
+          GCP_PROJECT: ${{ inputs.gcpProject }}
+        run: |
+          set -euo pipefail
+          case "$PROVIDER" in
+            aks)
+              az aks upgrade -g "$AKS_RG" -n "$AKS_CLUSTER" --kubernetes-version "$TARGET" --control-plane-only --yes
+              ;;
+            eks)
+              UPDATE_ID="$(aws eks update-cluster-version --name "$EKS_CLUSTER" --region "$AWS_REGION_IN" --kubernetes-version "$TARGET" --query 'update.id' --output text)"
+              echo "Started EKS control plane update: $UPDATE_ID"
+              STATUS="InProgress"
+              while [ "$STATUS" = "InProgress" ]; do
+                sleep 30
+                STATUS="$(aws eks describe-update --name "$EKS_CLUSTER" --region "$AWS_REGION_IN" --update-id "$UPDATE_ID" --query 'update.status' --output text)"
+                echo "Status: $STATUS"
+              done
+              [ "$STATUS" = "Successful" ] || { echo "::error::EKS control plane update finished with status $STATUS"; exit 1; }
+              ;;
+            gke)
+              gcloud container clusters upgrade "$GKE_CLUSTER" --master --cluster-version="$TARGET" --location="$GKE_LOCATION" --project="$GCP_PROJECT" --quiet
+              ;;
+          esac
+
+      - name: Control plane upgrade summary
+        run: |
+          {
+            echo "## Control Plane Upgrade Completed"
+            echo ""
+            echo "- Provider: \`${{ inputs.clusterProvider }}\`"
+            echo "- From: \`${{ needs.plan.outputs.currentVersion }}\`"
+            echo "- To: \`${{ needs.plan.outputs.selectedVersion }}\`"
+            echo ""
+            if [ "${{ inputs.controlPlaneOnly }}" = "true" ]; then
+              echo "> controlPlaneOnly was set — worker node upgrade will be skipped."
+            else
+              echo "> Next: review and approve the **upgrade-worker-nodes** environment job to proceed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  upgrade-worker-nodes:
+    name: Upgrade Worker Nodes (separate approval required)
+    runs-on: ubuntu-latest
+    needs: [plan, upgrade-control-plane]
+    if: needs.plan.outputs.hasUpgrade == 'true' && inputs.controlPlaneOnly == false
+    timeout-minutes: 90
+    environment:
+      name: k8s-upgrade-worker-nodes # configure required reviewers in repo settings — can be a different reviewer group than control-plane
+    steps:
+      - name: Azure login (OIDC)
+        if: inputs.clusterProvider == 'aks'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: AWS login (OIDC)
+        if: inputs.clusterProvider == 'eks'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_EKS_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: GCP login (Workload Identity Federation)
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upgrade node pools
+        shell: bash
+        env:
+          PROVIDER: ${{ inputs.clusterProvider }}
+          TARGET: ${{ needs.plan.outputs.selectedVersion }}
+          POOL_INPUT: ${{ inputs.nodePoolName }}
+          MAX_SURGE: ${{ inputs.maxSurge }}
+          DRAIN_TIMEOUT: ${{ inputs.drainTimeoutMinutes }}
+          AKS_RG: ${{ inputs.aksResourceGroup }}
+          AKS_CLUSTER: ${{ inputs.aksClusterName }}
+          EKS_CLUSTER: ${{ inputs.eksClusterName }}
+          AWS_REGION_IN: ${{ inputs.awsRegion }}
+          GKE_CLUSTER: ${{ inputs.gkeClusterName }}
+          GKE_LOCATION: ${{ inputs.gkeLocation }}
+          GCP_PROJECT: ${{ inputs.gcpProject }}
+        run: |
+          set -euo pipefail
+
+          case "$PROVIDER" in
+            aks)
+              if [ -n "$POOL_INPUT" ]; then
+                POOLS=("$POOL_INPUT")
+              else
+                mapfile -t POOLS < <(az aks nodepool list -g "$AKS_RG" --cluster-name "$AKS_CLUSTER" --query "[?mode=='User'].name" -o tsv)
+              fi
+              for POOL in "${POOLS[@]}"; do
+                echo "Upgrading AKS pool: $POOL"
+                az aks nodepool update -g "$AKS_RG" --cluster-name "$AKS_CLUSTER" -n "$POOL" \
+                  --max-surge "$MAX_SURGE" --drain-timeout "$DRAIN_TIMEOUT"
+                az aks nodepool upgrade -g "$AKS_RG" --cluster-name "$AKS_CLUSTER" -n "$POOL" \
+                  --kubernetes-version "$TARGET" --yes
+              done
+              ;;
+
+            eks)
+              echo "::warning::drainTimeoutMinutes has no direct EKS equivalent — using provider defaults."
+              if [ -n "$POOL_INPUT" ]; then
+                POOLS=("$POOL_INPUT")
+              else
+                mapfile -t POOLS < <(aws eks list-nodegroups --cluster-name "$EKS_CLUSTER" --region "$AWS_REGION_IN" --query 'nodegroups[]' --output text | tr '\t' '\n')
+              fi
+              SURGE_PCT="${MAX_SURGE%\%}"
+              for POOL in "${POOLS[@]}"; do
+                echo "Upgrading EKS node group: $POOL"
+                aws eks update-nodegroup-config --cluster-name "$EKS_CLUSTER" --nodegroup-name "$POOL" --region "$AWS_REGION_IN" \
+                  --update-config "maxUnavailablePercentage=${SURGE_PCT:-33}" || echo "::warning::Could not update surge config for $POOL, continuing with existing config."
+                UPDATE_ID="$(aws eks update-nodegroup-version --cluster-name "$EKS_CLUSTER" --nodegroup-name "$POOL" --region "$AWS_REGION_IN" \
+                  --kubernetes-version "$TARGET" --query 'update.id' --output text)"
+                STATUS="InProgress"
+                while [ "$STATUS" = "InProgress" ]; do
+                  sleep 30
+                  STATUS="$(aws eks describe-update --name "$EKS_CLUSTER" --nodegroup-name "$POOL" --region "$AWS_REGION_IN" --update-id "$UPDATE_ID" --query 'update.status' --output text)"
+                  echo "  $POOL status: $STATUS"
+                done
+                [ "$STATUS" = "Successful" ] || { echo "::error::EKS node group $POOL update finished with status $STATUS"; exit 1; }
+              done
+              ;;
+
+            gke)
+              echo "::warning::drainTimeoutMinutes has no direct GKE equivalent — using provider defaults."
+              if [ -n "$POOL_INPUT" ]; then
+                POOLS=("$POOL_INPUT")
+              else
+                mapfile -t POOLS < <(gcloud container node-pools list --cluster "$GKE_CLUSTER" --location "$GKE_LOCATION" --project "$GCP_PROJECT" --format='value(name)')
+              fi
+              SURGE_INT="${MAX_SURGE%\%}"
+              [ -n "$SURGE_INT" ] && [[ "$SURGE_INT" =~ ^[0-9]+$ ]] || SURGE_INT=1
+              for POOL in "${POOLS[@]}"; do
+                echo "Upgrading GKE node pool: $POOL"
+                gcloud container node-pools update "$POOL" --cluster "$GKE_CLUSTER" --location "$GKE_LOCATION" --project "$GCP_PROJECT" \
+                  --max-surge-upgrade="$SURGE_INT" --max-unavailable-upgrade=0 --quiet || echo "::warning::Could not update surge config for $POOL, continuing with existing config."
+                gcloud container clusters upgrade "$GKE_CLUSTER" --node-pool="$POOL" --cluster-version="$TARGET" \
+                  --location="$GKE_LOCATION" --project="$GCP_PROJECT" --quiet
+              done
+              ;;
+          esac
+
+  post-upgrade-validation:
+    name: Post-Upgrade Validation
+    runs-on: ubuntu-latest
+    needs: [plan, upgrade-control-plane, upgrade-worker-nodes]
+    if: |
+      always() &&
+      needs.upgrade-control-plane.result == 'success' &&
+      (needs.upgrade-worker-nodes.result == 'success' || needs.upgrade-worker-nodes.result == 'skipped')
+    timeout-minutes: 15
+    steps:
+      - name: Azure login (OIDC)
+        if: inputs.clusterProvider == 'aks'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: AWS login (OIDC)
+        if: inputs.clusterProvider == 'eks'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_EKS_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: GCP login (Workload Identity Federation)
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: inputs.clusterProvider == 'gke'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install GKE auth plugin
+        if: inputs.clusterProvider == 'gke'
+        run: sudo apt-get update -y && sudo apt-get install -y google-cloud-sdk-gke-gcloud-auth-plugin
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Post-upgrade validation
+        shell: bash
+        env:
+          PROVIDER: ${{ inputs.clusterProvider }}
+          TARGET: ${{ needs.plan.outputs.selectedVersion }}
+          AKS_RG: ${{ inputs.aksResourceGroup }}
+          AKS_CLUSTER: ${{ inputs.aksClusterName }}
+          EKS_CLUSTER: ${{ inputs.eksClusterName }}
+          AWS_REGION_IN: ${{ inputs.awsRegion }}
+          GKE_CLUSTER: ${{ inputs.gkeClusterName }}
+          GKE_LOCATION: ${{ inputs.gkeLocation }}
+          GCP_PROJECT: ${{ inputs.gcpProject }}
+        run: |
+          set -euo pipefail
+
+          case "$PROVIDER" in
+            aks)
+              az aks get-credentials -g "$AKS_RG" -n "$AKS_CLUSTER" --overwrite-existing
+              ;;
+            eks)
+              aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION_IN"
+              ;;
+            gke)
+              export USE_GKE_GCLOUD_AUTH_PLUGIN=True
+              gcloud container clusters get-credentials "$GKE_CLUSTER" --location "$GKE_LOCATION" --project "$GCP_PROJECT"
+              ;;
+          esac
+
+          echo "--- Node status ---"
+          kubectl get nodes -o wide
+
+          NOT_READY="$(kubectl get nodes --no-headers | awk '$2!="Ready"' | wc -l)"
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "::error::$NOT_READY node(s) are not Ready after upgrade"
+            kubectl get nodes --no-headers | awk '$2!="Ready"'
+            exit 1
+          fi
+          echo "All nodes Ready."
+
+      - name: Upgrade summary
+        run: |
+          {
+            echo "## Kubernetes Upgrade Completed"
+            echo ""
+            echo "- Provider: \`${{ inputs.clusterProvider }}\`"
+            echo "- From: \`${{ needs.plan.outputs.currentVersion }}\`"
+            echo "- To: \`${{ needs.plan.outputs.selectedVersion }}\`"
+            echo "- Control Plane Only: \`${{ inputs.controlPlaneOnly }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
