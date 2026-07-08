@@ -76,12 +76,7 @@ jobs:
       - name: Detailed node info
         run: |
           echo "========== NODE VERSION DETAILS =========="
-          kubectl get nodes -o custom-columns=\
-NAME:.metadata.name,\
-STATUS:.status.conditions[-1].type,\
-K8S_VERSION:.status.nodeInfo.kubeletVersion,\
-OS_IMAGE:.status.nodeInfo.osImage,\
-CONTAINER_RUNTIME:.status.nodeInfo.containerRuntimeVersion
+          kubectl get nodes -o custom-columns='NAME:.metadata.name,STATUS:.status.conditions[-1].type,K8S_VERSION:.status.nodeInfo.kubeletVersion,OS_IMAGE:.status.nodeInfo.osImage,CONTAINER_RUNTIME:.status.nodeInfo.containerRuntimeVersion'
 
       - name: Summary
         run: |
