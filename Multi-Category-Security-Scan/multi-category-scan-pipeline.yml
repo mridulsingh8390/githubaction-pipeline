@@ -3,8 +3,11 @@ name: Multi-Category Security Scan Pipeline
 # Tool set:
 #   - Docker category:       Trivy, Dockle (no secrets needed)
 #   - Host/Network category: Nmap, Nuclei, OWASP ZAP (no secrets needed)
-#   - Cloud category:        AWS / Azure / GCP scan via ScoutSuite
-#     (this one unavoidably needs credentials — you cannot authenticate
+#   - Cloud category:        ScoutSuite + Prowler (account-wide posture audit)
+#     + optional Trivy scan of container images in the same account's
+#     registry (ECR/ACR/Artifact Registry) — either one named image, or
+#     every repo's latest tag auto-discovered in a single run.
+#     (this category unavoidably needs credentials — you cannot authenticate
 #     to a cloud account without a role ARN / client ID / service account,
 #     so secrets are required here even though every other category is
 #     secret-free)
@@ -80,13 +83,53 @@ on:
           - aws
           - azure
           - gcp
-      cloudRunImageScan:
-        description: "[Cloud] Also pull and Trivy-scan an image from the provider's registry (CVE/severity check)"
+      cloudAwsRegion:
+        description: "[Cloud][AWS] AWS region — used for ScoutSuite/Prowler/ECR discovery"
         required: false
-        default: false
+        default: "us-east-1"
+        type: string
+      runScoutSuite:
+        description: "[Cloud] Run ScoutSuite (cloud posture/configuration audit)"
+        required: false
+        default: true
+        type: boolean
+      runProwler:
+        description: "[Cloud] Run Prowler (cloud posture/compliance audit — complements ScoutSuite)"
+        required: false
+        default: true
+        type: boolean
+      cloudRunImageScan:
+        description: "[Cloud] Also Trivy-scan container image(s) from the provider's registry (CVE/severity check)"
+        required: false
+        default: true
         type: boolean
       cloudImageRef:
-        description: "[Cloud] Full image ref in the provider's registry (e.g. <acct>.dkr.ecr.<region>.amazonaws.com/repo:tag, <name>.azurecr.io/repo:tag, <region>-docker.pkg.dev/<project>/repo:tag)"
+        description: "[Cloud] Scan ONE specific image (repo:tag). Leave blank + enable cloudScanAllImages to scan every repo in the registry instead."
+        required: false
+        default: ""
+        type: string
+      cloudScanAllImages:
+        description: "[Cloud] If cloudImageRef is blank, auto-discover and scan the most recently pushed tag of every repository in the registry"
+        required: false
+        default: true
+        type: boolean
+      acrRegistryName:
+        description: "[Cloud][Azure] ACR registry name, e.g. 'myregistry' (no .azurecr.io) — required for all-image scan mode"
+        required: false
+        default: ""
+        type: string
+      gcpArtifactLocation:
+        description: "[Cloud][GCP] Artifact Registry location, e.g. us-central1 — required for all-image scan mode"
+        required: false
+        default: ""
+        type: string
+      gcpArtifactProject:
+        description: "[Cloud][GCP] GCP project ID hosting the Artifact Registry repo — required for all-image scan mode"
+        required: false
+        default: ""
+        type: string
+      gcpArtifactRepository:
+        description: "[Cloud][GCP] Artifact Registry repository name — required for all-image scan mode"
         required: false
         default: ""
         type: string
@@ -250,7 +293,8 @@ jobs:
     timeout-minutes: 30
     if: inputs.scanCategory == 'cloud'
     outputs:
-      cloud_status: ${{ steps.collect.outputs.cloud_status }}
+      scoutsuite_status: ${{ steps.collect.outputs.scoutsuite_status }}
+      prowler_status: ${{ steps.collect.outputs.prowler_status }}
       cloud_provider: ${{ inputs.cloudProvider }}
       cloud_image_trivy_status: ${{ steps.collect.outputs.cloud_image_trivy_status }}
     steps:
@@ -261,7 +305,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_SCAN_ROLE_ARN }}
-          aws-region: us-east-1
+          aws-region: ${{ inputs.cloudAwsRegion }}
 
       - name: Azure login (OIDC)
         if: inputs.cloudProvider == 'azure'
@@ -280,6 +324,7 @@ jobs:
 
       - name: Run ScoutSuite scan
         id: scoutsuite
+        if: inputs.runScoutSuite == true
         continue-on-error: true
         env:
           PROVIDER: ${{ inputs.cloudProvider }}
@@ -291,9 +336,36 @@ jobs:
             gcp)   scout gcp   --no-browser --report-dir scout-report ;;
           esac
 
+      - name: Install Prowler
+        if: inputs.runProwler == true
+        run: pip install prowler
+
+      - name: Run Prowler scan
+        id: prowler
+        if: inputs.runProwler == true
+        continue-on-error: true
+        env:
+          PROVIDER: ${{ inputs.cloudProvider }}
+        run: |
+          set -euo pipefail
+          case "$PROVIDER" in
+            aws)   prowler aws   --output-directory prowler-report ;;
+            azure) prowler azure --az-cli-auth --output-directory prowler-report ;;
+            gcp)   prowler gcp   --output-directory prowler-report ;;
+          esac
+
+      - name: Upload Prowler report
+        if: always() && inputs.runProwler == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: prowler-report-${{ inputs.cloudProvider }}
+          path: prowler-report
+          if-no-files-found: ignore
+
+      # ---- MODE A: single image (cloudImageRef is set) ----
       # Logs into the provider's container registry using the same
       # credentials from the login step above, so no extra secrets needed.
-      - name: Cloud registry login (for image scan)
+      - name: Cloud registry login (single image)
         id: registry_login
         if: inputs.cloudRunImageScan == true && inputs.cloudImageRef != ''
         continue-on-error: true
@@ -318,7 +390,7 @@ jobs:
               ;;
           esac
 
-      - name: Pull cloud image
+      - name: Pull cloud image (single)
         id: pull_cloud_image
         if: inputs.cloudRunImageScan == true && inputs.cloudImageRef != ''
         continue-on-error: true
@@ -326,7 +398,7 @@ jobs:
           IMAGE_REF: ${{ inputs.cloudImageRef }}
         run: docker pull "$IMAGE_REF"
 
-      - name: Trivy scan (cloud registry image)
+      - name: Trivy scan (single cloud image)
         id: cloud_image_trivy
         if: inputs.cloudRunImageScan == true && inputs.cloudImageRef != ''
         continue-on-error: true
@@ -338,30 +410,117 @@ jobs:
           severity: 'CRITICAL,HIGH'
           exit-code: '0'
 
-      - name: Upload cloud image Trivy SARIF
+      - name: Upload single-image Trivy SARIF
         if: inputs.cloudRunImageScan == true && inputs.cloudImageRef != ''
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: 'cloud-image-trivy-results.sarif'
+
+      # ---- MODE B: all images (cloudImageRef blank + cloudScanAllImages true) ----
+      # Auto-discovers every repository in the registry and scans the most
+      # recently pushed tag of each with Trivy. Scans only the latest tag per
+      # repo (not every historical tag) to keep runtime bounded — adjust the
+      # discovery logic below if you need full tag history coverage.
+      - name: Discover & scan all registry images with Trivy
+        id: cloud_images_trivy_all
+        if: inputs.cloudRunImageScan == true && inputs.cloudImageRef == '' && inputs.cloudScanAllImages == true
+        continue-on-error: true
+        env:
+          PROVIDER: ${{ inputs.cloudProvider }}
+          AWS_REGION_IN: ${{ inputs.cloudAwsRegion }}
+          ACR_REGISTRY_NAME: ${{ inputs.acrRegistryName }}
+          GCP_LOCATION: ${{ inputs.gcpArtifactLocation }}
+          GCP_PROJECT: ${{ inputs.gcpArtifactProject }}
+          GCP_REPO: ${{ inputs.gcpArtifactRepository }}
+        run: |
+          set -euo pipefail
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+          IMAGES=()
+
+          case "$PROVIDER" in
+            aws)
+              ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+              REGISTRY="$ACCOUNT_ID.dkr.ecr.$AWS_REGION_IN.amazonaws.com"
+              aws ecr get-login-password --region "$AWS_REGION_IN" | docker login --username AWS --password-stdin "$REGISTRY"
+              mapfile -t REPOS < <(aws ecr describe-repositories --region "$AWS_REGION_IN" --query 'repositories[].repositoryName' --output text | tr '\t' '\n')
+              for REPO in "${REPOS[@]}"; do
+                TAG="$(aws ecr describe-images --repository-name "$REPO" --region "$AWS_REGION_IN" \
+                  --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags[0]' --output text 2>/dev/null || echo "None")"
+                [ "$TAG" != "None" ] && [ -n "$TAG" ] && IMAGES+=("$REGISTRY/$REPO:$TAG")
+              done
+              ;;
+            azure)
+              [ -n "$ACR_REGISTRY_NAME" ] || { echo "::error::acrRegistryName is required for all-image scan mode on Azure."; exit 1; }
+              az acr login --name "$ACR_REGISTRY_NAME"
+              mapfile -t REPOS < <(az acr repository list --name "$ACR_REGISTRY_NAME" --output tsv)
+              for REPO in "${REPOS[@]}"; do
+                TAG="$(az acr repository show-tags --name "$ACR_REGISTRY_NAME" --repository "$REPO" --orderby time_desc --top 1 --output tsv || echo "")"
+                [ -n "$TAG" ] && IMAGES+=("$ACR_REGISTRY_NAME.azurecr.io/$REPO:$TAG")
+              done
+              ;;
+            gcp)
+              [ -n "$GCP_LOCATION" ] && [ -n "$GCP_PROJECT" ] && [ -n "$GCP_REPO" ] || { echo "::error::gcpArtifactLocation, gcpArtifactProject, and gcpArtifactRepository are required for all-image scan mode on GCP."; exit 1; }
+              gcloud auth configure-docker "$GCP_LOCATION-docker.pkg.dev" --quiet
+              mapfile -t IMAGES < <(gcloud artifacts docker images list \
+                "$GCP_LOCATION-docker.pkg.dev/$GCP_PROJECT/$GCP_REPO" \
+                --include-tags --format='value(package,tags)' | awk -F'\t' '$2!="" {print $1":"$2}')
+              ;;
+          esac
+
+          echo "Discovered ${#IMAGES[@]} image(s) to scan."
+          FAIL=0
+          for IMG in "${IMAGES[@]}"; do
+            echo "== Scanning $IMG =="
+            if ! trivy image --severity CRITICAL,HIGH --exit-code 1 --format table "$IMG" | tee -a trivy-all-images.txt; then
+              FAIL=1
+            fi
+          done
+
+          echo "images_scanned=${#IMAGES[@]}" >> "$GITHUB_OUTPUT"
+          [ "$FAIL" -eq 0 ]
+
+      - name: Upload all-images Trivy report
+        if: always() && inputs.cloudRunImageScan == true && inputs.cloudImageRef == '' && inputs.cloudScanAllImages == true
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-all-images-trivy-report-${{ inputs.cloudProvider }}
+          path: trivy-all-images.txt
+          if-no-files-found: ignore
 
       - name: Collect results
         id: collect
         if: always()
         run: |
           {
-            echo "cloud_status=${{ steps.scoutsuite.outcome == 'success' && 'PASS' || 'FAIL' }}"
-            if [ "${{ inputs.cloudRunImageScan }}" = "true" ] && [ -n "${{ inputs.cloudImageRef }}" ]; then
-              echo "cloud_image_trivy_status=${{ steps.cloud_image_trivy.outcome == 'success' && 'PASS' || 'FAIL' }}"
+            if [ "${{ inputs.runScoutSuite }}" = "true" ]; then
+              echo "scoutsuite_status=${{ steps.scoutsuite.outcome == 'success' && 'PASS' || 'FAIL' }}"
+            else
+              echo "scoutsuite_status=SKIPPED"
+            fi
+
+            if [ "${{ inputs.runProwler }}" = "true" ]; then
+              echo "prowler_status=${{ steps.prowler.outcome == 'success' && 'PASS' || 'FAIL' }}"
+            else
+              echo "prowler_status=SKIPPED"
+            fi
+
+            if [ "${{ inputs.cloudRunImageScan }}" != "true" ]; then
+              echo "cloud_image_trivy_status=SKIPPED"
+            elif [ -n "${{ inputs.cloudImageRef }}" ]; then
+              echo "cloud_image_trivy_status=${{ steps.cloud_image_trivy.outcome == 'success' && 'PASS' || 'FAIL' }} (1 image)"
+            elif [ "${{ inputs.cloudScanAllImages }}" = "true" ]; then
+              echo "cloud_image_trivy_status=${{ steps.cloud_images_trivy_all.outcome == 'success' && 'PASS' || 'FAIL' }} (${{ steps.cloud_images_trivy_all.outputs.images_scanned || '0' }} images)"
             else
               echo "cloud_image_trivy_status=SKIPPED"
             fi
           } >> "$GITHUB_OUTPUT"
 
-      - name: Upload cloud scan report
-        if: always()
+      - name: Upload ScoutSuite report
+        if: always() && inputs.runScoutSuite == true
         uses: actions/upload-artifact@v4
         with:
-          name: cloud-scan-report-${{ inputs.cloudProvider }}
+          name: scoutsuite-report-${{ inputs.cloudProvider }}
           path: scout-report
           if-no-files-found: ignore
 
@@ -436,7 +595,8 @@ jobs:
               echo "| Host/Network | Nuclei | ${{ needs.host-network-scan.outputs.nuclei_status || 'N/A' }} |"
               echo "| Host/Network | OWASP ZAP | ${{ needs.host-network-scan.outputs.zap_status || 'N/A' }} |"
             elif [ "${{ inputs.scanCategory }}" = "cloud" ]; then
-              echo "| Cloud (${{ needs.cloud-scan.outputs.cloud_provider }}) | ScoutSuite (posture) | ${{ needs.cloud-scan.outputs.cloud_status || 'N/A' }} |"
+              echo "| Cloud (${{ needs.cloud-scan.outputs.cloud_provider }}) | ScoutSuite (posture) | ${{ needs.cloud-scan.outputs.scoutsuite_status || 'N/A' }} |"
+              echo "| Cloud (${{ needs.cloud-scan.outputs.cloud_provider }}) | Prowler (posture/compliance) | ${{ needs.cloud-scan.outputs.prowler_status || 'N/A' }} |"
               echo "| Cloud (${{ needs.cloud-scan.outputs.cloud_provider }}) | Trivy (registry image CVE/severity) | ${{ needs.cloud-scan.outputs.cloud_image_trivy_status || 'N/A' }} |"
             elif [ "${{ inputs.scanCategory }}" = "codebase" ]; then
               echo "| Codebase | Gitleaks | ${{ needs.codebase-scan.outputs.gitleaks_status || 'N/A' }} |"

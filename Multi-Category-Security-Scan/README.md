@@ -2,8 +2,8 @@
 
 A single GitHub Actions workflow (`multi-category-scan-pipeline.yml`) that runs
 security scans across four categories — **Docker**, **Host/Network**, **Cloud**, and
-**Codebase** — selected at trigger time via `workflow_dispatch`. Every non-cloud
-category is entirely secret-free.
+**Codebase** — selected at trigger time via `workflow_dispatch`. Every category except
+`cloud` is entirely secret-free.
 
 ## How it works
 
@@ -29,14 +29,33 @@ scanCategory = codebase      →  codebase-scan       →  report
 |---|---|---|
 | **`docker`** | Trivy, Dockle | No |
 | **`host_network`** | Nmap, Nuclei, OWASP ZAP | No |
-| **`cloud`** | ScoutSuite (posture audit) + optional Trivy (registry image CVE scan) | **Yes** — cloud auth is unavoidable |
+| **`cloud`** | ScoutSuite + Prowler (account-wide posture audit) + Trivy (image CVE scan) | **Yes** — cloud auth is unavoidable |
 | **`codebase`** | Gitleaks (secrets scan), Semgrep (SAST) | No (Gitleaks only uses the auto-provided `GITHUB_TOKEN`) |
+
+### Cloud category — single-shot combined scan
+
+Selecting `cloud` with default settings runs **all three** of the following in one job:
+
+1. **ScoutSuite** — cloud account posture/configuration audit
+2. **Prowler** — a second posture/compliance auditor, overlapping but not identical
+   to ScoutSuite's checks (useful as a cross-check, different rule coverage)
+3. **Trivy** — CVE/severity scan of container image(s) in the same account's registry
+   (ECR / ACR / Artifact Registry). Two modes:
+   - **Single image**: set `cloudImageRef` to scan exactly one image
+   - **All images** (default): leave `cloudImageRef` blank and keep
+     `cloudScanAllImages = true` — the pipeline auto-discovers every repository in
+     the registry and scans **the most recently pushed tag of each one**
+
+   > **Scope note:** only the latest tag per repository is scanned, not every
+   > historical tag, to keep runtime bounded. Scanning full tag history across every
+   > repo would multiply the job's runtime significantly — ask if you need that and
+   > the discovery loop can be changed.
 
 ### Excluded tools
 
-These were considered and deliberately left out — either they're placeholders for
-tools that were never confirmed, or every one of them requires a token/client
-ID/API key to function at all:
+Considered and deliberately left out — either they're placeholders for tools that
+were never confirmed, or every one of them requires a token/client ID/API key to
+function at all:
 
 - **DockerShield** — tool never confirmed, no known public action
 - **Wiz** — needs `WIZ_CLIENT_ID`/`WIZ_CLIENT_SECRET`
@@ -70,8 +89,16 @@ ID/API key to function at all:
 | Input | Required | Default | Notes |
 |---|---|---|---|
 | `cloudProvider` | No | `aws` | `aws` \| `azure` \| `gcp` |
-| `cloudRunImageScan` | No | `false` | Also pull + Trivy-scan an image from the provider's registry |
-| `cloudImageRef` | No | `""` | Full image ref, e.g. `<acct>.dkr.ecr.<region>.amazonaws.com/repo:tag`, `<name>.azurecr.io/repo:tag`, `<region>-docker.pkg.dev/<project>/repo:tag` |
+| `cloudAwsRegion` | No | `us-east-1` | Used for ScoutSuite/Prowler/ECR discovery on AWS |
+| `runScoutSuite` | No | `true` | Toggle ScoutSuite |
+| `runProwler` | No | `true` | Toggle Prowler |
+| `cloudRunImageScan` | No | `true` | Toggle the Trivy image scan(s) entirely |
+| `cloudImageRef` | No | `""` | Set to scan exactly ONE image. Leave blank for all-image mode |
+| `cloudScanAllImages` | No | `true` | Used only when `cloudImageRef` is blank — scans every repo's latest tag |
+| `acrRegistryName` | No | `""` | **Required for Azure all-image mode** — ACR name without `.azurecr.io` |
+| `gcpArtifactLocation` | No | `""` | **Required for GCP all-image mode** — e.g. `us-central1` |
+| `gcpArtifactProject` | No | `""` | **Required for GCP all-image mode** — GCP project ID |
+| `gcpArtifactRepository` | No | `""` | **Required for GCP all-image mode** — Artifact Registry repo name |
 
 ### Codebase (`scanCategory = codebase`)
 | Input | Required | Default | Notes |
@@ -83,9 +110,8 @@ ID/API key to function at all:
 
 ### Cloud category only
 
-The `cloud` category is the one exception to "no secrets" — you cannot authenticate
-to a cloud account without credentials. Set whichever of these apply as repo/org
-secrets:
+You cannot authenticate to a cloud account without credentials — set whichever of
+these apply as repo/org secrets:
 
 | Provider | Secrets |
 |---|---|
@@ -93,13 +119,17 @@ secrets:
 | Azure | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` |
 | GCP | `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT` |
 
-If you also enable `cloudRunImageScan`, the same OIDC role/service principal needs
-**registry read/pull permissions** in addition to whatever ScoutSuite needs for the
-posture audit:
+The same OIDC role/service principal also needs:
 
-- AWS: `AmazonEC2ContainerRegistryReadOnly` (or equivalent ECR pull policy)
-- Azure: `AcrPull` role on the target registry
-- GCP: `Artifact Registry Reader` role
+- **ScoutSuite/Prowler**: broad read-only permissions across the account (IAM,
+  networking, storage, logging, etc. — see each tool's docs for the minimal policy)
+- **Registry read/pull** (if `cloudRunImageScan` is enabled):
+  - AWS: `AmazonEC2ContainerRegistryReadOnly` (or equivalent ECR pull policy)
+  - Azure: `AcrPull` role on the target registry
+  - GCP: `Artifact Registry Reader` role
+- **GCP Prowler specifically** relies on Application Default Credentials, which
+  `google-github-actions/auth` sets up automatically in most configurations — if
+  only the Prowler step fails on GCP, check that auth handoff first.
 
 ### All other categories
 
@@ -111,20 +141,33 @@ No setup beyond the default `GITHUB_TOKEN` GitHub provides automatically.
 
 1. Select `scanCategory`
 2. Fill in the required input(s) for that category (`imageRef` for docker,
-   `targets` for host/network)
+   `targets` for host/network, registry-discovery fields for cloud all-image mode)
 3. Toggle whichever tool checkboxes you want on/off
 4. Run — check the workflow summary for the results table
+
+## Artifacts produced
+
+| Category | Artifact(s) |
+|---|---|
+| `docker` | Trivy SARIF (uploaded to Security tab) |
+| `host_network` | `host-network-scan-results` (Nmap output) |
+| `cloud` | `scoutsuite-report-<provider>`, `prowler-report-<provider>`, and either a SARIF (single-image mode) or `cloud-all-images-trivy-report-<provider>` (all-image mode) |
+| `codebase` | Gitleaks/Semgrep findings surface directly in workflow logs and the Security tab |
 
 ## Known limitations
 
 - **ZAP expects a single URL target.** If `targets` contains multiple comma-separated
   hosts/IPs and `runZap` is enabled, only a URL-shaped entry will scan correctly —
   non-URL entries (bare IPs) may cause it to fail or behave unpredictably.
-- **Cloud image registry parsing is done with simple string splitting** (`cut` on
-  `/` and `.`), assuming standard registry URL formats for each provider. Non-standard
-  registry naming may break the parsing in the `cloud-scan` job.
-- **Trivy and ZAP steps use `continue-on-error: true` with `exit-code: '0'`** so a
-  single tool failure doesn't block the whole job — status is captured explicitly in
-  the `collect` step instead. This means a scan *finding* vulnerabilities won't fail
-  the workflow by itself; check the summary table and uploaded SARIF/artifacts for
-  actual results.
+- **All-image discovery scans only the latest tag per repository**, not full tag
+  history — see the Cloud category note above.
+- **Registry name/region parsing uses simple string splitting** (`cut` on `/` and
+  `.`), assuming standard registry URL formats for each provider. Non-standard
+  registry naming may break the parsing.
+- **Trivy and ZAP steps use `continue-on-error: true`** so a single tool failure
+  doesn't block the whole job — status is captured explicitly in the `collect` step
+  instead. A scan *finding* vulnerabilities won't fail the workflow by itself; check
+  the summary table and uploaded artifacts/SARIF for actual results.
+- **ScoutSuite and Prowler check overlapping but not identical things** — treat them
+  as complementary, not redundant; don't assume a PASS from one implies a clean bill
+  from the other.
