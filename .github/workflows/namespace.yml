@@ -1,0 +1,617 @@
+name: Cluster details from repo
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+jobs:
+  cluster-details:
+    runs-on:
+      group: private-cluster-runners
+    if: github.repository == 'SymphonyFS/scripts'   # Only runs from scripts repo, not forks
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # =========================
+      # INSTALL + LOGIN
+      # =========================
+      - name: Install Azure CLI + kubectl
+        run: |
+          # kubectl (user-level)
+          curl -LO https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl
+          chmod +x kubectl
+          mkdir -p $HOME/bin
+          mv kubectl $HOME/bin/
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+          # Azure CLI — use whichever is available on the runner
+          # (jumpbox likely already has az installed system-wide)
+          if ! command -v az &>/dev/null; then
+            echo "az not found, installing..."
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          else
+            echo "az already installed: $(az version --query '"azure-cli"' -o tsv)"
+          fi
+
+          az version
+          kubectl version --client
+
+      - name: Azure Login
+        run: |
+          az login --service-principal \
+            --username "${{ secrets.AZURE_SP_ID }}" \
+            --password "${{ secrets.AZURE_SP_SECRET }}" \
+            --tenant "${{ secrets.AZURE_TENANT_ID }}"
+
+      # =========================
+      # FETCH AKS CLUSTERS
+      # Fetches both cluster name and privateFqdn so we can detect
+      # private clusters and connect via their private endpoint
+      # =========================
+      - name: Fetch AKS clusters
+        run: |
+          # Get cluster name, resource group, and privateFqdn in one query
+          az aks list \
+            --query "[?apiServerAccessProfile.enablePrivateCluster==\`true\`].{rg:resourceGroup, name:name, privateFqdn:privateFqdn}" \
+            -o table > private_clusters_raw.txt || true
+
+          # Get all cluster names for helmfile matching
+          az aks list --query "[].name" -o tsv | sort > aks_clusters.txt
+
+          # Build a lookup file: clustername|privateFqdn
+          az aks list \
+            --query "[].{name:name, fqdn:privateFqdn, rg:resourceGroup}" \
+            -o json | python3 -c "
+          import sys, json
+          clusters = json.load(sys.stdin)
+          for c in clusters:
+              name = c.get('name','')
+              fqdn = c.get('fqdn') or ''
+              rg   = c.get('rg','')
+              print(f'{name}|{rg}|{fqdn}')
+          " > cluster_meta.txt
+
+          echo "Total AKS clusters found: $(wc -l < aks_clusters.txt)"
+          private_count=$(awk -F'|' '$3 != ""' cluster_meta.txt | wc -l)
+          echo "Private clusters (with privateFqdn): $private_count"
+
+      # =========================
+      # COLLECT HELMFILE DATA
+      # =========================
+      - name: Collect Helmfile Data
+        run: |
+          echo "Collecting helmfile applications..."
+          > helmfile_data.txt
+
+          EXCLUDED="trident|tailscale|velero|mtls-outbound|default|datadog"
+          STATIC_NS_APPS="common-res|edb-common-res"
+
+          find apps -type f -name "helmfile.yaml" | while read file; do
+            rel=${file#apps/}
+            IFS='/' read -ra p <<< "$rel"
+            app=${p[0]}
+            instance=${p[1]}
+
+            echo "$app" | grep -qiE "^($EXCLUDED)$" && continue
+            echo "$instance" | grep -qi "template" && continue
+
+            cluster=$(grep -iE "kubeContext:" "$file" \
+              | head -1 | awk -F ':' '{print $2}' | xargs | tr -d '"' | tr -d "'")
+
+            [[ -z "$cluster" ]] && continue
+            echo "$cluster" | grep -q "UPDATE_ME" && continue
+
+            if echo "$app" | grep -qiE "^($STATIC_NS_APPS)$"; then
+              namespace="common-res"
+            else
+              if grep -q 'trimSuffix.*-dr' "$file" 2>/dev/null; then
+                namespace="${instance%-dr}"
+              else
+                namespace="$instance"
+              fi
+            fi
+
+            if grep -qxF "$cluster" aks_clusters.txt; then
+              in_aks="Y"
+            else
+              in_aks="N"
+            fi
+
+            echo "$cluster|$namespace|$instance|$app|$in_aks" >> helmfile_data.txt
+          done
+
+          sort -t'|' -k1,1 -k2,2 -u helmfile_data.txt -o helmfile_data.txt
+
+          total=$(wc -l < helmfile_data.txt)
+          in_aks=$(grep -c '|Y$' helmfile_data.txt || true)
+          not_in_aks=$(grep -c '|N$' helmfile_data.txt || true)
+          echo "Total helmfile instances  : $total"
+          echo "  Cluster in AKS          : $in_aks"
+          echo "  Cluster NOT in AKS      : $not_in_aks"
+
+      # =========================
+      # BUILD AKS CACHE
+      # Private cluster fix: if a cluster has a privateFqdn, connect
+      # via the private endpoint using --server flag on kubectl.
+      # This mirrors how jumpboxes connect to private clusters.
+      # =========================
+      - name: Build AKS Cache
+        run: |
+          echo "Building AKS deployment cache..."
+          export KUBECONFIG=/tmp/kubeconfig
+          > aks_data.txt
+          > aks_namespaces.txt
+          > unreachable_clusters.txt
+          UNREACHABLE=0
+
+          EXCLUDED_NS="^(default|kube-.*|calico.*|tigera.*|gatekeeper.*|trident.*|aks-command.*)"
+          EXCLUDED_APPS="trident|tailscale|velero|mtls-outbound|datadog|ingress-nginx|cert-manager|konnectivity|azure-cni|calico|gatekeeper|tigera"
+
+          while read cluster; do
+            # Look up resource group and privateFqdn from cluster_meta.txt
+            meta=$(grep "^${cluster}|" cluster_meta.txt | head -1)
+            rg=$(echo "$meta" | cut -d'|' -f2)
+            private_fqdn=$(echo "$meta" | cut -d'|' -f3)
+
+            if [[ -z "$rg" ]]; then
+              echo "  WARNING: No resource group found for $cluster — skipping"
+              echo "$cluster" >> unreachable_clusters.txt
+              UNREACHABLE=$((UNREACHABLE + 1))
+              continue
+            fi
+
+            # Get credentials — always fetch first
+            az aks get-credentials -g "$rg" -n "$cluster" --overwrite-existing >/dev/null 2>&1
+
+            # If cluster has a private FQDN, patch kubeconfig to use it
+            # This allows the runner to connect via the private endpoint
+            if [[ -n "$private_fqdn" ]]; then
+              echo "  INFO: $cluster is private — using privateFqdn: $private_fqdn"
+              # Replace the public API server URL with the private FQDN in kubeconfig
+              kubectl config set-cluster "$cluster" \
+                --server="https://${private_fqdn}:443" \
+                --kubeconfig=/tmp/kubeconfig >/dev/null 2>&1
+            fi
+
+            if ! kubectl get ns >/dev/null 2>&1; then
+              echo "  WARNING: Cannot reach $cluster — skipping"
+              echo "$cluster" >> unreachable_clusters.txt
+              UNREACHABLE=$((UNREACHABLE + 1))
+              continue
+            fi
+
+            kubectl get ns --no-headers 2>/dev/null | awk '{print $1}' \
+            | grep -vE "$EXCLUDED_NS" \
+            | while read ns; do
+                echo "$cluster|$ns" >> aks_namespaces.txt
+                kubectl get deploy -n "$ns" --no-headers 2>/dev/null \
+                | awk '{print $1}' \
+                | grep -viE "^($EXCLUDED_APPS)$" \
+                | while read d; do
+                    echo "$cluster|$ns|$d" >> aks_data.txt
+                  done
+              done
+
+          done < aks_clusters.txt
+
+          sort -u aks_data.txt -o aks_data.txt
+          sort -u aks_namespaces.txt -o aks_namespaces.txt
+          echo "UNREACHABLE=$UNREACHABLE" >> "$GITHUB_ENV"
+          echo "Total AKS deployments cached: $(wc -l < aks_data.txt)"
+          echo "Unreachable clusters        : $UNREACHABLE"
+
+      # =========================
+      # DISPLAY HELMFILE DATA
+      # =========================
+      - name: Display Helmfile Data
+        run: |
+          echo ""
+          echo "================ HELMFILE DATA ================="
+          printf "%-35s %-30s %-30s %-20s %-10s\n" \
+            "Cluster" "Namespace" "Instance" "App Type" "In AKS"
+          printf "%-35s %-30s %-30s %-20s %-10s\n" \
+            "=======" "=========" "========" "========" "======"
+
+          while IFS='|' read cluster ns instance app in_aks; do
+            [[ "$in_aks" == "Y" ]] && flag="YES" || flag="NO"
+            printf "%-35s %-30s %-30s %-20s %-10s\n" \
+              "$cluster" "$ns" "$instance" "$app" "$flag"
+          done < helmfile_data.txt
+
+      # =========================
+      # DISPLAY AKS DATA
+      # =========================
+      - name: Display AKS Data
+        run: |
+          echo ""
+          echo "================ AKS DATA ================="
+          printf "%-35s %-30s %-30s\n" "Cluster Name" "Namespace" "Deployed App"
+          printf "%-35s %-30s %-30s\n" "============" "=========" "============"
+
+          if [[ -s aks_data.txt ]]; then
+            while IFS='|' read cluster ns app; do
+              printf "%-35s %-30s %-30s\n" "$cluster" "$ns" "$app"
+            done < aks_data.txt
+          else
+            echo "No AKS deployments found."
+          fi
+
+      # =========================
+      # SUMMARY
+      # =========================
+      - name: Print Summary
+        run: |
+          echo ""
+          echo "========================= SUMMARY ============================"
+
+          HELM_CLUSTER_COUNT=$(cut -d'|' -f1 helmfile_data.txt | sort -u | wc -l)
+          HELM_APP_COUNT=$(wc -l < helmfile_data.txt)
+          HELM_IN_AKS=$(grep -c '|Y$' helmfile_data.txt || true)
+          HELM_NOT_IN_AKS=$(grep -c '|N$' helmfile_data.txt || true)
+
+          AKS_CLUSTER_COUNT=$(wc -l < aks_clusters.txt)
+          AKS_NS_COUNT=$(wc -l < aks_namespaces.txt)
+          AKS_DEPLOY_COUNT=$(wc -l < aks_data.txt)
+
+          echo ""
+          echo "  Helmfile clusters              : $HELM_CLUSTER_COUNT"
+          echo "  Helmfile instances (total)     : $HELM_APP_COUNT"
+          echo "  Helmfile instances (in AKS)    : $HELM_IN_AKS"
+          echo "  Helmfile instances (not in AKS): $HELM_NOT_IN_AKS"
+          echo ""
+          echo "  AKS clusters (total)           : $AKS_CLUSTER_COUNT"
+          echo "  AKS namespaces                 : $AKS_NS_COUNT"
+          echo "  AKS deployments                : $AKS_DEPLOY_COUNT"
+          echo "  Unreachable clusters           : $UNREACHABLE"
+          echo "=============================================================="
+
+      # =========================
+      # COMPARE AND GENERATE FINAL TABLE
+      # Columns: Cluster | Namespace | App Type | Status
+      # =========================
+      - name: Compare and Generate Final Table
+        run: |
+          echo ""
+          echo "================ CLUSTER DETAILS ================="
+          printf "%-35s %-30s %-20s %-20s\n" \
+            "Cluster" "Namespace" "App Type" "Status"
+          printf "%-35s %-30s %-20s %-20s\n" \
+            "=======" "=========" "========" "======"
+
+          total=0
+          count_yes=0; count_no=0; count_unreachable=0; count_not_found=0
+          prev_cluster=""
+
+          while IFS='|' read helm_cluster helm_ns helm_instance helm_app in_aks; do
+            total=$((total + 1))
+            status="NO"
+
+            if [[ "$in_aks" == "N" ]]; then
+              status="CLUSTER-NOT-FOUND"
+              count_not_found=$((count_not_found + 1))
+            elif grep -qxF "$helm_cluster" unreachable_clusters.txt 2>/dev/null; then
+              status="UNREACHABLE"
+              count_unreachable=$((count_unreachable + 1))
+            else
+              if grep -qxF "$helm_cluster|$helm_ns" aks_namespaces.txt 2>/dev/null || \
+                 grep -qxF "$helm_cluster|$helm_ns|$helm_instance" aks_data.txt 2>/dev/null; then
+                status="YES"
+              fi
+              [[ "$status" == "YES" ]] && count_yes=$((count_yes + 1)) || count_no=$((count_no + 1))
+            fi
+
+            if [[ "$helm_cluster" != "$prev_cluster" ]]; then
+              display_cluster="$helm_cluster"
+              prev_cluster="$helm_cluster"
+            elif [[ "$status" == "UNREACHABLE" || "$status" == "CLUSTER-NOT-FOUND" ]]; then
+              display_cluster="$helm_cluster"
+            else
+              display_cluster=""
+            fi
+
+            printf "%-35s %-30s %-20s %-20s\n" \
+              "$display_cluster" "$helm_ns" "$helm_app" "$status"
+
+          done < <(cat helmfile_data.txt)
+
+          checkable=$((count_yes + count_no))
+          [[ $checkable -gt 0 ]] && coverage=$(echo "scale=1; $count_yes * 100 / $checkable" | bc) || coverage="N/A"
+
+          echo ""
+          echo "=============================================================="
+          echo "STATISTICS:"
+          echo "  Total helmfile instances : $total"
+          echo "  YES  (deployed)          : $count_yes"
+          echo "  NO   (not deployed)      : $count_no"
+          echo "  UNREACHABLE              : $count_unreachable"
+          echo "  CLUSTER-NOT-FOUND        : $count_not_found"
+          echo "  Coverage                 : ${coverage}%"
+          echo ""
+
+          echo "STAT_TOTAL=$total"                   >> "$GITHUB_ENV"
+          echo "STAT_YES=$count_yes"                 >> "$GITHUB_ENV"
+          echo "STAT_NO=$count_no"                   >> "$GITHUB_ENV"
+          echo "STAT_UNREACHABLE=$count_unreachable" >> "$GITHUB_ENV"
+          echo "STAT_NOT_FOUND=$count_not_found"     >> "$GITHUB_ENV"
+          echo "STAT_COVERAGE=$coverage"             >> "$GITHUB_ENV"
+
+      # =========================
+      # BUILD CONFLUENCE HTML TABLE
+      # Fix: wider column widths so text fits on one line
+      # Columns: Cluster | Namespace | App Type | Status
+      # =========================
+      - name: Build Confluence HTML Table
+        run: |
+          RUN_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          python3 << PYEOF
+          run_date  = "${RUN_DATE}"
+          run_url   = "${RUN_URL}"
+          total     = "${STAT_TOTAL}"
+          count_yes = "${STAT_YES}"
+          count_no  = "${STAT_NO}"
+          count_ur  = "${STAT_UNREACHABLE}"
+          count_nf  = "${STAT_NOT_FOUND}"
+          coverage  = "${STAT_COVERAGE}"
+
+          COLOR_YES  = "#36B37E"
+          COLOR_NO   = "#FF5630"
+          COLOR_UR   = "#FFAB00"
+          COLOR_NF   = "#6554C0"
+
+          def status_span(s):
+              c = {
+                  "YES":               COLOR_YES,
+                  "NO":                COLOR_NO,
+                  "UNREACHABLE":       COLOR_UR,
+                  "CLUSTER-NOT-FOUND": COLOR_NF,
+              }.get(s, "#97A0AF")
+              return f'<span style="color:{c};font-weight:bold;">{s}</span>'
+
+          lines = []
+
+          lines.append(
+              f'<p><strong>Last updated:</strong> {run_date} &nbsp;|&nbsp; '
+              f'<a href="{run_url}">View pipeline run</a></p>'
+          )
+
+          # Summary banner
+          lines.append('<table><tbody>')
+          lines.append(
+              '<tr style="background-color:#F4F5F7;">'
+              '<th style="white-space:nowrap;">Total</th>'
+              '<th style="white-space:nowrap;">Deployed &#x2705;</th>'
+              '<th style="white-space:nowrap;">Not Deployed &#x274C;</th>'
+              '<th style="white-space:nowrap;">Unreachable &#x26A0;&#xFE0F;</th>'
+              '<th style="white-space:nowrap;">Cluster Not Found &#x1F50D;</th>'
+              '<th style="white-space:nowrap;">Coverage</th>'
+              '</tr>'
+          )
+          lines.append(
+              f'<tr>'
+              f'<td>{total}</td>'
+              f'<td style="color:{COLOR_YES};font-weight:bold;">{count_yes}</td>'
+              f'<td style="color:{COLOR_NO};font-weight:bold;">{count_no}</td>'
+              f'<td style="color:{COLOR_UR};font-weight:bold;">{count_ur}</td>'
+              f'<td style="color:{COLOR_NF};font-weight:bold;">{count_nf}</td>'
+              f'<td><strong>{coverage}%</strong></td>'
+              f'</tr>'
+          )
+          lines.append('</tbody></table><br/>')
+
+          # Detail table with fixed wider column widths — text fits on one line
+          lines.append(
+              '<table style="width:100%;table-layout:fixed;"><tbody>'
+          )
+          lines.append(
+              '<tr style="background-color:#F4F5F7;">'
+              '<th style="width:280px;white-space:nowrap;"><strong>Cluster</strong></th>'
+              '<th style="width:220px;white-space:nowrap;"><strong>Namespace</strong></th>'
+              '<th style="width:160px;white-space:nowrap;"><strong>App Type</strong></th>'
+              '<th style="width:160px;white-space:nowrap;"><strong>Status</strong></th>'
+              '</tr>'
+          )
+
+          try:
+              with open("unreachable_clusters.txt") as uf:
+                  unreachable = set(l.strip() for l in uf if l.strip())
+          except:
+              unreachable = set()
+
+          try:
+              with open("aks_namespaces.txt") as nf:
+                  ns_set = set(l.strip() for l in nf if l.strip())
+          except:
+              ns_set = set()
+
+          try:
+              with open("aks_data.txt") as df:
+                  deploy_set = set(l.strip() for l in df if l.strip())
+          except:
+              deploy_set = set()
+
+          prev_cluster = ""
+          with open("helmfile_data.txt") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  parts = line.split("|")
+                  if len(parts) < 5:
+                      continue
+                  helm_cluster, helm_ns, helm_instance, helm_app, in_aks = parts
+
+                  if in_aks == "N":
+                      status = "CLUSTER-NOT-FOUND"
+                  elif helm_cluster in unreachable:
+                      status = "UNREACHABLE"
+                  elif (f"{helm_cluster}|{helm_ns}" in ns_set or
+                        f"{helm_cluster}|{helm_ns}|{helm_instance}" in deploy_set):
+                      status = "YES"
+                  else:
+                      status = "NO"
+
+                  if helm_cluster != prev_cluster:
+                      display_cluster = f"<strong>{helm_cluster}</strong>"
+                      row_bg = 'style="background-color:#FAFAFA;"'
+                      prev_cluster = helm_cluster
+                  elif status in ("UNREACHABLE", "CLUSTER-NOT-FOUND"):
+                      display_cluster = f"<strong>{helm_cluster}</strong>"
+                      row_bg = 'style="background-color:#FAFAFA;"'
+                  else:
+                      display_cluster = ""
+                      row_bg = ""
+
+                  lines.append(
+                      f'<tr {row_bg}>'
+                      f'<td style="white-space:nowrap;">{display_cluster}</td>'
+                      f'<td style="white-space:nowrap;"><code>{helm_ns}</code></td>'
+                      f'<td style="white-space:nowrap;">{helm_app}</td>'
+                      f'<td style="white-space:nowrap;">{status_span(status)}</td>'
+                      f'</tr>'
+                  )
+
+          lines.append('</tbody></table>')
+
+          with open("confluence_table.html", "w") as out:
+              out.write("\n".join(lines))
+
+          print(f"Built confluence_table.html ({len(lines)} rows)")
+          PYEOF
+
+      # =========================
+      # UPDATE CONFLUENCE PAGE
+      # Required secrets:
+      #   CONFLUENCE_EMAIL     - Atlassian account email
+      #   CONFLUENCE_API_TOKEN - Atlassian API token
+      #                          Generate at: https://id.atlassian.com/manage-profile/security/api-tokens
+      # =========================
+      - name: Update Confluence Page
+        env:
+          CONFLUENCE_EMAIL: ${{ secrets.CONFLUENCE_EMAIL }}
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+        run: |
+          CONFLUENCE_BASE_URL="https://netreveal.atlassian.net"
+          PAGE_ID="1286471859"
+
+          echo "Fetching current page version..."
+
+          HTTP_GET=$(curl -s -w "\n%{http_code}" \
+            -u "${CONFLUENCE_EMAIL}:${CONFLUENCE_API_TOKEN}" \
+            -H "Accept: application/json" \
+            "${CONFLUENCE_BASE_URL}/wiki/rest/api/content/${PAGE_ID}?expand=version")
+
+          HTTP_BODY=$(echo "$HTTP_GET" | head -n -1)
+          HTTP_STATUS=$(echo "$HTTP_GET" | tail -n 1)
+
+          echo "GET status: $HTTP_STATUS"
+
+          if [[ "$HTTP_STATUS" != "200" ]]; then
+            echo "❌ Failed to fetch page. Response:"
+            echo "$HTTP_BODY"
+            exit 1
+          fi
+
+          CURRENT_VERSION=$(echo "$HTTP_BODY" | python3 -c "
+          import sys, json
+          try:
+              data = json.load(sys.stdin)
+              print(data['version']['number'])
+          except Exception as e:
+              print(f'PARSE_ERROR: {e}', file=sys.stderr)
+              sys.exit(1)
+          ")
+
+          PAGE_TITLE=$(echo "$HTTP_BODY" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          print(data['title'])
+          ")
+
+          echo "Page: '${PAGE_TITLE}' — current version: ${CURRENT_VERSION}"
+          NEW_VERSION=$((CURRENT_VERSION + 1))
+
+          python3 << PYEOF
+          import json
+
+          with open("confluence_table.html") as f:
+              table_html = f.read()
+
+          full_body = (
+              "<h2>Cluster Deployment Status</h2>"
+              '<ac:structured-macro ac:name="info"><ac:rich-text-body>'
+              "<p>This table is auto-generated by the "
+              '<a href="${{ github.server_url }}/${{ github.repository }}/actions">cluster-details pipeline</a>. '
+              "Do not edit — changes are overwritten on every run.</p>"
+              "</ac:rich-text-body></ac:structured-macro>"
+              + table_html
+          )
+
+          payload = {
+              "version": {"number": ${NEW_VERSION}},
+              "title": "${PAGE_TITLE}",
+              "type": "page",
+              "body": {
+                  "storage": {
+                      "value": full_body,
+                      "representation": "storage"
+                  }
+              }
+          }
+
+          with open("confluence_payload.json", "w") as f:
+              json.dump(payload, f)
+
+          print("Payload written to confluence_payload.json")
+          PYEOF
+
+          echo "Pushing update to Confluence (version ${NEW_VERSION})..."
+
+          HTTP_PUT=$(curl -s -w "\n%{http_code}" \
+            -X PUT \
+            -u "${CONFLUENCE_EMAIL}:${CONFLUENCE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d @confluence_payload.json \
+            "${CONFLUENCE_BASE_URL}/wiki/rest/api/content/${PAGE_ID}")
+
+          PUT_BODY=$(echo "$HTTP_PUT" | head -n -1)
+          PUT_STATUS=$(echo "$HTTP_PUT" | tail -n 1)
+
+          echo "PUT status: $PUT_STATUS"
+
+          if [[ "$PUT_STATUS" == "200" ]]; then
+            echo "✅ Confluence page updated successfully"
+            echo "   https://netreveal.atlassian.net/wiki/spaces/CDOPSNROD/pages/${PAGE_ID}"
+          else
+            echo "❌ Confluence update failed (HTTP ${PUT_STATUS})"
+            echo "Response:"
+            echo "$PUT_BODY" | python3 -c "
+          import sys, json
+          try:
+              print(json.dumps(json.load(sys.stdin), indent=2))
+          except:
+              print(sys.stdin.read())
+          " 2>/dev/null || echo "$PUT_BODY"
+            exit 1
+          fi
+
+      # =========================
+      # UPLOAD ARTIFACTS
+      # =========================
+      - name: Upload Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-reports
+          path: |
+            aks_clusters.txt
+            cluster_meta.txt
+            helmfile_data.txt
+            aks_data.txt
+            aks_namespaces.txt
+            unreachable_clusters.txt
+            confluence_table.html
+          retention-days: 7
