@@ -4,10 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       resource_group:
-        description: "Resource Group to import"
+        description: "Azure Resource Group to import from"
         required: true
         type: string
-<<<<<<< HEAD
       environment:
         description: "Environment label"
         required: true
@@ -17,10 +16,8 @@ on:
           - qa
           - staging
           - prod
-=======
->>>>>>> b04bb3bd00ca3209480349840420032105625663
       action:
-        description: "Action"
+        description: "Action to run"
         required: true
         type: choice
         options:
@@ -28,25 +25,22 @@ on:
           - generate
           - discover-generate-validate
       tag_filter:
-<<<<<<< HEAD
         description: "Filter by tag key=value (optional, leave empty for all)"
-=======
-        description: "Tag filter key=value (optional)"
->>>>>>> b04bb3bd00ca3209480349840420032105625663
         required: false
         type: string
         default: ""
       branch:
-        description: "Branch"
+        description: "Branch to run from"
         required: true
         type: string
         default: "main"
 
-jobs:
-<<<<<<< HEAD
+concurrency:
+  group: azure-import-${{ github.event.inputs.resource_group }}
+  cancel-in-progress: false
 
-=======
->>>>>>> b04bb3bd00ca3209480349840420032105625663
+jobs:
+
   discover:
     name: "Discover Resources"
     runs-on: ubuntu-latest
@@ -55,10 +49,7 @@ jobs:
       contents: read
     outputs:
       resource_count: ${{ steps.discover.outputs.resource_count }}
-<<<<<<< HEAD
       resource_types: ${{ steps.discover.outputs.resource_types }}
-=======
->>>>>>> b04bb3bd00ca3209480349840420032105625663
     env:
       ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -78,7 +69,6 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-<<<<<<< HEAD
       - name: List all resources in resource group
         run: |
           az resource list \
@@ -101,50 +91,6 @@ jobs:
         with:
           name: discovery-report-${{ github.run_id }}
           path: /tmp/discovery-report.json
-=======
-      - name: Discover
-        id: discover
-        run: |
-          RG="${{ github.event.inputs.resource_group }}"
-          TAG_FILTER="${{ github.event.inputs.tag_filter }}"
-
-          az resource list --resource-group "$RG" --output json > /tmp/raw.json
-
-          if [ -n "$TAG_FILTER" ]; then
-            TAG_KEY=$(echo "$TAG_FILTER" | cut -d'=' -f1)
-            TAG_VAL=$(echo "$TAG_FILTER" | cut -d'=' -f2)
-            python3 -c "
-import json
-with open('/tmp/raw.json') as f: r=json.load(f)
-out=[x for x in r if x.get('tags',{}).get('$TAG_KEY')=='$TAG_VAL']
-print(f'Matched {len(out)} of {len(r)}')
-json.dump(out, open('/tmp/resources.json','w'), indent=2)
-"
-          else
-            cp /tmp/raw.json /tmp/resources.json
-          fi
-
-          python3 -c "
-import json
-from collections import defaultdict
-r=json.load(open('/tmp/resources.json'))
-by_type=defaultdict(list)
-for x in r: by_type[x['type']].append(x['name'])
-print(f'Total: {len(r)}')
-for t,names in sorted(by_type.items()):
-    print(f'  {t}')
-    for n in names: print(f'    - {n}')
-json.dump({'total':len(r),'by_type':dict(by_type)}, open('/tmp/report.json','w'), indent=2)
-"
-          COUNT=$(python3 -c "import json; print(json.load(open('/tmp/resources.json')).__len__())")
-          echo "resource_count=$COUNT" >> "$GITHUB_OUTPUT"
-
-      - name: Upload report
-        uses: actions/upload-artifact@v4
-        with:
-          name: discovery-report-${{ github.run_id }}
-          path: /tmp/report.json
->>>>>>> b04bb3bd00ca3209480349840420032105625663
           retention-days: 30
 
   generate:
@@ -188,11 +134,7 @@ json.dump({'total':len(r),'by_type':dict(by_type)}, open('/tmp/report.json','w')
         with:
           terraform_version: "~1.9"
 
-<<<<<<< HEAD
       - name: Generate Terraform code with aztfexport
-=======
-      - name: Generate
->>>>>>> b04bb3bd00ca3209480349840420032105625663
         run: |
           mkdir -p /tmp/generated-tf
           aztfexport resource-group \
@@ -200,7 +142,6 @@ json.dump({'total':len(r),'by_type':dict(by_type)}, open('/tmp/report.json','w')
             --output-dir /tmp/generated-tf \
             --overwrite \
             "${{ github.event.inputs.resource_group }}"
-<<<<<<< HEAD
           echo "Generated files:"
           ls -la /tmp/generated-tf
 
@@ -208,11 +149,6 @@ json.dump({'total':len(r),'by_type':dict(by_type)}, open('/tmp/report.json','w')
         run: bash scripts/add_backend.sh
 
       - name: Upload generated Terraform code
-=======
-          ls -la /tmp/generated-tf
-
-      - name: Upload generated code
->>>>>>> b04bb3bd00ca3209480349840420032105625663
         uses: actions/upload-artifact@v4
         with:
           name: generated-tf-${{ github.run_id }}
@@ -220,11 +156,7 @@ json.dump({'total':len(r),'by_type':dict(by_type)}, open('/tmp/report.json','w')
           retention-days: 30
 
   validate:
-<<<<<<< HEAD
     name: "Validate with Terraform Plan"
-=======
-    name: "Validate"
->>>>>>> b04bb3bd00ca3209480349840420032105625663
     runs-on: ubuntu-latest
     needs: [discover, generate]
     if: github.event.inputs.action == 'discover-generate-validate'
@@ -274,12 +206,15 @@ json.dump({'total':len(r),'by_type':dict(by_type)}, open('/tmp/report.json','w')
             -backend-config="dynamodb_table=${{ secrets.TF_STATE_LOCK_TABLE }}" \
             -backend-config="encrypt=true"
 
+      - name: Terraform Validate
+        working-directory: /tmp/generated-tf
+        run: terraform validate
+
       - name: Terraform Plan
         working-directory: /tmp/generated-tf
         run: |
           terraform plan \
             -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
-<<<<<<< HEAD
             -out=import-plan 2>&1 | tee /tmp/plan-output.txt
           grep -E "Plan:|No changes|to import|to add|to change|to destroy" /tmp/plan-output.txt || true
 
@@ -288,14 +223,4 @@ json.dump({'total':len(r),'by_type':dict(by_type)}, open('/tmp/report.json','w')
         with:
           name: plan-output-${{ github.run_id }}
           path: /tmp/plan-output.txt
-=======
-            2>&1 | tee /tmp/plan.txt
-          grep -E "Plan:|No changes|to import" /tmp/plan.txt || true
-
-      - name: Upload plan
-        uses: actions/upload-artifact@v4
-        with:
-          name: plan-output-${{ github.run_id }}
-          path: /tmp/plan.txt
->>>>>>> b04bb3bd00ca3209480349840420032105625663
           retention-days: 30
