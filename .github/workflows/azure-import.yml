@@ -22,10 +22,11 @@ on:
         type: choice
         options:
           - discover
-          - generate
-          - discover-generate-validate
+          - generate-tfvars
+          - import-state
+          - all
       tag_filter:
-        description: "Filter by tag key=value (optional, leave empty for all)"
+        description: "Filter by tag key=value (optional)"
         required: false
         type: string
         default: ""
@@ -49,7 +50,6 @@ jobs:
       contents: read
     outputs:
       resource_count: ${{ steps.discover.outputs.resource_count }}
-      resource_types: ${{ steps.discover.outputs.resource_types }}
     env:
       ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -69,14 +69,14 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: List all resources in resource group
+      - name: List resources
         run: |
           az resource list \
             --resource-group "${{ github.event.inputs.resource_group }}" \
             --output json > /tmp/all-resources-raw.json
-          echo "Raw resource count:" $(python3 -c "import json; print(len(json.load(open('/tmp/all-resources-raw.json'))))")
+          echo "Total found:" $(python3 -c "import json; print(len(json.load(open('/tmp/all-resources-raw.json'))))")
 
-      - name: Filter and generate discovery report
+      - name: Filter and report
         id: discover
         env:
           TAG_FILTER: ${{ github.event.inputs.tag_filter }}
@@ -84,7 +84,6 @@ jobs:
         run: |
           python3 aks-import/scripts/discover.py
           echo "resource_count=$(cat /tmp/resource_count.txt)" >> "$GITHUB_OUTPUT"
-          echo "resource_types=$(cat /tmp/resource_types.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Upload discovery report
         uses: actions/upload-artifact@v4
@@ -93,13 +92,13 @@ jobs:
           path: /tmp/discovery-report.json
           retention-days: 30
 
-  generate:
-    name: "Generate Terraform Code"
+  generate-tfvars:
+    name: "Generate tfvars File"
     runs-on: ubuntu-latest
     needs: discover
     if: |
-      github.event.inputs.action == 'generate' ||
-      github.event.inputs.action == 'discover-generate-validate'
+      github.event.inputs.action == 'generate-tfvars' ||
+      github.event.inputs.action == 'all'
     permissions:
       id-token: write
       contents: read
@@ -122,51 +121,42 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Install aztfexport
+      - name: List resources
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y jq unzip
-          ASSET_URL=$(curl -fsSL https://api.github.com/repos/Azure/aztfexport/releases/latest \
-            | jq -r '.assets[] | select(.name | test("linux.*amd64.*zip")) | .browser_download_url')
-          echo "Downloading: $ASSET_URL"
-          curl -fL "$ASSET_URL" -o aztfexport.zip
-          unzip -q aztfexport.zip
-          chmod +x aztfexport
-          sudo mv aztfexport /usr/local/bin/
-          aztfexport --version
+          az resource list \
+            --resource-group "${{ github.event.inputs.resource_group }}" \
+            --output json > /tmp/all-resources-raw.json
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "~1.9"
+      - name: Filter by tag
+        env:
+          TAG_FILTER: ${{ github.event.inputs.tag_filter }}
+          RESOURCE_GROUP: ${{ github.event.inputs.resource_group }}
+        run: python3 aks-import/scripts/discover.py
 
-      - name: Generate Terraform code with aztfexport
-        run: |
-          mkdir -p /tmp/generated-tf
-          aztfexport resource-group \
-            --non-interactive \
-            --plain-ui \
-            --overwrite \
-            --output-dir /tmp/generated-tf \
-            "${{ github.event.inputs.resource_group }}"
-          echo "Generated files:"
-          ls -la /tmp/generated-tf
+      - name: Fetch detailed properties
+        run: python3 aks-import/scripts/fetch_details.py
 
-      - name: Replace backend and provider with clean config
-        run: bash aks-import/scripts/add_backend.sh
+      - name: Generate tfvars
+        env:
+          RESOURCE_GROUP: ${{ github.event.inputs.resource_group }}
+          SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+        run: python3 aks-import/scripts/generate_tfvars.py
 
-      - name: Upload generated Terraform code
+      - name: Upload tfvars
         uses: actions/upload-artifact@v4
         with:
-          name: generated-tf-${{ github.run_id }}
-          path: /tmp/generated-tf/
+          name: generated-tfvars-${{ github.event.inputs.environment }}-${{ github.run_id }}
+          path: /tmp/generated.tfvars
           retention-days: 30
 
-  validate:
-    name: "Validate with Terraform Plan"
+  import-state:
+    name: "Import to Terraform State"
     runs-on: ubuntu-latest
-    needs: [discover, generate]
-    if: github.event.inputs.action == 'discover-generate-validate'
+    needs: discover
+    if: |
+      github.event.inputs.action == 'import-state' ||
+      github.event.inputs.action == 'all'
     permissions:
       id-token: write
       contents: read
@@ -197,60 +187,42 @@ jobs:
         with:
           terraform_version: "~1.9"
 
-      - name: Download generated code
-        uses: actions/download-artifact@v4
-        with:
-          name: generated-tf-${{ github.run_id }}
-          path: /tmp/generated-tf
-
-      - name: Clean and fix Terraform configs
-        run: |
-          cd /tmp/generated-tf
-          echo "=== Files before cleanup ==="
-          ls -la *.tf 2>/dev/null || echo "no tf files"
-
-          # Remove ALL tf files that aztfexport generates for backend/provider
-          rm -f backend.tf terraform.tf provider.tf
-
-          # Create clean backend.tf - empty block, values passed via -backend-config
-          printf 'terraform {\n  backend "s3" {}\n}\n' > backend.tf
-
-          # Create clean provider.tf
-          printf 'provider "azurerm" {\n  features {}\n  use_oidc = true\n  subscription_id = var.subscription_id\n}\nvariable "subscription_id" {\n  type    = string\n  default = null\n}\n' > provider.tf
-
-          echo "=== Files after cleanup ==="
-          cat backend.tf
-          echo "---"
-          cat provider.tf
-
       - name: Terraform Init
-        working-directory: /tmp/generated-tf
+        working-directory: terraform/azure/azure-kubernetes-service
         run: |
           terraform init \
             -input=false \
-            -migrate-state \
-            -force-copy \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="key=azure/imports/${{ github.event.inputs.resource_group }}/terraform.tfstate" \
+            -backend-config="key=azure/azure-kubernetes-service/${{ github.event.inputs.environment }}/terraform.tfstate" \
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="dynamodb_table=${{ secrets.TF_STATE_LOCK_TABLE }}" \
             -backend-config="encrypt=true"
 
-      - name: Terraform Validate
-        working-directory: /tmp/generated-tf
-        run: terraform validate
+      - name: List resources
+        run: |
+          az resource list \
+            --resource-group "${{ github.event.inputs.resource_group }}" \
+            --output json > /tmp/all-resources-raw.json
 
-      - name: Terraform Plan
-        working-directory: /tmp/generated-tf
+      - name: Run terraform import
+        working-directory: terraform/azure/azure-kubernetes-service
+        env:
+          TAG_FILTER: ${{ github.event.inputs.tag_filter }}
+          RESOURCE_GROUP: ${{ github.event.inputs.resource_group }}
+        run: python3 ../../../aks-import/scripts/run_import.py
+
+      - name: Terraform Plan to verify
+        working-directory: terraform/azure/azure-kubernetes-service
         run: |
           terraform plan \
+            -var-file="values/${{ github.event.inputs.environment }}.tfvars" \
             -var="subscription_id=${{ secrets.AZURE_SUBSCRIPTION_ID }}" \
-            -out=import-plan 2>&1 | tee /tmp/plan-output.txt
-          grep -E "Plan:|No changes|to import|to add|to change|to destroy" /tmp/plan-output.txt || true
+            2>&1 | tee /tmp/import-plan.txt
+          grep -E "Plan:|No changes|to import" /tmp/import-plan.txt || true
 
-      - name: Upload plan output
+      - name: Upload plan
         uses: actions/upload-artifact@v4
         with:
-          name: plan-output-${{ github.run_id }}
-          path: /tmp/plan-output.txt
+          name: import-plan-${{ github.run_id }}
+          path: /tmp/import-plan.txt
           retention-days: 30
