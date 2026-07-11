@@ -110,20 +110,32 @@ jobs:
           echo " Discovering resources in: $RG"
           echo "================================================="
 
-          # Build tag filter if provided
-          TAG_ARGS=""
+          # List all resources in the resource group
+          # Note: --tag and --resource-group cannot be used together in Azure CLI
+          # so we fetch all resources first then filter by tag using Python
+          az resource list \
+            --resource-group "$RG" \
+            --output json > /tmp/all-resources-raw.json
+
+          # Filter by tag if provided
           if [ -n "$TAG_FILTER" ]; then
             TAG_KEY=$(echo "$TAG_FILTER" | cut -d'=' -f1)
             TAG_VAL=$(echo "$TAG_FILTER" | cut -d'=' -f2)
-            TAG_ARGS="--tag $TAG_KEY=$TAG_VAL"
             echo "Filtering by tag: $TAG_KEY=$TAG_VAL"
+            python3 << PYFILTER
+import json
+with open('/tmp/all-resources-raw.json') as f:
+    resources = json.load(f)
+filtered = [r for r in resources
+            if r.get('tags', {}).get('$TAG_KEY') == '$TAG_VAL']
+print(f'Filtered: {len(filtered)} of {len(resources)} resources match tag $TAG_KEY=$TAG_VAL')
+with open('/tmp/all-resources.json', 'w') as f:
+    json.dump(filtered, f)
+PYFILTER
+          else
+            echo "No tag filter - using all resources"
+            cp /tmp/all-resources-raw.json /tmp/all-resources.json
           fi
-
-          # List all resources in the resource group
-          az resource list \
-            --resource-group "$RG" \
-            $TAG_ARGS \
-            --output json > /tmp/all-resources.json
 
           RESOURCE_COUNT=$(cat /tmp/all-resources.json | python3 -c \
             "import json,sys; r=json.load(sys.stdin); print(len(r))")
