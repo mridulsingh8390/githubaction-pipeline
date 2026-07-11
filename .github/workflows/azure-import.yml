@@ -150,12 +150,15 @@ jobs:
           terraform_version: "~1.9"
 
       - name: Generate Terraform code with aztfexport
+        env:
+          AZTFEXPORT_NON_INTERACTIVE: "true"
         run: |
           mkdir -p /tmp/generated-tf
           aztfexport resource-group \
             --non-interactive \
             --output-dir /tmp/generated-tf \
             --overwrite \
+            --enable-telemetry=false \
             "${{ github.event.inputs.resource_group }}"
           echo "Generated files:"
           ls -la /tmp/generated-tf
