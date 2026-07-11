@@ -1,0 +1,708 @@
+name: Azure VNet Report to Confluence
+
+# Single-file pipeline: the report script is written to disk at run time
+# from this workflow file itself, so there's one place to find and edit
+# both the automation logic and its schedule - no separate .py file to
+# keep in sync in the repo.
+on:
+  schedule:
+    - cron: "0 3 * * *"  # 03:00 UTC daily - adjust to your preferred off-peak hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write   # required only if using OIDC federated login (see GITHUB_ACTIONS_SETUP.md)
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install azure-identity azure-mgmt-network requests urllib3
+
+      - name: Write report script
+        run: |
+          cat > azure_vnet_report_to_confluence.py << 'PYEOF'
+          #!/usr/bin/env python3
+          """
+          azure_vnet_report_to_confluence.py
+
+          1. Discovers every VNet and subnet in the target Azure subscription(s),
+             along with the resources (NICs -> VMs, private endpoints, etc.)
+             attached to each subnet.
+          2. Computes the next available CIDR range (of a given size) within a
+             parent supernet, using the used-CIDR-aware algorithm supplied.
+          3. Generates a draw.io network diagram (VNets as containers, subnets
+             nested inside with their attached resources) and uploads it as an
+             attachment on the target Confluence page.
+          4. Publishes a formatted report to that Confluence page - inventory
+             table, next-available-CIDR callout, and the embedded draw.io diagram -
+             via the REST API.
+
+          Environment variables required:
+            AZURE_SUBSCRIPTION_ID      Azure subscription to scan (comma-separate for multiple)
+            PARENT_CIDR                The overall supernet to search for free space in (e.g. "10.0.0.0/8")
+            TARGET_PREFIX_LENGTH       Desired size of the next allocation (e.g. 16 for a /16)
+
+            CONFLUENCE_BASE_URL        e.g. https://yourcompany.atlassian.net/wiki
+            CONFLUENCE_PAGE_ID         The numeric ID of the page to update
+            CONFLUENCE_EMAIL           Atlassian account email (Cloud) used for auth
+            CONFLUENCE_API_TOKEN       Atlassian API token (Cloud) - never the account password
+
+          Environment variables optional:
+            SUBNET_TARGET_PREFIX_LENGTH  If set, also computes+displays the next free
+                                          subnet-sized range within each individual VNet
+                                          (separate from the global PARENT_CIDR lookup above)
+            CONFLUENCE_PAGE_TITLE         If unset, the script fetches and reuses the
+                                          page's current title (safer default). Set
+                                          explicitly only if you want to rename the page.
+
+          Usage:
+            pip install azure-identity azure-mgmt-network requests
+            python azure_vnet_report_to_confluence.py
+          """
+
+          import ipaddress
+          import logging
+          import os
+          import sys
+          from dataclasses import dataclass, field
+          from html import escape
+
+          import requests
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+          from azure.identity import DefaultAzureCredential
+          from azure.mgmt.network import NetworkManagementClient
+
+          logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+          log = logging.getLogger("azure-vnet-report")
+
+
+          def make_retrying_session() -> requests.Session:
+              """
+              Shared HTTP session with automatic retry/backoff for transient failures
+              (429 rate limits, 5xx server errors) against the Confluence REST API.
+              Azure SDK calls have their own built-in retry policy already.
+              """
+              session = requests.Session()
+              retry = Retry(
+                  total=4,
+                  backoff_factor=1.5,  # 1.5s, 3s, 6s, 12s
+                  status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=["GET", "POST", "PUT"],
+                  raise_on_status=False,
+              )
+              adapter = HTTPAdapter(max_retries=retry)
+              session.mount("https://", adapter)
+              session.mount("http://", adapter)
+              return session
+
+
+          CONFLUENCE_SESSION = make_retrying_session()
+
+
+          # ---------------------------------------------------------------------------
+          # Provided CIDR calculation logic
+          # ---------------------------------------------------------------------------
+
+          def next_available_cidr(parent_cidr: str, used_cidrs: list[str], target_prefix: int):
+              parent = ipaddress.ip_network(parent_cidr, strict=False)
+              used = []
+              for c in used_cidrs:
+                  n = ipaddress.ip_network(c, strict=False)
+                  if n.subnet_of(parent):
+                      used.append(n)
+              used.sort(key=lambda x: int(x.network_address))
+              for candidate in parent.subnets(new_prefix=target_prefix):
+                  if all(not candidate.overlaps(u) for u in used):
+                      return str(candidate)
+              return "N/A"
+
+
+          # ---------------------------------------------------------------------------
+          # Data model
+          # ---------------------------------------------------------------------------
+
+          @dataclass
+          class ResourceBinding:
+              """One attached resource + its IP within a subnet (one row per IP)."""
+              ip_address: str          # actual private IP, or "N/A" if not resolvable yet
+              resource_type: str       # "VM", "AKS (delegated)", "Load Balancer", "NetApp", "Unknown", etc.
+              resource_name: str       # friendly name if resolved, else raw resource ID
+
+
+          @dataclass
+          class SubnetInfo:
+              name: str
+              cidrs: list[str]  # supports both single (address_prefix) and multi (address_prefixes) subnets
+              bindings: list[ResourceBinding] = field(default_factory=list)
+
+              @property
+              def cidr_display(self) -> str:
+                  return ", ".join(self.cidrs) if self.cidrs else "N/A"
+
+
+          @dataclass
+          class VnetInfo:
+              name: str
+              resource_group: str
+              subscription_id: str
+              address_spaces: list[str]
+              subnets: list[SubnetInfo] = field(default_factory=list)
+
+
+          def parse_resource_group(azure_resource_id: str) -> str:
+              """
+              Safely extract the resource group name from an Azure resource ID, e.g.:
+              /subscriptions/{sub}/resourceGroups/{rg}/providers/... -> {rg}
+              Falls back to 'unknown' rather than raising if the ID doesn't match the
+              expected shape (more robust than a hardcoded parts[4] index).
+              """
+              parts = azure_resource_id.split("/")
+              try:
+                  idx = [p.lower() for p in parts].index("resourcegroups")
+                  return parts[idx + 1]
+              except (ValueError, IndexError):
+                  log.warning(f"Could not parse resource group from ID: {azure_resource_id}")
+                  return "unknown"
+
+
+          def get_subnet_cidrs(subnet) -> list[str]:
+              """
+              Azure subnets can expose either a single 'address_prefix' or a list
+              'address_prefixes' (used for dual-stack / multi-prefix subnets).
+              Handle both safely and always return a list.
+              """
+              if getattr(subnet, "address_prefixes", None):
+                  return list(subnet.address_prefixes)
+              if getattr(subnet, "address_prefix", None):
+                  return [subnet.address_prefix]
+              return []
+
+
+          # ---------------------------------------------------------------------------
+          # Azure discovery
+          # ---------------------------------------------------------------------------
+
+          # Maps the resource-provider segment in an Azure ID to a human-readable type label
+          RESOURCE_TYPE_MAP = {
+              "networkinterfaces": "VM",
+              "loadbalancers": "Load Balancer",
+              "netappaccounts": "NetApp",
+              "privateendpoints": "Private Endpoint",
+              "applicationgateways": "App Gateway",
+              "natgateways": "NAT Gateway",
+          }
+
+
+          def detect_resource_type(resource_id: str) -> str:
+              """Best-effort resource type detection from the Azure resource ID's provider segment."""
+              parts = [p.lower() for p in resource_id.split("/")]
+              for key, label in RESOURCE_TYPE_MAP.items():
+                  if key in parts:
+                      return label
+              return "Unknown"
+
+
+          def discover_vnets(subscription_ids: list[str]) -> list[VnetInfo]:
+              """Enumerate all VNets, their subnets, and the resources (with raw IDs) attached to each subnet."""
+              credential = DefaultAzureCredential()
+              vnets: list[VnetInfo] = []
+
+              for sub_id in subscription_ids:
+                  log.info(f"Scanning subscription {sub_id} ...")
+                  client = NetworkManagementClient(credential, sub_id)
+
+                  for vnet in client.virtual_networks.list_all():
+                      resource_group = parse_resource_group(vnet.id)
+                      info = VnetInfo(
+                          name=vnet.name,
+                          resource_group=resource_group,
+                          subscription_id=sub_id,
+                          address_spaces=list(vnet.address_space.address_prefixes),
+                      )
+
+                      for subnet in vnet.subnets or []:
+                          sub_info = SubnetInfo(name=subnet.name, cidrs=get_subnet_cidrs(subnet))
+
+                          # Resources attached to this subnet (NICs/VMs, LBs, private endpoints, NetApp, etc.)
+                          # IP address and friendly name are resolved later in resolve_resource_names().
+                          for ip_config in subnet.ip_configurations or []:
+                              sub_info.bindings.append(
+                                  ResourceBinding(
+                                      ip_address="N/A",
+                                      resource_type=detect_resource_type(ip_config.id),
+                                      resource_name=ip_config.id,  # placeholder until resolved
+                                  )
+                              )
+
+                          # Delegated services (e.g. AKS, App Service) - not a discrete IP-bound
+                          # resource, but worth surfacing as its own row for visibility.
+                          for delegation in subnet.delegations or []:
+                              label = "AKS (delegated)" if "aks" in (delegation.service_name or "").lower() else f"Delegated: {delegation.service_name}"
+                              sub_info.bindings.append(
+                                  ResourceBinding(ip_address="N/A (delegation)", resource_type=label, resource_name=delegation.name or "")
+                              )
+
+                          info.subnets.append(sub_info)
+
+                      vnets.append(info)
+
+              log.info(f"Discovered {len(vnets)} vnets across {len(subscription_ids)} subscription(s)")
+              return vnets
+
+
+          def resolve_resource_names(vnets: list[VnetInfo], subscription_ids: list[str]) -> None:
+              """
+              Resolve raw resource IDs into friendly names and real IP addresses where possible.
+
+              Fully resolved (name + real private IP): VM (via NIC -> ipConfig -> private_ip_address)
+              Type-only (name/ID shown, IP not resolved in this pass): Load Balancer, NetApp,
+                Private Endpoint, App Gateway, NAT Gateway - these use different Azure SDK clients
+                (network LB client, azure-mgmt-netapp, etc.) not wired into this script yet.
+                They're still labeled by type so they're visible in the report, just not
+                fully enriched - flagged as a known limitation in the published page.
+              """
+              credential = DefaultAzureCredential()
+              clients = {sub_id: NetworkManagementClient(credential, sub_id) for sub_id in subscription_ids}
+
+              for vnet in vnets:
+                  client = clients[vnet.subscription_id]
+                  for subnet in vnet.subnets:
+                      for binding in subnet.bindings:
+                          if binding.resource_type in ("AKS (delegated)",) or binding.resource_type.startswith("Delegated:"):
+                              continue  # already labeled, nothing to resolve
+
+                          resource_id = binding.resource_name  # currently holds the raw ID
+                          if binding.resource_type == "VM":
+                              try:
+                                  parts = resource_id.split("/")
+                                  nic_name = parts[parts.index("networkInterfaces") + 1]
+                                  ip_config_name = parts[parts.index("ipConfigurations") + 1]
+                                  nic_rg = parse_resource_group(resource_id)
+                                  nic = client.network_interfaces.get(nic_rg, nic_name)
+
+                                  target = nic.virtual_machine.id.split("/")[-1] if nic.virtual_machine else nic.name
+                                  binding.resource_name = target
+
+                                  matching_config = next(
+                                      (c for c in (nic.ip_configurations or []) if c.name == ip_config_name), None
+                                  )
+                                  binding.ip_address = matching_config.private_ip_address if matching_config else "N/A"
+                              except Exception as e:
+                                  log.warning(f"Could not resolve VM/NIC resource {resource_id}: {e}")
+                          else:
+                              # Not yet fully resolved - show the resource's own name (last ID
+                              # segment) rather than the full raw ID, so it's at least readable.
+                              binding.resource_name = resource_id.rstrip("/").split("/")[-1]
+                              binding.ip_address = "N/A (resolver not implemented for this type)"
+
+
+          # ---------------------------------------------------------------------------
+          # Report generation
+          # ---------------------------------------------------------------------------
+
+          def next_free_in_vnet(vnet_address_spaces: list[str], used_subnet_cidrs: list[str], prefix: int) -> str:
+              """
+              Find the next free subnet-sized range within a VNet that may have
+              MULTIPLE address spaces (not just the first one) - checks each space in
+              order and returns the first valid candidate found across any of them.
+              """
+              for space in vnet_address_spaces:
+                  candidate = next_available_cidr(space, used_subnet_cidrs, prefix)
+                  if candidate != "N/A":
+                      return candidate
+              return "N/A"
+
+
+          def build_confluence_html(vnets: list[VnetInfo], next_cidr: str, parent_cidr: str, target_prefix: int, drawio_filename: str, subnet_target_prefix: int | None = None) -> str:
+              """
+              Build a Confluence storage-format (XHTML) page body, in this order:
+                1. VNet / IP address / attached resource table (one row per IP binding)
+                2. Next available CIDR range(s)
+                3. Network diagram (draw.io)
+
+              next_cidr / parent_cidr / target_prefix describe the NEXT FREE VNET-SIZED
+              RANGE within the overall supernet (global parent space).
+
+              subnet_target_prefix, if provided, additionally computes the next free
+              SUBNET-sized range *within each individual VNet* (a separate question
+              from the global one) - shown as a second callout, not folded into the
+              per-IP table, since it's a VNet-level fact, not a per-resource one.
+
+              All dynamic values (names pulled from Azure) are HTML-escaped before
+              being embedded in the storage-format XHTML.
+              """
+              rows = []
+              for vnet in vnets:
+                  for subnet in vnet.subnets:
+                      if not subnet.bindings:
+                          # Empty subnet - still show one row so it's visible in the inventory
+                          rows.append(
+                              f"<tr>"
+                              f"<td>{escape(vnet.name)}</td>"
+                              f"<td>{escape(subnet.name)} ({escape(subnet.cidr_display)})</td>"
+                              f"<td><i>N/A</i></td>"
+                              f"<td><i>empty subnet</i></td>"
+                              f"<td><i>-</i></td>"
+                              f"</tr>"
+                          )
+                          continue
+                      for binding in subnet.bindings:
+                          rows.append(
+                              f"<tr>"
+                              f"<td>{escape(vnet.name)}</td>"
+                              f"<td>{escape(subnet.name)} ({escape(subnet.cidr_display)})</td>"
+                              f"<td>{escape(binding.ip_address)}</td>"
+                              f"<td>{escape(binding.resource_type)}</td>"
+                              f"<td>{escape(binding.resource_name)}</td>"
+                              f"</tr>"
+                          )
+
+              table_rows = "\n".join(rows)
+
+              # Per-VNet next-free-subnet callouts (separate question from the global lookup)
+              per_vnet_rows = []
+              if subnet_target_prefix:
+                  for vnet in vnets:
+                      vnet_subnet_cidrs = [c for s in vnet.subnets for c in s.cidrs]
+                      next_subnet_cidr = next_free_in_vnet(vnet.address_spaces, vnet_subnet_cidrs, subnet_target_prefix)
+                      per_vnet_rows.append(
+                          f"<tr><td>{escape(vnet.name)}</td><td>{escape(next_subnet_cidr)}</td></tr>"
+                      )
+              per_vnet_table_rows = "\n".join(per_vnet_rows)
+
+              # draw.io Confluence app macro - embeds the attached .drawio file inline.
+              # NOTE: macro name/parameters can differ slightly by draw.io app version/edition
+              # (Cloud vs Data Center). Verify against your instance if this doesn't render -
+              # check Confluence's macro browser for the exact "Draw.io Diagram" macro
+              # and, if needed, insert one manually once and copy its generated storage XML.
+              drawio_macro = f"""
+          <ac:structured-macro ac:name="drawio">
+            <ac:parameter ac:name="diagramName">{drawio_filename}</ac:parameter>
+            <ac:parameter ac:name="revision">1</ac:parameter>
+            <ac:parameter ac:name="simple">0</ac:parameter>
+            <ac:parameter ac:name="width">100%</ac:parameter>
+          </ac:structured-macro>
+          """
+
+              per_vnet_section = ""
+              if subnet_target_prefix:
+                  per_vnet_section = f"""
+          <h4>Next available subnet within each VNet (size: /{subnet_target_prefix})</h4>
+          <table>
+            <thead><tr><th>VNet</th><th>Next free subnet</th></tr></thead>
+            <tbody>{per_vnet_table_rows}</tbody>
+          </table>
+          """
+
+              html = f"""
+          <h2>Azure VNet / Subnet Inventory (auto-generated)</h2>
+          <p><i>This page is updated automatically by azure_vnet_report_to_confluence.py. Do not edit by hand — changes will be overwritten on the next run.</i></p>
+
+          <h3>VNet / IP address / attached resources</h3>
+          <p><i>Known limitation: IP address + name resolution is fully implemented for VM (via NIC). Load Balancer, NetApp, Private Endpoint, App Gateway, and NAT Gateway are detected and labeled by type, but their IP/name resolution is not yet implemented in this script.</i></p>
+          <table>
+            <thead>
+              <tr>
+                <th>VNet</th>
+                <th>Subnet (CIDR)</th>
+                <th>IP Address</th>
+                <th>Resource Type</th>
+                <th>Resource Name</th>
+              </tr>
+            </thead>
+            <tbody>
+              {table_rows}
+            </tbody>
+          </table>
+
+          <h3>Next available CIDR range</h3>
+          <p>Parent supernet: <code>{escape(parent_cidr)}</code> | Requested size: <code>/{target_prefix}</code></p>
+          <p><b>Next available range for a new cluster's VNet: <code>{escape(next_cidr)}</code></b></p>
+          {per_vnet_section}
+
+          <h3>Network diagram</h3>
+          {drawio_macro}
+          """
+              return html
+
+
+          # ---------------------------------------------------------------------------
+          # draw.io diagram generation
+          # ---------------------------------------------------------------------------
+
+          def build_drawio_xml(vnets: list[VnetInfo]) -> str:
+              """
+              Build a draw.io (.drawio / mxGraph) XML diagram showing each VNet as a
+              container box with its subnets nested inside. This is a structural
+              layout diagram (what exists, and its hierarchy) - not a live topology
+              map of peerings/routing, which would need additional Azure data
+              (VNet peerings, NSG associations) not collected by this script.
+              """
+              cells = []
+              cell_id = 0
+
+              def new_id():
+                  nonlocal cell_id
+                  cell_id += 1
+                  return f"n{cell_id}"
+
+              x_cursor = 40
+              vnet_width = 320
+              vnet_gap = 60
+
+              for vnet in vnets:
+                  vnet_id = new_id()
+                  subnet_count = max(len(vnet.subnets), 1)
+                  vnet_height = 80 + subnet_count * 70
+
+                  # VNet container box
+                  vnet_label = escape(f"{vnet.name}\n({', '.join(vnet.address_spaces)})\nRG: {vnet.resource_group}").replace("\n", "&#10;")
+                  cells.append(
+                      f'<mxCell id="{vnet_id}" value="{vnet_label}" '
+                      f'style="rounded=0;whiteSpace=wrap;html=1;verticalAlign=top;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=1;" '
+                      f'vertex="1" parent="1">'
+                      f'<mxGeometry x="{x_cursor}" y="40" width="{vnet_width}" height="{vnet_height}" as="geometry"/>'
+                      f'</mxCell>'
+                  )
+
+                  y_cursor = 60
+                  for subnet in vnet.subnets:
+                      subnet_id = new_id()
+                      binding_summary = "; ".join(f"{b.resource_type}: {b.resource_name}" for b in subnet.bindings) if subnet.bindings else "empty"
+                      # Truncate long resource lists so the box stays readable
+                      if len(binding_summary) > 60:
+                          binding_summary = binding_summary[:57] + "..."
+
+                      subnet_label = escape(f"{subnet.name}\n{subnet.cidr_display}\n{binding_summary}").replace("\n", "&#10;")
+                      cells.append(
+                          f'<mxCell id="{subnet_id}" value="{subnet_label}" '
+                          f'style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;" '
+                          f'vertex="1" parent="1">'
+                          f'<mxGeometry x="{x_cursor + 20}" y="{y_cursor + 20}" width="{vnet_width - 40}" height="55" as="geometry"/>'
+                          f'</mxCell>'
+                      )
+                      y_cursor += 70
+
+                  x_cursor += vnet_width + vnet_gap
+
+              cells_xml = "\n        ".join(cells)
+
+              drawio_xml = f"""<mxfile host="app.diagrams.net" agent="azure_vnet_report_to_confluence.py" version="1.0">
+            <diagram name="Azure VNet Topology" id="azure-vnet-topology">
+              <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="900" math="0" shadow="0">
+                <root>
+                  <mxCell id="0"/>
+                  <mxCell id="1" parent="0"/>
+                  {cells_xml}
+                </root>
+              </mxGraphModel>
+            </diagram>
+          </mxfile>"""
+              return drawio_xml
+
+
+
+
+          def upload_drawio_attachment(base_url: str, page_id: str, email: str, api_token: str, filename: str, drawio_xml: str) -> None:
+              """
+              Upload (or update) a .drawio file as an attachment on the Confluence page.
+              The draw.io app for Confluence renders any .drawio/.xml attachment when
+              referenced by its 'drawio' macro in the page body (see build_confluence_html).
+              """
+              auth = (email, api_token)
+              session = CONFLUENCE_SESSION
+
+              # Check whether an attachment with this filename already exists
+              search_url = f"{base_url}/rest/api/content/{page_id}/child/attachment"
+              resp = session.get(search_url, auth=auth, params={"filename": filename}, timeout=30)
+              resp.raise_for_status()
+              results = resp.json().get("results", [])
+
+              files = {"file": (filename, drawio_xml.encode("utf-8"), "application/xml")}
+              headers = {"X-Atlassian-Token": "nocheck"}  # required to bypass XSRF check for uploads
+
+              if results:
+                  # Attachment exists - update it (creates a new version)
+                  attachment_id = results[0]["id"]
+                  update_url = f"{base_url}/rest/api/content/{page_id}/child/attachment/{attachment_id}/data"
+                  resp = session.post(update_url, auth=auth, headers=headers, files=files, timeout=30)
+                  resp.raise_for_status()
+                  log.info(f"Updated existing draw.io attachment '{filename}'")
+              else:
+                  # No existing attachment - create it
+                  create_url = f"{base_url}/rest/api/content/{page_id}/child/attachment"
+                  resp = session.post(create_url, auth=auth, headers=headers, files=files, timeout=30)
+                  resp.raise_for_status()
+                  log.info(f"Created new draw.io attachment '{filename}'")
+
+
+          def get_confluence_page_title(base_url: str, page_id: str, email: str, api_token: str) -> str:
+              """Fetch the page's current title, so we don't clobber it with a mismatched value."""
+              auth = (email, api_token)
+              resp = CONFLUENCE_SESSION.get(f"{base_url}/rest/api/content/{page_id}", auth=auth, timeout=30)
+              resp.raise_for_status()
+              return resp.json()["title"]
+
+
+          def publish_to_confluence(base_url: str, page_id: str, email: str, api_token: str, title: str, html_body: str) -> None:
+              """Update an existing Confluence page's content via the REST API."""
+              auth = (email, api_token)
+              headers = {"Content-Type": "application/json"}
+              session = CONFLUENCE_SESSION
+
+              # Get current version number - Confluence requires version+1 on update
+              get_url = f"{base_url}/rest/api/content/{page_id}?expand=version"
+              resp = session.get(get_url, auth=auth, headers=headers, timeout=30)
+              resp.raise_for_status()
+              current_version = resp.json()["version"]["number"]
+
+              update_url = f"{base_url}/rest/api/content/{page_id}"
+              payload = {
+                  "id": page_id,
+                  "type": "page",
+                  "title": title,
+                  "version": {"number": current_version + 1},
+                  "body": {
+                      "storage": {
+                          "value": html_body,
+                          "representation": "storage",
+                      }
+                  },
+              }
+
+              resp = session.put(update_url, auth=auth, headers=headers, json=payload, timeout=30)
+              resp.raise_for_status()
+              log.info(f"Confluence page {page_id} updated to version {current_version + 1}")
+
+
+          # ---------------------------------------------------------------------------
+          # Main
+          # ---------------------------------------------------------------------------
+
+          def get_env(name: str, required: bool = True, default: str = None) -> str:
+              val = os.environ.get(name, default)
+              if required and not val:
+                  log.error(f"Missing required environment variable: {name}")
+                  sys.exit(1)
+              return val
+
+
+          def main():
+              subscription_ids = [s.strip() for s in get_env("AZURE_SUBSCRIPTION_ID").split(",") if s.strip()]
+              parent_cidr = get_env("PARENT_CIDR")
+              target_prefix = int(get_env("TARGET_PREFIX_LENGTH"))
+              # Optional: also compute the next free SUBNET-sized range within each
+              # individual VNet (a different question from the global parent lookup
+              # above). Leave unset to skip this second calculation.
+              subnet_target_prefix_raw = get_env("SUBNET_TARGET_PREFIX_LENGTH", required=False)
+              subnet_target_prefix = int(subnet_target_prefix_raw) if subnet_target_prefix_raw else None
+
+              confluence_base_url = get_env("CONFLUENCE_BASE_URL")
+              confluence_page_id = get_env("CONFLUENCE_PAGE_ID")
+              confluence_email = get_env("CONFLUENCE_EMAIL")
+              confluence_api_token = get_env("CONFLUENCE_API_TOKEN")
+              # If CONFLUENCE_PAGE_TITLE is explicitly set, use it. Otherwise, fetch and
+              # reuse whatever the page is actually titled today - safer than assuming
+              # a hardcoded default, since some Confluence setups reject an update
+              # whose title doesn't match the existing page exactly.
+              confluence_page_title_override = get_env("CONFLUENCE_PAGE_TITLE", required=False)
+
+              # 1. Discover all vnets/subnets + attached resources
+              vnets = discover_vnets(subscription_ids)
+              resolve_resource_names(vnets, subscription_ids)
+
+              # 2. Compute next available CIDR against every vnet address space in use
+              #    (this answers "next free VNet-sized range in the global supernet" -
+              #    see build_confluence_html for the separate per-VNet subnet calculation)
+              used_cidrs = [cidr for vnet in vnets for cidr in vnet.address_spaces]
+              next_cidr = next_available_cidr(parent_cidr, used_cidrs, target_prefix)
+              log.info(f"Next available /{target_prefix} in {parent_cidr}: {next_cidr}")
+
+              # 3. Build the draw.io network diagram and upload it as a page attachment
+              drawio_filename = "azure-network-diagram.drawio"
+              drawio_xml = build_drawio_xml(vnets)
+              upload_drawio_attachment(
+                  base_url=confluence_base_url,
+                  page_id=confluence_page_id,
+                  email=confluence_email,
+                  api_token=confluence_api_token,
+                  filename=drawio_filename,
+                  drawio_xml=drawio_xml,
+              )
+
+              # Resolve the title to use: explicit override, or the page's current title
+              if confluence_page_title_override:
+                  confluence_page_title = confluence_page_title_override
+              else:
+                  confluence_page_title = get_confluence_page_title(
+                      confluence_base_url, confluence_page_id, confluence_email, confluence_api_token
+                  )
+                  log.info(f"Using existing page title: '{confluence_page_title}'")
+
+              # 4. Build the report (embedding the diagram) and publish it
+              html_body = build_confluence_html(
+                  vnets, next_cidr, parent_cidr, target_prefix, drawio_filename,
+                  subnet_target_prefix=subnet_target_prefix,
+              )
+              publish_to_confluence(
+                  base_url=confluence_base_url,
+                  page_id=confluence_page_id,
+                  email=confluence_email,
+                  api_token=confluence_api_token,
+                  title=confluence_page_title,
+                  html_body=html_body,
+              )
+
+              log.info("Done.")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+
+      # --- Azure auth -----------------------------------------------------
+      # DefaultAzureCredential picks up AZURE_CLIENT_ID / AZURE_TENANT_ID /
+      # AZURE_CLIENT_SECRET automatically when set as environment variables
+      # (EnvironmentCredential). These come from a service principal with
+      # Reader-only access - see GITHUB_ACTIONS_SETUP.md for setup steps.
+      #
+      # Prefer OIDC federated credentials over a long-lived client secret if
+      # your Azure AD app registration supports it - swap this for
+      # azure/login@v2 with 'client-id' / 'tenant-id' / 'subscription-id'
+      # and no client-secret, using GitHub's OIDC token instead.
+      - name: Run Azure VNet report -> Confluence
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+          PARENT_CIDR: ${{ vars.PARENT_CIDR }}
+          TARGET_PREFIX_LENGTH: ${{ vars.TARGET_PREFIX_LENGTH }}
+          SUBNET_TARGET_PREFIX_LENGTH: ${{ vars.SUBNET_TARGET_PREFIX_LENGTH }}
+
+          CONFLUENCE_BASE_URL: ${{ vars.CONFLUENCE_BASE_URL }}
+          CONFLUENCE_PAGE_ID: ${{ vars.CONFLUENCE_PAGE_ID }}
+          CONFLUENCE_EMAIL: ${{ secrets.CONFLUENCE_EMAIL }}
+          CONFLUENCE_API_TOKEN: ${{ secrets.CONFLUENCE_API_TOKEN }}
+        run: python azure_vnet_report_to_confluence.py
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::Azure VNet -> Confluence report run failed. Check the logs above."
+          # Optional: add a Slack/Teams webhook call here so failures don't
+          # go unnoticed - a silently-failing daily job recreates the exact
+          # "nobody notices it's stale" problem this automation replaces.
