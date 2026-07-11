@@ -165,6 +165,42 @@ jobs:
           echo "Generated files:"
           ls -la /tmp/generated-tf
 
+      - name: Clean up conflicting Terraform configurations
+        run: |
+          cd /tmp/generated-tf
+          
+          # Remove conflicting backend files
+          rm -f backend.tf terraform.tf
+          
+          # Create a clean backend.tf with S3 configuration
+          cat > backend.tf << 'EOF'
+          terraform {
+            backend "s3" {
+              bucket         = "${{ secrets.TF_STATE_BUCKET }}"
+              key            = "azure/imports/${{ github.event.inputs.resource_group }}/terraform.tfstate"
+              region         = "${{ secrets.AWS_REGION }}"
+              dynamodb_table = "${{ secrets.TF_STATE_LOCK_TABLE }}"
+              encrypt        = true
+            }
+          }
+          EOF
+          
+          # Create a clean provider.tf if it doesn't exist or fix duplicates
+          cat > provider.tf << 'EOF'
+          provider "azurerm" {
+            features {}
+            subscription_id = var.subscription_id
+          }
+          
+          variable "subscription_id" {
+            description = "Azure Subscription ID"
+            type        = string
+          }
+          EOF
+          
+          echo "Cleaned up configuration files:"
+          ls -la *.tf
+
       - name: Add S3 backend config
         run: bash aks-import/scripts/add_backend.sh
 
@@ -215,6 +251,23 @@ jobs:
         with:
           name: generated-tf-${{ github.run_id }}
           path: /tmp/generated-tf
+
+      - name: Verify and clean generated code
+        run: |
+          cd /tmp/generated-tf
+          echo "Current files:"
+          ls -la
+          
+          # Remove any remaining conflicting backend configurations
+          if [ -f backend.tf ] && [ -f terraform.tf ]; then
+            echo "Removing duplicate terraform.tf"
+            rm -f terraform.tf
+          fi
+          
+          # Check for duplicate provider configurations
+          if grep -q "provider \"azurerm\"" *.tf 2>/dev/null | grep -v "provider.tf"; then
+            echo "WARNING: Duplicate provider configurations found"
+          fi
 
       - name: Terraform Init
         working-directory: /tmp/generated-tf
