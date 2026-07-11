@@ -1,23 +1,23 @@
 name: Azure Terraform Import
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Generic Azure resource import pipeline
-# Uses OIDC (Workload Identity Federation) — no client secret needed
+# Uses OIDC (Workload Identity Federation) - no client secret needed
 #
 # HOW IT WORKS:
-#   1. DISCOVER  — Lists all resources in the target resource group
-#   2. GENERATE  — Uses aztfexport to auto-generate Terraform code
-#   3. VALIDATE  — Runs terraform plan against generated code
+#   1. DISCOVER  - Lists all resources in the target resource group
+#   2. GENERATE  - Uses aztfexport to auto-generate Terraform code
+#   3. VALIDATE  - Runs terraform plan against generated code
 #
 # REQUIRED SECRETS:
-#   AZURE_CLIENT_ID       — Service principal App ID
-#   AZURE_TENANT_ID       — Azure AD Tenant ID
-#   AZURE_SUBSCRIPTION_ID — Azure Subscription ID
-#   TF_STATE_BUCKET       — S3 bucket for state
-#   TF_STATE_LOCK_TABLE   — DynamoDB table for locking
-#   AWS_ACCESS_KEY_ID     — S3 backend access
-#   AWS_SECRET_ACCESS_KEY — S3 backend secret
-#   AWS_REGION            — S3 bucket region
+#   AZURE_CLIENT_ID       - Service principal App ID
+#   AZURE_TENANT_ID       - Azure AD Tenant ID
+#   AZURE_SUBSCRIPTION_ID - Azure Subscription ID
+#   TF_STATE_BUCKET       - S3 bucket for state
+#   TF_STATE_LOCK_TABLE   - DynamoDB table for locking
+#   AWS_ACCESS_KEY_ID     - S3 backend access
+#   AWS_SECRET_ACCESS_KEY - S3 backend secret
+#   AWS_REGION            - S3 bucket region
 #
 # OIDC SETUP (one-time):
 #   az ad app federated-credential create \
@@ -28,7 +28,7 @@ name: Azure Terraform Import
 #       "subject": "repo:mridulsingh8390/Terraform-LAB:ref:refs/heads/main",
 #       "audiences": ["api://AzureADTokenExchange"]
 #     }'
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 on:
   workflow_dispatch:
@@ -66,7 +66,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ── STEP 1: DISCOVER ────────────────────────────────────────────────────────
+  # -- STEP 1: DISCOVER --------------------------------------------------------
   discover:
     name: "Discover | ${{ github.event.inputs.resource_group }}"
     runs-on: ubuntu-latest
@@ -195,7 +195,7 @@ PYFILTER
           path: /tmp/discovery-report.json
           retention-days: 30
 
-  # ── STEP 2: GENERATE TF CODE ─────────────────────────────────────────────────
+  # -- STEP 2: GENERATE TF CODE -------------------------------------------------
   generate:
     name: "Generate TF | ${{ github.event.inputs.resource_group }}"
     runs-on: ubuntu-latest
@@ -326,7 +326,7 @@ PYFILTER
           path: /tmp/generated-tf/
           retention-days: 30
 
-  # ── STEP 3: VALIDATE ─────────────────────────────────────────────────────────
+  # -- STEP 3: VALIDATE ---------------------------------------------------------
   validate:
     name: "Validate | ${{ github.event.inputs.resource_group }}"
     runs-on: ubuntu-latest
