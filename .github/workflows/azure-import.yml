@@ -57,7 +57,7 @@ jobs:
       ARM_USE_OIDC: "true"
 
     steps:
-      - name: Checkout
+      - name: Checkout import pipeline repo
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.branch }}
@@ -109,7 +109,7 @@ jobs:
       ARM_USE_OIDC: "true"
 
     steps:
-      - name: Checkout
+      - name: Checkout import pipeline repo
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.branch }}
@@ -153,7 +153,7 @@ jobs:
   import-state:
     name: "Import to Terraform State"
     runs-on: ubuntu-latest
-    needs: discover
+    needs: generate-tfvars
     if: |
       github.event.inputs.action == 'import-state' ||
       github.event.inputs.action == 'all'
@@ -170,10 +170,18 @@ jobs:
       AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
 
     steps:
-      - name: Checkout
+      - name: Checkout import pipeline repo (for scripts)
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.branch }}
+          path: import-pipeline
+
+      - name: Checkout Terraform-LAB repo (for TF config)
+        uses: actions/checkout@v4
+        with:
+          repository: mridulsingh8390/Terraform-LAB
+          ref: main
+          path: terraform-lab
 
       - name: Azure Login
         uses: azure/login@v2
@@ -188,31 +196,32 @@ jobs:
           terraform_version: "~1.9"
 
       - name: Terraform Init
-        working-directory: terraform/azure/azure-kubernetes-service
+        working-directory: terraform-lab/terraform/azure/azure-kubernetes-service
         run: |
           terraform init \
             -input=false \
+            -reconfigure \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=azure/azure-kubernetes-service/${{ github.event.inputs.environment }}/terraform.tfstate" \
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="dynamodb_table=${{ secrets.TF_STATE_LOCK_TABLE }}" \
             -backend-config="encrypt=true"
 
-      - name: List resources
+      - name: List resources to import
         run: |
           az resource list \
             --resource-group "${{ github.event.inputs.resource_group }}" \
             --output json > /tmp/all-resources-raw.json
 
       - name: Run terraform import
-        working-directory: terraform/azure/azure-kubernetes-service
+        working-directory: terraform-lab/terraform/azure/azure-kubernetes-service
         env:
           TAG_FILTER: ${{ github.event.inputs.tag_filter }}
           RESOURCE_GROUP: ${{ github.event.inputs.resource_group }}
-        run: python3 ../../../aks-import/scripts/run_import.py
+        run: python3 $GITHUB_WORKSPACE/import-pipeline/aks-import/scripts/run_import.py
 
       - name: Terraform Plan to verify
-        working-directory: terraform/azure/azure-kubernetes-service
+        working-directory: terraform-lab/terraform/azure/azure-kubernetes-service
         run: |
           terraform plan \
             -var-file="values/${{ github.event.inputs.environment }}.tfvars" \
