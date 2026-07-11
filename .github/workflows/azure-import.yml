@@ -227,6 +227,9 @@ jobs:
         working-directory: /tmp/generated-tf
         run: |
           terraform init \
+            -input=false \
+            -migrate-state \
+            -force-copy \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=azure/imports/${{ github.event.inputs.resource_group }}/terraform.tfstate" \
             -backend-config="region=${{ secrets.AWS_REGION }}" \
