@@ -97,9 +97,7 @@ jobs:
     name: "Generate Terraform Code"
     runs-on: ubuntu-latest
     needs: discover
-    if: |
-      github.event.inputs.action == 'generate' ||
-      github.event.inputs.action == 'discover-generate-validate'
+    if: github.event.inputs.action == 'generate' || github.event.inputs.action == 'discover-generate-validate'
     permissions:
       id-token: write
       contents: read
@@ -124,7 +122,24 @@ jobs:
 
       - name: Install aztfexport
         run: |
-          curl -sL "https://github.com/Azure/aztfexport/releases/download/v0.15.0/aztfexport_linux_amd64.zip" -o /tmp/aztfexport.zip
+          # Get the latest version dynamically
+          LATEST_VERSION=$(curl -s https://api.github.com/repos/Azure/aztfexport/releases/latest | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
+          if [ -z "$LATEST_VERSION" ]; then
+            echo "Failed to get latest version, falling back to v0.16.0"
+            LATEST_VERSION="v0.16.0"
+          fi
+          echo "Installing aztfexport version: $LATEST_VERSION"
+          
+          DOWNLOAD_URL="https://github.com/Azure/aztfexport/releases/download/${LATEST_VERSION}/aztfexport_linux_amd64.zip"
+          curl -sL "$DOWNLOAD_URL" -o /tmp/aztfexport.zip
+          
+          # Verify the zip file
+          if ! file /tmp/aztfexport.zip | grep -q "Zip archive"; then
+            echo "ERROR: Downloaded file is not a valid zip archive"
+            echo "Download URL was: $DOWNLOAD_URL"
+            exit 1
+          fi
+          
           unzip -q /tmp/aztfexport.zip -d /tmp/aztfexport
           sudo mv /tmp/aztfexport/aztfexport /usr/local/bin/
           aztfexport --version
