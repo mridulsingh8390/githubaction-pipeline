@@ -97,7 +97,9 @@ jobs:
     name: "Generate Terraform Code"
     runs-on: ubuntu-latest
     needs: discover
-    if: github.event.inputs.action == 'generate' || github.event.inputs.action == 'discover-generate-validate'
+    if: |
+      github.event.inputs.action == 'generate' ||
+      github.event.inputs.action == 'discover-generate-validate'
     permissions:
       id-token: write
       contents: read
@@ -122,26 +124,15 @@ jobs:
 
       - name: Install aztfexport
         run: |
-          sudo apt-get update
+          sudo apt-get update -qq
           sudo apt-get install -y jq unzip
-
-          RELEASE=$(curl -fsSL https://api.github.com/repos/Azure/aztfexport/releases/latest)
-
-          TAG=$(echo "$RELEASE" | jq -r '.tag_name')
-
-          ASSET_URL=$(echo "$RELEASE" | jq -r '.assets[] | select(.name | test("linux.*amd64.*zip")) | .browser_download_url')
-
-          echo "Version: $TAG"
-          echo "Asset: $ASSET_URL"
-
+          ASSET_URL=$(curl -fsSL https://api.github.com/repos/Azure/aztfexport/releases/latest \
+            | jq -r '.assets[] | select(.name | test("linux.*amd64.*zip")) | .browser_download_url')
+          echo "Downloading: $ASSET_URL"
           curl -fL "$ASSET_URL" -o aztfexport.zip
-
-          unzip aztfexport.zip
-
+          unzip -q aztfexport.zip
           chmod +x aztfexport
-
           sudo mv aztfexport /usr/local/bin/
-
           aztfexport --version
 
       - name: Setup Terraform
@@ -150,10 +141,6 @@ jobs:
           terraform_version: "~1.9"
 
       - name: Generate Terraform code with aztfexport
-        env:
-          AZTFEXPORT_NON_INTERACTIVE: "true"
-          AZTFEXPORT_PLAIN_UI: "true"
-          AZTFEXPORT_OVERWRITE: "true"
         run: |
           mkdir -p /tmp/generated-tf
           aztfexport resource-group \
@@ -165,43 +152,7 @@ jobs:
           echo "Generated files:"
           ls -la /tmp/generated-tf
 
-      - name: Clean up conflicting Terraform configurations
-        run: |
-          cd /tmp/generated-tf
-          
-          # Remove conflicting backend files
-          rm -f backend.tf terraform.tf
-          
-          # Create a clean backend.tf with S3 configuration
-          cat > backend.tf << 'EOF'
-          terraform {
-            backend "s3" {
-              bucket         = "${{ secrets.TF_STATE_BUCKET }}"
-              key            = "azure/imports/${{ github.event.inputs.resource_group }}/terraform.tfstate"
-              region         = "${{ secrets.AWS_REGION }}"
-              dynamodb_table = "${{ secrets.TF_STATE_LOCK_TABLE }}"
-              encrypt        = true
-            }
-          }
-          EOF
-          
-          # Create a clean provider.tf if it doesn't exist or fix duplicates
-          cat > provider.tf << 'EOF'
-          provider "azurerm" {
-            features {}
-            subscription_id = var.subscription_id
-          }
-          
-          variable "subscription_id" {
-            description = "Azure Subscription ID"
-            type        = string
-          }
-          EOF
-          
-          echo "Cleaned up configuration files:"
-          ls -la *.tf
-
-      - name: Add S3 backend config
+      - name: Replace backend and provider with clean config
         run: bash aks-import/scripts/add_backend.sh
 
       - name: Upload generated Terraform code
@@ -252,22 +203,25 @@ jobs:
           name: generated-tf-${{ github.run_id }}
           path: /tmp/generated-tf
 
-      - name: Verify and clean generated code
+      - name: Clean and fix Terraform configs
         run: |
           cd /tmp/generated-tf
-          echo "Current files:"
-          ls -la
-          
-          # Remove any remaining conflicting backend configurations
-          if [ -f backend.tf ] && [ -f terraform.tf ]; then
-            echo "Removing duplicate terraform.tf"
-            rm -f terraform.tf
-          fi
-          
-          # Check for duplicate provider configurations
-          if grep -q "provider \"azurerm\"" *.tf 2>/dev/null | grep -v "provider.tf"; then
-            echo "WARNING: Duplicate provider configurations found"
-          fi
+          echo "=== Files before cleanup ==="
+          ls -la *.tf 2>/dev/null || echo "no tf files"
+
+          # Remove ALL tf files that aztfexport generates for backend/provider
+          rm -f backend.tf terraform.tf provider.tf
+
+          # Create clean backend.tf - empty block, values passed via -backend-config
+          printf 'terraform {\n  backend "s3" {}\n}\n' > backend.tf
+
+          # Create clean provider.tf
+          printf 'provider "azurerm" {\n  features {}\n  use_oidc = true\n  subscription_id = var.subscription_id\n}\nvariable "subscription_id" {\n  type    = string\n  default = null\n}\n' > provider.tf
+
+          echo "=== Files after cleanup ==="
+          cat backend.tf
+          echo "---"
+          cat provider.tf
 
       - name: Terraform Init
         working-directory: /tmp/generated-tf
