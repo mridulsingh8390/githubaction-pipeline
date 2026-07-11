@@ -31,7 +31,7 @@ for r in resources:
 
     print(f'Importing: {rname} -> {tf_addr}')
     result = subprocess.run(
-        ['terraform', 'import', tf_addr, rid],
+        ['terraform', 'import', '-input=false', tf_addr, rid],
         capture_output=True, text=True
     )
     if result.returncode == 0:
