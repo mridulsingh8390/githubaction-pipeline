@@ -1,0 +1,383 @@
+name: Azure Terraform Import
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generic Azure resource import pipeline
+#
+# HOW IT WORKS:
+#   1. DISCOVER  — Lists all resources in the target resource group and
+#                  produces a resource inventory report
+#   2. GENERATE  — Uses aztfexport to auto-generate Terraform code (.tf files)
+#                  and import blocks for every discovered resource
+#   3. VALIDATE  — Runs terraform plan against the generated code to confirm
+#                  no drift between generated state and actual Azure resources
+#
+# OUTPUTS (downloadable as pipeline artifacts):
+#   - discovery-report/    JSON inventory of all resources found
+#   - generated-tf/        Ready-to-use .tf files + import blocks
+#   - plan-output/         Terraform plan showing any drift
+#
+# REQUIRED SECRETS (same as main pipeline):
+#   ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_TENANT_ID, ARM_SUBSCRIPTION_ID
+#   TF_STATE_BUCKET, TF_STATE_LOCK_TABLE, AWS_ACCESS_KEY_ID,
+#   AWS_SECRET_ACCESS_KEY, AWS_REGION
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: "Azure Resource Group to import from"
+        required: true
+        type: string
+      environment:
+        description: "Environment label (used for state file path)"
+        required: true
+        type: choice
+        options: [dev, qa, staging, prod]
+      action:
+        description: "Action to run"
+        required: true
+        type: choice
+        options:
+          - discover          # Step 1 only — list resources, no changes
+          - generate          # Steps 1+2 — discover + generate tf code
+          - discover-generate-validate  # All steps
+      tag_filter:
+        description: "Filter resources by tag (format: key=value). Leave empty to import all resources in the RG."
+        required: false
+        type: string
+        default: ""
+      branch:
+        description: "Branch to run from"
+        required: true
+        type: string
+        default: "main"
+
+concurrency:
+  group: azure-import-${{ github.event.inputs.resource_group }}
+  cancel-in-progress: false
+
+jobs:
+  # ── STEP 1: DISCOVER ────────────────────────────────────────────────────────
+  discover:
+    name: "Discover | ${{ github.event.inputs.resource_group }}"
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    outputs:
+      resource_count: ${{ steps.discover.outputs.resource_count }}
+      resource_types: ${{ steps.discover.outputs.resource_types }}
+
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.ARM_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.ARM_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.ARM_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.ARM_SUBSCRIPTION_ID }}"
+            }
+
+      - name: Discover resources
+        id: discover
+        run: |
+          RG="${{ github.event.inputs.resource_group }}"
+          TAG_FILTER="${{ github.event.inputs.tag_filter }}"
+
+          echo "================================================="
+          echo " Discovering resources in: $RG"
+          echo "================================================="
+
+          # Build tag filter if provided
+          TAG_ARGS=""
+          if [ -n "$TAG_FILTER" ]; then
+            TAG_KEY=$(echo "$TAG_FILTER" | cut -d'=' -f1)
+            TAG_VAL=$(echo "$TAG_FILTER" | cut -d'=' -f2)
+            TAG_ARGS="--tag $TAG_KEY=$TAG_VAL"
+            echo "Filtering by tag: $TAG_KEY=$TAG_VAL"
+          fi
+
+          # List all resources in the resource group
+          az resource list \
+            --resource-group "$RG" \
+            $TAG_ARGS \
+            --output json > /tmp/all-resources.json
+
+          RESOURCE_COUNT=$(cat /tmp/all-resources.json | python3 -c "import json,sys; r=json.load(sys.stdin); print(len(r))")
+          echo "Found $RESOURCE_COUNT resources"
+
+          # Generate detailed discovery report
+          python3 << 'PYEOF'
+          import json, sys
+          from collections import defaultdict
+
+          with open('/tmp/all-resources.json') as f:
+              resources = json.load(f)
+
+          # Group by type
+          by_type = defaultdict(list)
+          for r in resources:
+              by_type[r['type']].append({
+                  'name': r['name'],
+                  'id':   r['id'],
+                  'location': r.get('location', 'global'),
+                  'tags': r.get('tags', {})
+              })
+
+          report = {
+              'resource_group': '${{ github.event.inputs.resource_group }}',
+              'total_resources': len(resources),
+              'resource_types':  dict(by_type),
+              'summary': {t: len(v) for t, v in by_type.items()}
+          }
+
+          with open('/tmp/discovery-report.json', 'w') as f:
+              json.dump(report, f, indent=2)
+
+          print(f"\nDiscovery Summary:")
+          print(f"{'='*50}")
+          print(f"Total resources: {len(resources)}")
+          print(f"\nBy type:")
+          for t, items in sorted(by_type.items()):
+              print(f"  {t}: {len(items)}")
+              for item in items:
+                  print(f"    - {item['name']}")
+          PYEOF
+
+          echo "resource_count=$RESOURCE_COUNT" >> "$GITHUB_OUTPUT"
+
+          # Extract unique resource types for output
+          TYPES=$(python3 -c "
+          import json
+          with open('/tmp/discovery-report.json') as f:
+              r = json.load(f)
+          print(','.join(r['summary'].keys()))
+          ")
+          echo "resource_types=$TYPES" >> "$GITHUB_OUTPUT"
+
+      - name: Upload discovery report
+        uses: actions/upload-artifact@v4
+        with:
+          name: discovery-report-${{ github.event.inputs.resource_group }}-${{ github.run_id }}
+          path: /tmp/discovery-report.json
+          retention-days: 30
+
+  # ── STEP 2: GENERATE TF CODE ─────────────────────────────────────────────────
+  generate:
+    name: "Generate TF Code | ${{ github.event.inputs.resource_group }}"
+    runs-on: ubuntu-latest
+    needs: discover
+    environment: ${{ github.event.inputs.environment }}
+    if: |
+      github.event.inputs.action == 'generate' ||
+      github.event.inputs.action == 'discover-generate-validate'
+
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.ARM_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.ARM_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.ARM_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.ARM_SUBSCRIPTION_ID }}"
+            }
+
+      - name: Install aztfexport
+        run: |
+          # aztfexport — Microsoft's official tool to generate TF code from Azure resources
+          # https://github.com/Azure/aztfexport
+          AZTFEXPORT_VERSION="0.15.0"
+          curl -sL "https://github.com/Azure/aztfexport/releases/download/v${AZTFEXPORT_VERSION}/aztfexport_linux_amd64.zip" \
+            -o /tmp/aztfexport.zip
+          unzip -q /tmp/aztfexport.zip -d /tmp/aztfexport
+          sudo mv /tmp/aztfexport/aztfexport /usr/local/bin/
+          aztfexport --version
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.9"
+
+      - name: Generate Terraform code
+        run: |
+          RG="${{ github.event.inputs.resource_group }}"
+          OUTPUT_DIR="/tmp/generated-tf"
+          mkdir -p "$OUTPUT_DIR"
+
+          echo "================================================="
+          echo " Generating Terraform code for: $RG"
+          echo " Using: aztfexport"
+          echo "================================================="
+
+          # aztfexport scans the resource group and generates:
+          #   - main.tf        (resource blocks for every resource found)
+          #   - import.tf      (import blocks — TF 1.5+ native import)
+          #   - provider.tf    (azurerm provider config)
+          #   - terraform.tf   (required_providers block)
+          aztfexport resource-group \
+            --non-interactive \
+            --output-dir "$OUTPUT_DIR" \
+            --overwrite \
+            "$RG"
+
+          echo ""
+          echo "=== Generated files ==="
+          ls -la "$OUTPUT_DIR"
+
+          echo ""
+          echo "=== Resource count in generated code ==="
+          grep -c "^resource " "$OUTPUT_DIR/main.tf" 2>/dev/null && echo "resources found in main.tf" || echo "No main.tf generated"
+
+          echo ""
+          echo "=== Preview of import blocks ==="
+          head -50 "$OUTPUT_DIR/import.tf" 2>/dev/null || echo "No import.tf generated"
+
+      - name: Add provider and backend config
+        run: |
+          OUTPUT_DIR="/tmp/generated-tf"
+
+          # Add S3 backend so the generated code can be applied to manage these resources
+          cat > "$OUTPUT_DIR/backend.tf" << 'TFEOF'
+          terraform {
+            backend "s3" {}
+          }
+
+          provider "azurerm" {
+            subscription_id = var.subscription_id
+            features {}
+          }
+
+          variable "subscription_id" {
+            description = "Azure subscription ID"
+            type        = string
+            default     = null
+          }
+          TFEOF
+
+          # Create a README for the generated code
+          cat > "$OUTPUT_DIR/IMPORT_README.md" << EOF
+          # Generated Terraform Code
+
+          **Resource Group:** ${{ github.event.inputs.resource_group }}
+          **Generated on:** $(date -u)
+          **Pipeline run:** ${{ github.run_id }}
+
+          ## How to use this generated code
+
+          1. Copy these files into your Terraform project
+          2. Run terraform init
+          3. Run terraform plan — the import blocks will pull existing resources into state
+          4. Review the plan carefully
+          5. Run terraform apply to complete the import
+
+          ## Files
+          - \`main.tf\`    — Resource definitions for all discovered resources
+          - \`import.tf\`  — Import blocks (Terraform 1.5+ native import)
+          - \`backend.tf\` — S3 backend + provider config (added by pipeline)
+
+          ## Resources found: ${{ needs.discover.outputs.resource_count }}
+          ## Resource types: ${{ needs.discover.outputs.resource_types }}
+
+          > **Note:** Review and clean up the generated code before applying.
+          > aztfexport generates verbose code — you may want to simplify it.
+          EOF
+
+          echo "=== Final generated files ==="
+          ls -la "$OUTPUT_DIR"
+
+      - name: Upload generated Terraform code
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-tf-${{ github.event.inputs.resource_group }}-${{ github.run_id }}
+          path: /tmp/generated-tf/
+          retention-days: 30
+
+  # ── STEP 3: VALIDATE ─────────────────────────────────────────────────────────
+  validate:
+    name: "Validate | ${{ github.event.inputs.resource_group }}"
+    runs-on: ubuntu-latest
+    needs: [discover, generate]
+    environment: ${{ github.event.inputs.environment }}
+    if: github.event.inputs.action == 'discover-generate-validate'
+
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.9"
+
+      - name: Download generated code
+        uses: actions/download-artifact@v4
+        with:
+          name: generated-tf-${{ github.event.inputs.resource_group }}-${{ github.run_id }}
+          path: /tmp/generated-tf
+
+      - name: Terraform Init
+        working-directory: /tmp/generated-tf
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=azure/imports/${{ github.event.inputs.resource_group }}/terraform.tfstate" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
+
+      - name: Terraform Validate
+        working-directory: /tmp/generated-tf
+        run: terraform validate
+
+      - name: Terraform Plan (import)
+        working-directory: /tmp/generated-tf
+        run: |
+          terraform plan \
+            -var="subscription_id=${{ secrets.ARM_SUBSCRIPTION_ID }}" \
+            -out=import-plan \
+            2>&1 | tee /tmp/plan-output.txt
+
+          echo ""
+          echo "=== Plan Summary ==="
+          grep -E "^Plan:|No changes|to import|to add|to change|to destroy" /tmp/plan-output.txt || true
+
+      - name: Upload plan output
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-output-${{ github.event.inputs.resource_group }}-${{ github.run_id }}
+          path: /tmp/plan-output.txt
+          retention-days: 30
