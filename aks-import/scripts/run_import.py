@@ -62,12 +62,19 @@ with open('import_generated.tf', 'w') as f:
 print(f'\nGenerated import_generated.tf with {len(import_blocks)} import blocks')
 print('Running terraform plan to preview imports...')
 
-# Run terraform plan with -generate-config-out to preview
-result = subprocess.run(
-    ['terraform', 'plan', '-input=false', '-generate-config-out=generated_resources.tf'],
-    capture_output=False,
-    text=True
-)
+environment     = os.environ.get('ENVIRONMENT', 'dev')
+subscription_id = os.environ.get('SUBSCRIPTION_ID', '')
+
+cmd = [
+    'terraform', 'plan',
+    '-input=false',
+    '-generate-config-out=generated_resources.tf',
+    f'-var-file=values/{environment}.tfvars',
+]
+if subscription_id:
+    cmd.append(f'-var=subscription_id={subscription_id}')
+
+result = subprocess.run(cmd, capture_output=False, text=True)
 
 if result.returncode not in (0, 2):
     print(f'Plan failed with exit code {result.returncode}')
