@@ -82,7 +82,7 @@ jobs:
           TAG_FILTER: ${{ github.event.inputs.tag_filter }}
           RESOURCE_GROUP: ${{ github.event.inputs.resource_group }}
         run: |
-          python3 scripts/discover.py
+          python3 aks-import/scripts/discover.py
           echo "resource_count=$(cat /tmp/resource_count.txt)" >> "$GITHUB_OUTPUT"
           echo "resource_types=$(cat /tmp/resource_types.txt)" >> "$GITHUB_OUTPUT"
 
@@ -146,7 +146,7 @@ jobs:
           ls -la /tmp/generated-tf
 
       - name: Add S3 backend config
-        run: bash scripts/add_backend.sh
+        run: bash aks-import/scripts/add_backend.sh
 
       - name: Upload generated Terraform code
         uses: actions/upload-artifact@v4
