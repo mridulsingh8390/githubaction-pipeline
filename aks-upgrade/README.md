@@ -1,4 +1,4 @@
-# AKS Cluster Migration Pipelines
+# AKS Pipelines
 
 Two standalone GitHub Actions workflows for AKS — portable, no dependency
 on any other pipeline or repo. Drop both into `.github/workflows/` of any
@@ -275,13 +275,71 @@ plan → upgrade-control-plane (approval) → upgrade-worker-nodes (approval) �
 - **`upgrade-control-plane`**: optional pre-upgrade snapshot, then upgrades
   the control plane only.
 - **`upgrade-worker-nodes`**: upgrades **system node pools first, then user
-  node pools** (skipped entirely if `controlPlaneOnly=true`). AKS performs
-  this as a surge upgrade — a new node at the target version joins the pool,
-  the old node is cordoned (`Scheduling Disabled`) while it drains its pods
-  onto the new node, then the old node is deleted. This repeats per node.
+  node pools** (skipped entirely if `controlPlaneOnly=true`). See the
+  dedicated section below for exactly how this works node-by-node.
 - **`post-upgrade-validation`**: waits for nodes to be Ready, checks pod
   health, generates a full markdown report uploaded as a build artifact
   (retained 90 days).
+
+### How the worker node upgrade actually works (surge upgrade)
+
+AKS doesn't upgrade a node in place — it never touches the Kubernetes
+version of a running node directly. Instead, for every node that needs
+upgrading, it goes through a **replace, not modify** cycle:
+
+```mermaid
+sequenceDiagram
+    participant Pool as Node Pool
+    participant New as New Node (target version)
+    participant Old as Old Node (current version)
+    participant Sched as Scheduler
+
+    Pool->>New: 1. Provision new node at target K8s version
+    New-->>Pool: 2. New node joins pool, becomes Ready
+    Pool->>Old: 3. Cordon old node (Scheduling Disabled)
+    Note over Old: No new pods can land here,<br/>existing pods keep running
+    Old->>Sched: 4. Drain: evict pods gracefully
+    Sched->>New: 5. Evicted pods rescheduled onto new node
+    Note over Old: Waits up to drainTimeoutMinutes<br/>for graceful eviction
+    Pool->>Old: 6. Delete old node once empty
+    Note over Pool: Repeat steps 1-6 for each<br/>remaining node in the pool
+```
+
+Step by step, in the same order you'll see it in the Azure Portal's
+**Node pools → Nodes** view:
+
+1. **New node provisioned** — AKS creates a fresh VM already running the
+   target Kubernetes version and joins it to the pool. `maxSurge` controls
+   how many of these spin up in parallel (e.g. `33%` of pool size, or a
+   flat number like `1`).
+2. **New node ready** — appears in `kubectl get nodes` as `Ready`, but with
+   zero pods yet (this is exactly what you saw as the `v1.35.1` node with
+   growing pod count in your portal screenshot).
+3. **Old node cordoned** — marked `Scheduling Disabled` in the portal /
+   `SchedulingDisabled` in `kubectl`. It's still `Ready` and still running
+   its existing pods — cordoning only blocks *new* pods from landing there,
+   it doesn't evict anything by itself.
+4. **Drain begins** — Kubernetes evicts pods off the cordoned node one at a
+   time, respecting each pod's **Pod Disruption Budget** (this is exactly
+   what the `plan` job's PDB scan checks for in advance — a PDB with
+   `maxUnavailable: 0` can stall this step indefinitely). AKS waits up to
+   `drainTimeoutMinutes` for graceful eviction before force-terminating
+   whatever's left.
+5. **Pods reschedule onto the new node** — the scheduler places evicted
+   pods wherever capacity exists, typically the new node from step 1.
+6. **Old node deleted** — once fully drained (pod count reaches zero), AKS
+   removes the old VM entirely. It disappears from the node list.
+7. **Repeat per node** — if the pool has more nodes than the surge count,
+   this cycle repeats until every node is on the target version.
+   `nodeSoakDurationMinutes` adds a pause after each node finishes before
+   the next one starts, giving new nodes/pods time to settle before
+   continuing.
+
+This is why the upgrade is described as **zero-downtime** rather than
+**zero-disruption** — individual pods do get evicted and rescheduled (a
+real disruption to that pod), but the *service* stays available throughout
+because pods move to already-Ready capacity before their old home is torn
+down, rather than the whole pool going down and coming back up together.
 
 ### Inputs
 
