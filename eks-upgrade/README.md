@@ -73,6 +73,8 @@ admin-protected regardless of which shell you use.
 
 ### Cluster creation
 
+### Cluster creation
+
 ```bash
 # Install eksctl if you don't have it: https://eksctl.io/installation/
 
@@ -85,12 +87,24 @@ aws eks describe-addon-versions --query 'addons[0].addonVersions[0].compatibilit
 eksctl create cluster \
   --name migration-cluster \
   --region us-east-1 \
-  --version 1.29 \
+  --version 1.34 \
   --nodegroup-name migration-ng \
   --node-type t3.medium \
   --nodes 2 \
   --managed \
   --with-oidc
+```
+
+This takes roughly 15–20 minutes (EKS control plane provisioning is slow —
+don't assume it's hung if it sits quietly for a while). Confirmed working
+output from an actual run:
+
+```
+2026-07-12 14:00:27 [✔]  EKS cluster "migration-cluster" in "us-east-1" region is ready
+
+$ kubectl get nodes
+NAME                             STATUS   ROLES    AGE   VERSION
+ip-192-168-12-229.ec2.internal   Ready    <none>   81s   v1.34.9-eks-8f14419
 ```
 
 Notes on the flags:
