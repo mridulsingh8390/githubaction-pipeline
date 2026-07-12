@@ -1,104 +1,204 @@
-#!/usr/bin/env python3
-"""
-Imports existing AWS VPC + EKS resources into Terraform state.
-Does NOT create new resources - only registers existing ones.
-"""
-import json, subprocess, os, sys
+name: AWS EKS Terraform Import
 
-with open('/tmp/eks-resources.json') as f:
-    resources = json.load(f)
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_name:
+        description: "EKS cluster name to import"
+        required: true
+        type: string
+      environment:
+        description: "Environment label"
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - staging
+          - prod
+      action:
+        description: "Action to run"
+        required: true
+        type: choice
+        options:
+          - discover
+          - generate-tfvars
+          - import-state
+          - all
+      aws_region:
+        description: "AWS region where the cluster lives"
+        required: true
+        type: string
+        default: "us-east-1"
+      branch:
+        description: "Branch to run from"
+        required: true
+        type: string
+        default: "main"
 
-cluster_name    = os.environ.get('CLUSTER_NAME', '')
-environment     = os.environ.get('ENVIRONMENT', 'dev')
-aws_region      = os.environ.get('AWS_REGION', 'us-east-1')
+concurrency:
+  group: eks-import-${{ github.event.inputs.cluster_name }}
+  cancel-in-progress: false
 
-print(f"Importing {len(resources)} resources into Terraform state")
-print("NOTE: Only existing resources are registered - nothing is created")
-print("=" * 60)
+jobs:
 
-# Map resource type to Terraform module address
-# Must match the module structure in Terraform-LAB
-type_map = {
-    'aws_vpc':                         'module.vpc.aws_vpc.vpc',
-    'aws_subnet':                      None,   # handled dynamically below
-    'aws_eks_cluster':                 'module.eks.aws_eks_cluster.eks',
-    'aws_eks_node_group':              None,   # handled dynamically below
-    'aws_iam_openid_connect_provider': 'module.eks.aws_iam_openid_connect_provider.eks',
-}
+  discover:
+    name: "Discover EKS Resources"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      resource_count: ${{ steps.discover.outputs.resource_count }}
 
-imported = []
-skipped  = []
-failed   = []
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
 
-# Build var-file args
-var_args = [
-    f'-var-file=values/{environment}.tfvars',
-    f'-var=aws_region={aws_region}',
-]
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ github.event.inputs.aws_region }}
 
-for r in resources:
-    rtype  = r['type']
-    rid    = r['id']
-    rname  = r['name']
+      - name: Discover EKS and VPC resources
+        id: discover
+        env:
+          CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+          AWS_REGION:   ${{ github.event.inputs.aws_region }}
+        run: |
+          python3 eks-import/scripts/discover.py
+          echo "resource_count=$(cat /tmp/resource_count.txt)" >> "$GITHUB_OUTPUT"
 
-    # Dynamic address for subnets (indexed by position)
-    if rtype == 'aws_subnet':
-        # Count how many subnets already imported
-        idx = sum(1 for i in imported if 'subnet' in i.lower())
-        tf_addr = f'module.vpc.aws_subnet.private[{idx}]'
+      - name: Upload discovery report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eks-discovery-report-${{ github.run_id }}
+          path: /tmp/eks-discovery-report.json
+          retention-days: 30
 
-    elif rtype == 'aws_eks_node_group':
-        ng_name = rid.split(':')[-1]
-        if 'system' in ng_name:
-            tf_addr = 'module.eks.aws_eks_node_group.system[0]'
-        else:
-            tf_addr = 'module.eks.aws_eks_node_group.user'
-    else:
-        tf_addr = type_map.get(rtype)
+  import-state:
+    name: "Import to Terraform State"
+    runs-on: ubuntu-latest
+    needs: discover
+    if: |
+      github.event.inputs.action == 'import-state' ||
+      github.event.inputs.action == 'all'
+    permissions:
+      id-token: write
+      contents: read
 
-    if not tf_addr:
-        skipped.append(rname)
-        print(f"SKIP  : {rname} ({rtype}) - no mapping")
-        continue
+    steps:
+      - name: Checkout import pipeline repo (for scripts)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          path: import-pipeline
 
-    print(f"IMPORT: {rname} -> {tf_addr}")
+      - name: Checkout Terraform-LAB repo (for TF config)
+        uses: actions/checkout@v4
+        with:
+          repository: mridulsingh8390/Terraform-LAB
+          ref: main
+          path: terraform-lab
 
-    cmd = ['terraform', 'import', '-input=false'] + var_args + [tf_addr, rid]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ github.event.inputs.aws_region }}
 
-    if result.returncode == 0:
-        imported.append(rname)
-        print(f"  OK  : {rname} added to state")
-    else:
-        if 'already managed' in result.stderr or 'already exists' in result.stderr:
-            imported.append(rname)
-            print(f"  OK  : {rname} already in state")
-        else:
-            failed.append(rname)
-            print(f"  WARN: {rname}")
-            print(f"        {result.stderr.strip()[:300]}")
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.9"
 
-print("")
-print("=" * 60)
-print(f"Import Summary:")
-print(f"  Imported : {len(imported)} resources")
-print(f"  Skipped  : {len(skipped)} resources (no mapping)")
-print(f"  Failed   : {len(failed)} resources")
-print("=" * 60)
+      - name: Re-discover resources
+        env:
+          CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+          AWS_REGION:   ${{ github.event.inputs.aws_region }}
+        run: python3 import-pipeline/eks-import/scripts/discover.py
 
-# Run terraform plan to verify
-print("\nRunning terraform plan to verify state matches reality...")
-print("Expected: No changes (or minor config drift)")
-print("=" * 60)
+      - name: Terraform Init
+        working-directory: terraform-lab/terraform/aws/eks-cluster
+        run: |
+          terraform init \
+            -input=false \
+            -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=aws/eks-cluster/${{ github.event.inputs.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ github.event.inputs.aws_region }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_STATE_LOCK_TABLE }}" \
+            -backend-config="encrypt=true"
 
-plan_cmd = ['terraform', 'plan', '-input=false', '-detailed-exitcode'] + var_args
-result   = subprocess.run(plan_cmd, capture_output=False, text=True)
+      - name: Run terraform import
+        working-directory: terraform-lab/terraform/aws/eks-cluster
+        env:
+          CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+          ENVIRONMENT:  ${{ github.event.inputs.environment }}
+          AWS_REGION:   ${{ github.event.inputs.aws_region }}
+        run: python3 $GITHUB_WORKSPACE/import-pipeline/eks-import/scripts/run_import.py
 
-if result.returncode == 0:
-    print("\nSUCCESS: No changes - state matches AWS reality perfectly")
-elif result.returncode == 2:
-    print("\nINFO: Some drift detected - review plan above")
-    print("Normal if tfvars values differ slightly from actual config")
-else:
-    print(f"\nERROR: Plan failed - check errors above")
-    sys.exit(1)
+      - name: Upload plan output
+        uses: actions/upload-artifact@v4
+        with:
+          name: eks-import-plan-${{ github.run_id }}
+          path: /tmp/import-plan.txt
+          retention-days: 30
+
+  generate-tfvars:
+    name: "Generate tfvars File"
+    runs-on: ubuntu-latest
+    needs: import-state
+    if: |
+      github.event.inputs.action == 'generate-tfvars' ||
+      github.event.inputs.action == 'all'
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ github.event.inputs.aws_region }}
+
+      - name: Re-discover resources
+        env:
+          CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+          AWS_REGION:   ${{ github.event.inputs.aws_region }}
+        run: python3 eks-import/scripts/discover.py
+
+      - name: Generate tfvars
+        env:
+          CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+          ENVIRONMENT:  ${{ github.event.inputs.environment }}
+          AWS_REGION:   ${{ github.event.inputs.aws_region }}
+        run: python3 eks-import/scripts/generate_tfvars.py
+
+      - name: Save tfvars to repo
+        run: |
+          mkdir -p eks-import/tfvars
+          cp /tmp/generated.tfvars \
+            eks-import/tfvars/${{ github.event.inputs.environment }}-${{ github.event.inputs.cluster_name }}.tfvars
+
+          git config user.name "github-actions-terraform"
+          git config user.email "github-actions@github.com"
+          git add eks-import/tfvars/
+          git diff --staged --quiet || git commit -m "Import: generated tfvars for ${{ github.event.inputs.cluster_name }} (${{ github.event.inputs.environment }})"
+          git push
+
+      - name: Upload tfvars artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eks-generated-tfvars-${{ github.event.inputs.environment }}-${{ github.run_id }}
+          path: /tmp/generated.tfvars
+          retention-days: 30
