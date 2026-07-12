@@ -46,19 +46,22 @@ jobs:
     name: "Discover EKS Resources"
     runs-on: ubuntu-latest
     permissions:
+      id-token: write
       contents: read
     outputs:
       resource_count: ${{ steps.discover.outputs.resource_count }}
-    env:
-      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_PROVIDER_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_PROVIDER_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION:    ${{ github.event.inputs.aws_region }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.branch }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ github.event.inputs.aws_region }}
 
       - name: Discover EKS and VPC resources
         id: discover
@@ -84,14 +87,8 @@ jobs:
       github.event.inputs.action == 'import-state' ||
       github.event.inputs.action == 'all'
     permissions:
+      id-token: write
       contents: read
-    env:
-      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_PROVIDER_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_PROVIDER_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION:    ${{ github.event.inputs.aws_region }}
-      # S3 backend credentials
-      TF_BACKEND_ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      TF_BACKEND_SECRET_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
     steps:
       - name: Checkout import pipeline repo (for scripts)
@@ -106,6 +103,12 @@ jobs:
           repository: mridulsingh8390/Terraform-LAB
           ref: main
           path: terraform-lab
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ github.event.inputs.aws_region }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -126,11 +129,9 @@ jobs:
             -reconfigure \
             -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
             -backend-config="key=aws/eks-cluster/${{ github.event.inputs.environment }}/terraform.tfstate" \
-            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="region=${{ github.event.inputs.aws_region }}" \
             -backend-config="dynamodb_table=${{ secrets.TF_STATE_LOCK_TABLE }}" \
-            -backend-config="encrypt=true" \
-            -backend-config="access_key=${{ secrets.AWS_ACCESS_KEY_ID }}" \
-            -backend-config="secret_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            -backend-config="encrypt=true"
 
       - name: Run terraform import
         working-directory: terraform-lab/terraform/aws/eks-cluster
@@ -155,17 +156,20 @@ jobs:
       github.event.inputs.action == 'generate-tfvars' ||
       github.event.inputs.action == 'all'
     permissions:
+      id-token: write
       contents: write
-    env:
-      AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_PROVIDER_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_PROVIDER_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION:    ${{ github.event.inputs.aws_region }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.branch }}
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ github.event.inputs.aws_region }}
 
       - name: Re-discover resources
         env:
