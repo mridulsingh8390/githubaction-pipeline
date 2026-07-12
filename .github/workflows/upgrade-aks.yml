@@ -221,7 +221,7 @@ jobs:
     if: needs.plan.outputs.hasUpgrade == 'true'
     timeout-minutes: 60
     environment:
-      name: dev
+      name: aks-upgrade-control-plane
     steps:
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -283,7 +283,7 @@ jobs:
     if: needs.plan.outputs.hasUpgrade == 'true' && inputs.controlPlaneOnly == false
     timeout-minutes: 120
     environment:
-      name: dev
+      name: aks-upgrade-worker-nodes
     steps:
       - name: Azure login (OIDC)
         uses: azure/login@v2
