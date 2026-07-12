@@ -76,7 +76,10 @@ jobs:
           echo "--- parsed group names ---"
           cat /tmp/nodegroups.txt
 
-          mapfile -t GROUPS < /tmp/nodegroups.txt
+          GROUPS=()
+          while IFS= read -r LINE; do
+            [ -n "$LINE" ] && GROUPS+=("$LINE")
+          done < /tmp/nodegroups.txt
           echo "Found ${#GROUPS[@]} node group(s): ${GROUPS[*]}"
 
           for GROUP in "${GROUPS[@]}"; do
