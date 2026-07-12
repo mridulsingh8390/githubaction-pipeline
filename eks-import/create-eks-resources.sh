@@ -182,7 +182,7 @@ aws iam create-role \
   --assume-role-policy-document '{
     "Version": "2012-10-17",
     "Statement": [{"Effect": "Allow", "Principal": {"Service": "eks.amazonaws.com"}, "Action": "sts:AssumeRole"}]
-  }' --output none && ok "Cluster IAM role created"
+  }' > /dev/null && ok "Cluster IAM role created"
 
 aws iam attach-role-policy \
   --role-name "$CLUSTER_ROLE_NAME" \
@@ -196,7 +196,7 @@ aws iam create-role \
   --assume-role-policy-document '{
     "Version": "2012-10-17",
     "Statement": [{"Effect": "Allow", "Principal": {"Service": "ec2.amazonaws.com"}, "Action": "sts:AssumeRole"}]
-  }' --output none && ok "Node IAM role created"
+  }' > /dev/null && ok "Node IAM role created"
 
 for POLICY in AmazonEKSWorkerNodePolicy AmazonEKS_CNI_Policy AmazonEC2ContainerRegistryReadOnly; do
   aws iam attach-role-policy \
@@ -222,7 +222,7 @@ aws eks create-cluster \
   --resources-vpc-config subnetIds="${PRIVATE_SUBNET_1},${PRIVATE_SUBNET_2}",securityGroupIds="${SG_ID}" \
   --region "$REGION" \
   --tags environment=demo,managed_by=cli \
-  --output none && ok "EKS cluster creation started: $CLUSTER_NAME"
+  > /dev/null && ok "EKS cluster creation started: $CLUSTER_NAME"
 
 echo "Waiting for cluster to become ACTIVE (10-15 mins)..."
 aws eks wait cluster-active --name "$CLUSTER_NAME" --region "$REGION"
@@ -242,7 +242,7 @@ aws eks create-nodegroup \
   --scaling-config minSize=1,maxSize=2,desiredSize=1 \
   --region "$REGION" \
   --tags environment=demo,managed_by=cli \
-  --output none && ok "Node group creation started"
+  > /dev/null && ok "Node group creation started"
 
 echo "Waiting for node group to become ACTIVE (5-10 mins)..."
 aws eks wait nodegroup-active --cluster-name "$CLUSTER_NAME" --nodegroup-name "${PREFIX}-user" --region "$REGION"
