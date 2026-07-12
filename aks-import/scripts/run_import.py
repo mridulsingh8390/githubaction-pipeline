@@ -58,10 +58,16 @@ for r in resources:
 
     print(f'IMPORT: {rname} -> {tf_addr}')
 
-    result = subprocess.run(
-        ['terraform', 'import', '-input=false', tf_addr, rid],
-        capture_output=True, text=True
-    )
+    cmd = [
+        'terraform', 'import',
+        '-input=false',
+        f'-var-file=values/{environment}.tfvars',
+    ]
+    if subscription_id:
+        cmd.append(f'-var=subscription_id={subscription_id}')
+    cmd += [tf_addr, rid]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
 
     if result.returncode == 0:
         imported.append(rname)
