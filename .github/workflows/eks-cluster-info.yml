@@ -76,13 +76,13 @@ jobs:
           echo "--- parsed group names ---"
           cat /tmp/nodegroups.txt
 
-          GROUPS=()
+          NODE_GROUPS=()
           while IFS= read -r LINE; do
-            [ -n "$LINE" ] && GROUPS+=("$LINE")
+            [ -n "$LINE" ] && NODE_GROUPS+=("$LINE")
           done < /tmp/nodegroups.txt
-          echo "Found ${#GROUPS[@]} node group(s): ${GROUPS[*]}"
+          echo "Found ${#NODE_GROUPS[@]} node group(s): ${NODE_GROUPS[*]}"
 
-          for GROUP in "${GROUPS[@]}"; do
+          for GROUP in "${NODE_GROUPS[@]}"; do
             echo "--- $GROUP ---"
             aws eks describe-nodegroup --cluster-name "$CLUSTER" --nodegroup-name "$GROUP" --region "$REGION" \
               --query "nodegroup.{Name:nodegroupName, Status:status, Version:version, InstanceTypes:instanceTypes, DesiredSize:scalingConfig.desiredSize}" \
