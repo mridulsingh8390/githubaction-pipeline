@@ -1,161 +1,277 @@
 # Azure Terraform Import Pipeline
 
-Auto-discovers existing Azure resources and generates ready-to-use Terraform code using Microsoft's official `aztfexport` tool.
+Auto-discovers existing Azure resources, imports them into Terraform state,
+generates a tfvars file, and commits it to the repo — all in one pipeline run.
 
 ---
 
-## What it does
+## How it works
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  You provide: resource_group + environment           │
-└─────────────────────────┬───────────────────────────┘
-                          ↓
-┌─────────────────────────────────────────────────────┐
-│  DISCOVER                                            │
-│  Scans the resource group using Azure CLI            │
-│  Lists every resource grouped by type               │
-│  → Artifact: discovery-report.json                  │
-└─────────────────────────┬───────────────────────────┘
-                          ↓
-┌─────────────────────────────────────────────────────┐
-│  GENERATE                                            │
-│  Runs aztfexport on the resource group              │
-│  Generates main.tf + import.tf for all resources    │
-│  → Artifact: generated-tf/ folder                  │
-└─────────────────────────┬───────────────────────────┘
-                          ↓
-┌─────────────────────────────────────────────────────┐
-│  VALIDATE                                            │
-│  Runs terraform plan against generated code          │
-│  Shows any drift between code and actual resources   │
-│  → Artifact: plan-output.txt                        │
-└─────────────────────────────────────────────────────┘
+Step 1: DISCOVER
+  Scans the resource group
+  Lists all resources by type
+  Filters by tag if provided
+  Output: discovery-report.json artifact
+
+Step 2: IMPORT TO STATE
+  Runs terraform import for each resource
+  Adds existing Azure resources to Terraform state in S3
+  Runs terraform plan to verify state matches reality
+  No new resources are created - only existing ones are registered
+
+Step 3: GENERATE TFVARS
+  Fetches detailed properties from Azure
+  Generates tfvars file with real values
+  Auto-commits to aks-import/tfvars/<env>-<rg>.tfvars
+  Output: generated-tfvars artifact
 ```
+
+---
+
+## Pipeline inputs
+
+| Input | Description | Example |
+|-------|-------------|---------|
+| `resource_group` | Azure RG to scan | `rg-import-demo` |
+| `environment` | Environment label | `dev` |
+| `action` | What to run | see below |
+| `tag_filter` | Filter by tag (optional) | `environment=demo` |
+| `branch` | Branch to run from | `main` |
+
+### Actions
+
+| Action | Jobs that run |
+|--------|--------------|
+| `discover` | Discover only |
+| `generate-tfvars` | Discover + Generate tfvars |
+| `import-state` | Discover + Import to state |
+| `all` | All three steps in order |
+
+---
+
+## One-time setup
+
+### 1. Create demo Azure resources
+
+```bash
+# Run the creation script
+bash create-azure-resources.sh
+```
+
+This creates in `rg-import-demo`:
+- Resource Group
+- VNet + 2 subnets
+- NSG + rules + subnet association
+- Key Vault
+- Storage Account + blob container
+
+All tagged with `environment=demo` for tag filtering.
+
+### 2. If Key Vault name conflicts (soft delete)
+
+```bash
+# Purge the old soft-deleted Key Vault
+az keyvault purge \
+  --name <old-kv-name> \
+  --location eastus
+
+# Or use a different name in create-azure-resources.sh
+KV_NAME="kv-import-demo-yourname2"
+```
+
+### 3. OIDC federated credentials (one-time)
+
+```bash
+# Get service principal App ID
+APP_ID=$(az ad sp list \
+  --display-name "github-actions-terraform" \
+  --query "[].appId" -o tsv)
+
+# Add credential for workflow_dispatch runs
+az ad app federated-credential create \
+  --id "$APP_ID" \
+  --parameters '{
+    "name": "githubaction-pipeline-dispatch",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:mridulsingh8390/githubaction-pipeline:workflow_dispatch",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+```
+
+### 4. GitHub Secrets required
+
+Go to `githubaction-pipeline` repo → Settings → Secrets → New repository secret:
+
+| Secret | Value |
+|--------|-------|
+| `AZURE_CLIENT_ID` | Service principal App ID |
+| `AZURE_TENANT_ID` | Azure AD Tenant ID |
+| `AZURE_SUBSCRIPTION_ID` | Azure Subscription ID |
+| `TF_STATE_BUCKET` | S3 bucket name |
+| `TF_STATE_LOCK_TABLE` | DynamoDB table name |
+| `AWS_ACCESS_KEY_ID` | IAM key for S3 access |
+| `AWS_SECRET_ACCESS_KEY` | IAM secret for S3 access |
+| `AWS_REGION` | S3 bucket region |
 
 ---
 
 ## Running the pipeline
 
-Go to **Actions → Azure Terraform Import → Run workflow**:
+Go to **Actions → Azure Terraform Import → Run workflow**
 
-| Input | Description | Example |
-|-------|-------------|---------|
-| `resource_group` | Azure RG to scan | `rg-aks-dev` |
-| `environment` | Environment label | `dev` |
-| `action` | What to run | see below |
-| `tag_filter` | Optional tag filter | `environment=dev` |
-| `branch` | Branch to run from | `main` |
+### Full import (recommended)
 
-### Actions
+```
+resource_group = rg-import-demo
+environment    = dev
+action         = all
+tag_filter     = environment=demo
+branch         = main
+```
 
-| Action | What runs | Use when |
-|--------|-----------|----------|
-| `discover` | Step 1 only | Just want to see what resources exist |
-| `generate` | Steps 1 + 2 | Want to generate TF code without validating |
-| `discover-generate-validate` | All steps | Full import workflow |
+This runs all three steps sequentially:
+```
+discover → import-state → generate-tfvars
+```
 
----
+### Just discover (safe, no changes)
 
-## Typical workflow
-
-### 1. First run — discover only
 ```
 action = discover
-resource_group = rg-aks-dev
 ```
-Download `discovery-report.json` from artifacts. Review what resources exist.
 
-### 2. Second run — generate code
-```
-action = generate
-resource_group = rg-aks-dev
-```
-Download `generated-tf/` folder from artifacts. Review the generated `.tf` files.
+Downloads `discovery-report.json` showing all resources found.
 
-### 3. Third run — full validation
-```
-action = discover-generate-validate
-resource_group = rg-aks-dev
-```
-Download `plan-output.txt` from artifacts. Check for any drift.
+### Just generate tfvars (no state changes)
 
-### 4. Apply the import (manual step)
-```bash
-# Copy generated files to your project
-cp generated-tf/* terraform/azure/azure-kubernetes-service/
-
-# Run locally
-cd terraform/azure/azure-kubernetes-service
-terraform init -backend-config="backend/dev.backend.hcl"
-terraform apply   # import blocks run automatically in TF 1.5+
 ```
+action = generate-tfvars
+```
+
+Generates tfvars from Azure resource properties.
+
+### Just import state (no tfvars)
+
+```
+action = import-state
+```
+
+Imports existing resources into Terraform state only.
 
 ---
 
-## How aztfexport works
+## After pipeline runs
 
-`aztfexport` is Microsoft's official tool for generating Terraform code from existing Azure resources. It:
+### Generated tfvars location
 
-1. Calls Azure Resource Manager API to list all resources in the RG
-2. Maps each resource type to the correct `azurerm_*` Terraform resource
-3. Reads all resource properties from Azure
-4. Generates `main.tf` with complete resource blocks
-5. Generates `import.tf` with native Terraform import blocks (TF 1.5+)
+```
+aks-import/tfvars/dev-rg-import-demo.tfvars
+```
 
-The generated `import.tf` looks like:
+Format: `<environment>-<resource_group>.tfvars`
+
+### Use generated tfvars in Terraform-LAB
+
+1. Copy content to `Terraform-LAB/terraform/azure/azure-kubernetes-service/values/dev.tfvars`
+2. Add missing required variables:
+
 ```hcl
-import {
-  id = "/subscriptions/.../resourceGroups/rg-aks-dev/providers/Microsoft.Network/virtualNetworks/vnet-aks-dev"
-  to = azurerm_virtual_network.res-0
-}
+# Add these manually (not discoverable from resources):
+prefix     = "import-demo"
+dns_prefix = "aksimport"
 
-import {
-  id = "/subscriptions/.../resourceGroups/rg-aks-dev/providers/Microsoft.KeyVault/vaults/kv-aksdev-mridul05"
-  to = azurerm_key_vault.res-1
-}
+# Uncomment subnet CIDRs from comments:
+aks_system_subnet_cidr = "10.0.0.0/20"
+storage_subnet_cidr    = "10.0.32.0/24"
+
+# Add AKS settings if cluster exists:
+cluster_name       = "aks-import-demo"
+kubernetes_version = "1.32"
 ```
 
-When you run `terraform apply`, these import blocks pull the existing resources into state automatically — no manual `terraform import` commands needed.
+3. Run terraform plan to verify:
+
+```bash
+cd terraform/azure/azure-kubernetes-service
+
+terraform plan \
+  -var-file="values/dev.tfvars" \
+  -var="subscription_id=<your-subscription-id>"
+```
+
+Expected output: `No changes` — confirms import was successful.
 
 ---
 
-## Tag filtering
+## Clearing state lock (if pipeline gets stuck)
 
-To import only specific resources, use the `tag_filter` input:
+```bash
+aws dynamodb delete-item \
+  --table-name terraform-state-lock \
+  --key '{"LockID": {"S": "terraform-lab-state-mridulsingh05/azure/azure-kubernetes-service/dev/terraform.tfstate"}}' \
+  --region us-east-1
 
+echo "State lock cleared"
 ```
-tag_filter = environment=dev
-tag_filter = managed_by=terraform
-tag_filter = project=aks-lab
-```
-
-This filters resources by Azure tag before passing them to aztfexport.
 
 ---
 
-## Artifacts produced
+## Cleanup demo resources
+
+```bash
+bash cleanup-azure-import-demo.sh
+```
+
+Or manually:
+
+```bash
+az group delete --name rg-import-demo --yes --no-wait
+echo "Deletion started (runs in background)"
+
+# Check status
+az group show \
+  --name rg-import-demo \
+  --query properties.provisioningState \
+  --output tsv
+```
+
+---
+
+## Resource type to Terraform address mapping
+
+The import pipeline maps Azure resource types to Terraform module addresses:
+
+| Azure Resource Type | Terraform Address |
+|--------------------|-------------------|
+| `Microsoft.Network/virtualNetworks` | `module.vnet.azurerm_virtual_network.vnet` |
+| `Microsoft.Network/networkSecurityGroups` | `module.vnet.azurerm_network_security_group.aks_user` |
+| `Microsoft.KeyVault/vaults` | `module.keyvault.azurerm_key_vault.kv` |
+| `Microsoft.Storage/storageAccounts` | `module.storage.azurerm_storage_account.sa` |
+| `Microsoft.ContainerService/managedClusters` | `module.aks.azurerm_kubernetes_cluster.aks` |
+
+To add more resource types, update `type_map` in `aks-import/scripts/run_import.py`.
+
+---
+
+## Pipeline artifacts
 
 | Artifact | Contents | Retention |
 |----------|----------|-----------|
-| `discovery-report-<rg>-<runid>` | JSON inventory of all resources found, grouped by type | 30 days |
-| `generated-tf-<rg>-<runid>` | Ready-to-use .tf files + import blocks + README | 30 days |
-| `plan-output-<rg>-<runid>` | Full terraform plan output showing drift | 30 days |
+| `discovery-report-<runid>` | JSON inventory of all resources | 30 days |
+| `generated-tfvars-<env>-<runid>` | Generated tfvars file | 30 days |
+| `import-plan-<runid>` | Terraform plan output | 30 days |
 
 ---
 
-## Required secrets
+## Common errors and fixes
 
-Same secrets as the main Terraform pipeline — no extra secrets needed:
-
-- `ARM_CLIENT_ID`, `ARM_CLIENT_SECRET`, `ARM_TENANT_ID`, `ARM_SUBSCRIPTION_ID`
-- `TF_STATE_BUCKET`, `TF_STATE_LOCK_TABLE`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`
-
----
-
-## Notes
-
-- Generated code is verbose — aztfexport includes every property. Clean it up before merging into your main Terraform code.
-- Resource names in generated code use `res-0`, `res-1` etc. Rename them to match your naming convention.
-- Some resource types are not supported by aztfexport yet — they'll be skipped with a warning.
-- Always run `discover` first to review what will be imported before running `generate`.
+| Error | Fix |
+|-------|-----|
+| `No matching federated identity record` | Add federated credential for `workflow_dispatch` subject |
+| `Error acquiring state lock` | Clear DynamoDB lock (see command above) |
+| `No value for required variable` | Pass `-var-file` to terraform import command |
+| `ConflictError - vault in deleted state` | Purge soft-deleted Key Vault or use different name |
+| `YAML not showing in Actions` | Non-ASCII characters in workflow file — keep all comments plain ASCII |
+| `working directory not found` | Check repo name in checkout step matches actual repo |
+| `Imported: 0 resources` | Check tag_filter matches actual resource tags |
