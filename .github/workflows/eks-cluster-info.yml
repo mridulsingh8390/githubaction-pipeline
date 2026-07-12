@@ -65,9 +65,20 @@ jobs:
           CLUSTER: ${{ inputs.eksClusterName }}
           REGION: ${{ inputs.awsRegion }}
         run: |
+          set -x
           echo "========== NODE GROUPS =========="
-          aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --output json | jq -r '.nodegroups[]' > /tmp/nodegroups.txt
+
+          aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --output json > /tmp/nodegroups-raw.json
+          echo "--- raw aws cli output ---"
+          cat /tmp/nodegroups-raw.json
+
+          jq -r '.nodegroups[]' /tmp/nodegroups-raw.json > /tmp/nodegroups.txt
+          echo "--- parsed group names ---"
+          cat /tmp/nodegroups.txt
+
           mapfile -t GROUPS < /tmp/nodegroups.txt
+          echo "Found ${#GROUPS[@]} node group(s): ${GROUPS[*]}"
+
           for GROUP in "${GROUPS[@]}"; do
             echo "--- $GROUP ---"
             aws eks describe-nodegroup --cluster-name "$CLUSTER" --nodegroup-name "$GROUP" --region "$REGION" \
