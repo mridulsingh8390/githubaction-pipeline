@@ -21,6 +21,7 @@ PREFIX="import-demo"
 VNET_NAME="vnet-import-demo"
 KV_NAME="kv-import-demo-mridul"
 STORAGE_NAME="stimportdemomridul"
+AKS_NAME="aks-import-demo"
 SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
 GREEN='\033[0;32m'
