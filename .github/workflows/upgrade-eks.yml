@@ -231,7 +231,7 @@ jobs:
         run: |
           set -euo pipefail
           aws eks describe-cluster --name "$CLUSTER" --region "$REGION" > pre-upgrade-cluster-state.json
-          aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --query 'nodegroups[]' --output text | tr '\t' '\n' > nodegroup-names.txt
+          aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --output json | jq -r '.nodegroups[]' > nodegroup-names.txt
           : > pre-upgrade-nodegroups-state.json
           while read -r NG; do
             aws eks describe-nodegroup --cluster-name "$CLUSTER" --nodegroup-name "$NG" --region "$REGION" >> pre-upgrade-nodegroups-state.json
@@ -310,13 +310,17 @@ jobs:
           set -euo pipefail
 
           if [ -n "$GROUP_INPUT" ]; then
-            GROUPS=("$GROUP_INPUT")
+            NODE_GROUPS=("$GROUP_INPUT")
           else
-            mapfile -t GROUPS < <(aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --query 'nodegroups[]' --output text | tr '\t' '\n')
+            aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --output json | jq -r '.nodegroups[]' > /tmp/nodegroups.txt
+            NODE_GROUPS=()
+            while IFS= read -r LINE; do
+              [ -n "$LINE" ] && NODE_GROUPS+=("$LINE")
+            done < /tmp/nodegroups.txt
           fi
 
           FIRST=true
-          for GROUP in "${GROUPS[@]}"; do
+          for GROUP in "${NODE_GROUPS[@]}"; do
             if [ "$FIRST" = false ] && [ "$SOAK_MINUTES" -gt 0 ]; then
               echo "Soaking ${SOAK_MINUTES}m before next node group..."
               sleep "$((SOAK_MINUTES * 60))"
@@ -405,7 +409,7 @@ jobs:
           CLUSTER: ${{ inputs.eksClusterName }}
           REGION: ${{ inputs.awsRegion }}
         run: |
-          NODE_GROUP_TABLE="$(aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --query 'nodegroups[]' --output text 2>/dev/null | tr '\t' '\n' || echo "Unable to fetch node groups")"
+          NODE_GROUP_TABLE="$(aws eks list-nodegroups --cluster-name "$CLUSTER" --region "$REGION" --output json 2>/dev/null | jq -r '.nodegroups[]' || echo "Unable to fetch node groups")"
 
           cat > upgrade-report.md << REPORT
           # EKS Cluster Upgrade Report
