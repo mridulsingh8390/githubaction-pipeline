@@ -16,3 +16,36 @@ tags = {
   cloud       = "aws"
   managed_by  = "terraform"
 }
+
+############################
+# VPC
+############################
+vpc_name = "eks-import-demo-vpc"
+vpc_cidr = "10.1.0.0/16"
+
+availability_zones = ["us-east-1a", "us-east-1b"]
+private_subnet_cidrs = ["10.1.2.0/24", "10.1.1.0/24"]
+public_subnet_cidrs = ["10.1.101.0/24"]
+
+# All discovered subnets:
+#   eks-import-demo-public-1: 10.1.101.0/24 (us-east-1a)
+#   eks-import-demo-private-2: 10.1.2.0/24 (us-east-1b)
+#   eks-import-demo-private-1: 10.1.1.0/24 (us-east-1a)
+
+############################
+# EKS
+############################
+cluster_name           = "eks-import-demo-cluster"
+kubernetes_version     = "1.36"
+endpoint_public_access = true
+node_volume_size_gb    = 50
+
+############################
+# Node Groups
+############################
+# Node group: eks-import-demo-user
+enable_system_node_group  = false
+user_node_instance_types  = ["t3.medium"]
+user_node_desired         = 1
+user_node_min             = 1
+user_node_max             = 2
