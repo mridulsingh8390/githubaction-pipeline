@@ -1,4 +1,4 @@
-# AKS Pipelines
+# AKS Cluster Migration Pipelines
 
 Two standalone GitHub Actions workflows for AKS — portable, no dependency
 on any other pipeline or repo. Drop both into `.github/workflows/` of any
