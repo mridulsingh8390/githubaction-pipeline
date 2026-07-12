@@ -17,6 +17,62 @@ Raw `aws eks create-cluster` requires you to manually stand up a VPC,
 subnets, security groups, and IAM roles first — `eksctl` does all of that
 in one command, which is why it's used here instead.
 
+### Installing eksctl on Windows
+
+The official docs link (`https://eksctl.io/installation/`) undersells how
+easy it is to get this wrong on Windows — worth documenting the real path,
+including the mistakes that are easy to make:
+
+**Mistake 1: downloading the wrong CPU architecture.** GitHub releases
+offer both `eksctl_Windows_amd64.zip` and `eksctl_Windows_arm64.zip`. Most
+Windows PCs are AMD64 (Intel/AMD x86-64), not ARM64 — ARM64 Windows
+machines are the exception (Surface Pro X and similar), not the rule.
+Downloading the wrong one produces a cryptic `Exec format error` when you
+try to run it, with no indication of *why* it failed.
+
+**Check your actual architecture first**, in a plain PowerShell window
+(this specific command is PowerShell syntax — it won't work in Git Bash):
+```powershell
+$env:PROCESSOR_ARCHITECTURE
+```
+Prints `AMD64` or `ARM64`. Use whichever matches for the download below.
+
+**Mistake 2: installing into `C:\Windows\System32`.** It's tempting since
+it's already on PATH, but it's a protected system directory — every future
+update or removal needs admin rights, and it's not where third-party tools
+belong. Use a folder under your user profile instead.
+
+**Correct installation, in an elevated PowerShell** (Windows key → type
+`PowerShell` → right-click → *Run as administrator*, needed only if you're
+cleaning up a bad previous install; the actual install below doesn't
+require admin rights if targeting a user folder):
+
+```powershell
+# Download the correct architecture (amd64 shown — swap to arm64 if that's what Step 1 showed)
+Invoke-WebRequest -Uri "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Windows_amd64.zip" -OutFile "$env:USERPROFILE\Downloads\eksctl.zip"
+Expand-Archive -Path "$env:USERPROFILE\Downloads\eksctl.zip" -DestinationPath "$env:USERPROFILE\eksctl" -Force
+
+# Add to PATH permanently, user-scope (no admin rights needed for this part)
+[Environment]::SetEnvironmentVariable("Path", $env:Path + ";$env:USERPROFILE\eksctl", "User")
+```
+
+**Then close PowerShell entirely and open a fresh Git Bash** —
+environment variable changes don't propagate to already-open terminals.
+
+**Verify:**
+```bash
+eksctl version
+```
+Should print a real version string, not an exec error.
+
+**If you'd previously installed a bad copy into `System32`**, remove it
+first from an elevated PowerShell (`Remove-Item C:\WINDOWS\system32\eksctl.exe`)
+before the steps above — Git Bash's `rm` will fail there with a permission
+error even as an otherwise-capable user, since that folder is
+admin-protected regardless of which shell you use.
+
+### Cluster creation
+
 ```bash
 # Install eksctl if you don't have it: https://eksctl.io/installation/
 
