@@ -26,9 +26,23 @@ type_map = {
     'aws_iam_openid_connect_provider': 'module.eks.aws_iam_openid_connect_provider.eks',
 }
 
-imported = []
-skipped  = []
-failed   = []
+# Import order matters: VPC and subnets must exist in state before EKS
+# cluster/node groups, because the EFS module's resource count depends on
+# module.vpc.private_subnet_ids - if VPC/subnets aren't in state yet, that
+# output is null/unknown and Terraform can't resolve `count = length(...)`.
+import_priority = {
+    'aws_vpc':                         0,
+    'aws_subnet':                      1,
+    'aws_iam_openid_connect_provider': 2,
+    'aws_eks_cluster':                 3,
+    'aws_eks_node_group':              4,
+}
+resources.sort(key=lambda r: import_priority.get(r['type'], 99))
+
+imported     = []
+skipped      = []
+failed       = []
+subnet_index = 0   # separate counter, not derived from resource names
 
 # Build var-file args
 var_args = [
@@ -43,9 +57,8 @@ for r in resources:
 
     # Dynamic address for subnets (indexed by position)
     if rtype == 'aws_subnet':
-        # Count how many subnets already imported
-        idx = sum(1 for i in imported if 'subnet' in i.lower())
-        tf_addr = f'module.vpc.aws_subnet.private[{idx}]'
+        tf_addr = f'module.vpc.aws_subnet.private[{subnet_index}]'
+        subnet_index += 1
 
     elif rtype == 'aws_eks_node_group':
         ng_name = rid.split(':')[-1]
