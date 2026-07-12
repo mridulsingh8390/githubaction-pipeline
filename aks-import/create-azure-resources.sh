@@ -19,20 +19,21 @@ RG="rg-import-demo"
 LOCATION="eastus"
 PREFIX="import-demo"
 VNET_NAME="vnet-import-demo"
-KV_NAME="kv-import-demo-mridul"      # must be globally unique
-STORAGE_NAME="stimportdemomridul"     # must be globally unique, lowercase only
-AKS_NAME="aks-import-demo"
+KV_NAME="kv-import-demo-mridul"
+STORAGE_NAME="stimportdemomridul"
 SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
 GREEN='\033[0;32m'
+RED='\033[0;31m'
 NC='\033[0m'
-ok() { echo -e "${GREEN}[OK]${NC} $1"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $1"; }
+fail() { echo -e "${RED}[FAIL]${NC} $1"; exit 1; }
 
 echo "================================================="
 echo " Creating Azure Resources for Import Demo"
-echo " Subscription: $SUBSCRIPTION_ID"
+echo " Subscription : $SUBSCRIPTION_ID"
 echo " Resource Group: $RG"
-echo " Location: $LOCATION"
+echo " Location      : $LOCATION"
 echo "================================================="
 
 # =============================================================================
@@ -44,7 +45,7 @@ az group create \
   --name "$RG" \
   --location "$LOCATION" \
   --tags environment=demo managed_by=cli project=import-demo \
-  --output none && ok "Resource group created: $RG"
+  --output none && ok "Resource group: $RG"
 
 # =============================================================================
 # 2. Virtual Network + Subnets
@@ -57,7 +58,7 @@ az network vnet create \
   --location "$LOCATION" \
   --address-prefix "10.0.0.0/8" \
   --tags environment=demo managed_by=cli \
-  --output none && ok "VNet created: $VNET_NAME"
+  --output none && ok "VNet: $VNET_NAME"
 
 az network vnet subnet create \
   --name "${PREFIX}-snet-aks" \
@@ -100,13 +101,26 @@ az network nsg rule create \
   --destination-port-range "*" \
   --output none && ok "NSG rule created"
 
-# Associate NSG with AKS subnet
+az network nsg rule create \
+  --name "deny-internet-inbound" \
+  --nsg-name "${PREFIX}-nsg" \
+  --resource-group "$RG" \
+  --priority 4000 \
+  --direction Inbound \
+  --access Deny \
+  --protocol "*" \
+  --source-address-prefix "Internet" \
+  --destination-address-prefix "*" \
+  --source-port-range "*" \
+  --destination-port-range "*" \
+  --output none && ok "NSG deny rule created"
+
 az network vnet subnet update \
   --name "${PREFIX}-snet-aks" \
   --resource-group "$RG" \
   --vnet-name "$VNET_NAME" \
   --network-security-group "${PREFIX}-nsg" \
-  --output none && ok "NSG associated with subnet"
+  --output none && ok "NSG associated with AKS subnet"
 
 # =============================================================================
 # 4. Key Vault
@@ -120,7 +134,7 @@ az keyvault create \
   --sku standard \
   --enable-rbac-authorization true \
   --tags environment=demo managed_by=cli \
-  --output none && ok "Key Vault created: $KV_NAME"
+  --output none && ok "Key Vault: $KV_NAME"
 
 # =============================================================================
 # 5. Storage Account
@@ -135,14 +149,13 @@ az storage account create \
   --kind StorageV2 \
   --min-tls-version TLS1_2 \
   --tags environment=demo managed_by=cli \
-  --output none && ok "Storage account created: $STORAGE_NAME"
+  --output none && ok "Storage account: $STORAGE_NAME"
 
-# Create a blob container
 az storage container create \
   --name "app-data" \
   --account-name "$STORAGE_NAME" \
   --auth-mode login \
-  --output none && ok "Blob container created: app-data"
+  --output none && ok "Blob container: app-data"
 
 # =============================================================================
 # 6. AKS Cluster (basic — no CMK for quick demo)
@@ -155,7 +168,7 @@ az aks create \
   --location "$LOCATION" \
   --node-count 1 \
   --node-vm-size Standard_D2s_v3 \
-  --kubernetes-version 1.31 \
+  --kubernetes-version 1.34.1 \
   --network-plugin azure \
   --vnet-subnet-id "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RG}/providers/Microsoft.Network/virtualNetworks/${VNET_NAME}/subnets/${PREFIX}-snet-aks" \
   --generate-ssh-keys \
