@@ -24,6 +24,12 @@ permissions:
   id-token: write
   contents: read
 
+# Disables AWS CLI's automatic pager, which can otherwise cause spurious
+# "Broken pipe" errors when its output is piped into another command
+# (e.g. mapfile/tr) in a non-interactive CI environment.
+env:
+  AWS_PAGER: ""
+
 jobs:
   eks-info:
     runs-on: ubuntu-latest
