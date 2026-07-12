@@ -73,8 +73,6 @@ admin-protected regardless of which shell you use.
 
 ### Cluster creation
 
-### Cluster creation
-
 ```bash
 # Install eksctl if you don't have it: https://eksctl.io/installation/
 
@@ -370,6 +368,61 @@ plan → upgrade-control-plane (approval) → upgrade-worker-nodes (approval) �
 - **`post-upgrade-validation`**: waits for nodes to be Ready, checks pod
   health, generates a markdown report uploaded as a build artifact.
 
+### Confirmed working end-to-end
+
+Real output from an actual successful run, `migration-cluster` upgraded
+from `1.34` to `1.35`:
+
+```bash
+$ aws eks describe-cluster --name migration-cluster --region us-east-1 \
+  --query "cluster.{Status:status, Version:version, PlatformVersion:platformVersion}" \
+  --output table
+------------------------------------------
+|             DescribeCluster            |
++------------------+---------+-----------+
+|  PlatformVersion | Status  |  Version  |
++------------------+---------+-----------+
+|  eks.18          |  ACTIVE |  1.35     |
++------------------+---------+-----------+
+
+$ aws eks describe-nodegroup --cluster-name migration-cluster --nodegroup-name migration-ng --region us-east-1 \
+  --query "nodegroup.{Name:nodegroupName, Status:status, Version:version, DesiredSize:scalingConfig.desiredSize}" \
+  --output table
+------------------------------------------------------
+|                  DescribeNodegroup                 |
++--------------+----------------+---------+----------+
+|  DesiredSize |     Name       | Status  | Version  |
++--------------+----------------+---------+----------+
+|  1           |  migration-ng  |  ACTIVE |  1.35    |
++--------------+----------------+---------+----------+
+```
+
+Both control plane and node group landed cleanly at the target version,
+`Status: ACTIVE` on both — a fully successful two-stage-approval upgrade.
+
+### Post-upgrade verification commands
+
+```bash
+# Control plane version
+aws eks describe-cluster --name <cluster> --region <region> \
+  --query "cluster.{Status:status, Version:version}" --output table
+
+# Node group version and status
+aws eks describe-nodegroup --cluster-name <cluster> --nodegroup-name <ng> --region <region> \
+  --query "nodegroup.{Status:status, Version:version}" --output table
+
+# Actual running node versions (the real ground truth)
+aws eks update-kubeconfig --name <cluster> --region <region>
+kubectl get nodes -o wide
+
+# Pod health across the cluster
+kubectl get pods --all-namespaces
+```
+
+The pipeline's own `post-upgrade-validation` job also generates a full
+markdown report, uploaded as a downloadable artifact
+(`eks-upgrade-report-<cluster>-<run_id>`) on the completed run page.
+
 ### How the node group upgrade actually works
 
 Same underlying "replace, not modify" principle as AKS, driven through
@@ -479,3 +532,45 @@ exit code 1 when it finds zero matches (i.e., when all pods are healthy),
 and combined with `set -o pipefail`, that aborted the script right before
 it could report success. Fixed by appending `|| true` to that line — if
 your copy predates this fix, that's the symptom to look for.
+
+### Node group loop mysteriously fails with `ResourceNotFoundException` for a numeric name like "1001"
+
+This was the hardest bug found while building this pipeline — worth
+documenting in full since it's genuinely non-obvious and could resurface
+if this script is ever modified.
+
+**Symptom:** a node group listing/upgrade step processes what looks like
+the right file (`cat`-ing the intermediate file shows the correct group
+name, e.g. `migration-ng`), but the very next line reports a completely
+different value — a handful of small numbers like `1001 100 118 999 4` —
+and then fails trying to operate on a node group with that numeric name,
+which obviously doesn't exist.
+
+**Root cause: `GROUPS` is a reserved special variable in bash.** It's
+automatically populated with the numeric group IDs (GIDs) of the current
+user — per the bash manual, *"Assignment to GROUPS has no effect."* An
+earlier version of this script named its own array `GROUPS` to hold node
+group names, colliding with this built-in. Every attempt to write to it
+was silently discarded; what got read back out was bash's own real GID
+list for the `runner` user on the Actions runner, not the intended node
+group names.
+
+**This produced a cascade of misleading symptoms** across several rounds
+of debugging — "broken pipe" errors (from unrelated `mapfile`/process-
+substitution races that were real but not the actual cause), then
+seemingly-corrupted log pastes, before the actual raw (unrendered) log
+file made the group-ID numbers recognizable for what they were.
+
+**Fix:** never name a custom variable `GROUPS`. This pipeline uses
+`NODE_GROUPS` instead. Other bash-reserved names to avoid for the same
+reason: `HOSTNAME`, `SECONDS`, `RANDOM`, `PPID`, `UID`, `EUID`, `BASH_*`,
+`HOME`, `PATH`, `IFS` — a project-specific prefix (like `NODE_GROUPS`
+instead of `GROUPS`) sidesteps this entire class of bug.
+
+**If you're debugging something that looks like this again:** always pull
+the raw/unrendered log file (workflow run → job → gear icon → *Download
+log archive*, or `gh run view --log`) rather than copy-pasting from the
+browser's rendered log view. Browser-rendered logs on large or fast-
+scrolling steps can appear to drop or scramble lines in ways that look
+like corruption but often aren't — the raw file is the only fully
+trustworthy source when a bug doesn't make sense.
