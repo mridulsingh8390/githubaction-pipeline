@@ -101,7 +101,7 @@ jobs:
       github.event.inputs.action == 'all'
     permissions:
       id-token: write
-      contents: read
+      contents: write
     env:
       ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -143,7 +143,19 @@ jobs:
           ENVIRONMENT: ${{ github.event.inputs.environment }}
         run: python3 aks-import/scripts/generate_tfvars.py
 
-      - name: Upload tfvars
+      - name: Save tfvars to repo
+        run: |
+          mkdir -p aks-import/tfvars
+          cp /tmp/generated.tfvars \
+            aks-import/tfvars/${{ github.event.inputs.environment }}-${{ github.event.inputs.resource_group }}.tfvars
+
+          git config user.name "github-actions-terraform"
+          git config user.email "github-actions@github.com"
+          git add aks-import/tfvars/
+          git diff --staged --quiet || git commit -m "Import: generated tfvars for ${{ github.event.inputs.resource_group }} (${{ github.event.inputs.environment }})"
+          git push
+
+      - name: Upload tfvars artifact
         uses: actions/upload-artifact@v4
         with:
           name: generated-tfvars-${{ github.event.inputs.environment }}-${{ github.run_id }}
