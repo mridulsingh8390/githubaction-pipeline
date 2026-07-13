@@ -1,0 +1,138 @@
+name: Website Security Scan
+
+# Standalone web application security scan pipeline — no dependency on any
+# other pipeline or repo. Scans a target URL with up to four independently
+# toggleable tools, all free/open-source, no licenses or secrets required.
+
+on:
+  workflow_dispatch:
+    inputs:
+      targetUrl:
+        description: "Target website URL to scan (e.g. https://example.com)"
+        required: true
+        type: string
+      runZap:
+        description: "Run OWASP ZAP (full active scan)"
+        required: false
+        default: true
+        type: boolean
+      runNuclei:
+        description: "Run Nuclei (template-based vulnerability scan)"
+        required: false
+        default: true
+        type: boolean
+      runNikto:
+        description: "Run Nikto (web server misconfiguration/outdated software scan)"
+        required: false
+        default: true
+        type: boolean
+      runWapiti:
+        description: "Run Wapiti (black-box web app vulnerability scanner — SQLi, XSS, etc.)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: website-scan-${{ inputs.targetUrl }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate target URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.targetUrl }}" in
+            http://*|https://*) ;;
+            *) echo "::error::targetUrl must start with http:// or https://"; exit 1 ;;
+          esac
+
+      - name: OWASP ZAP full scan
+        id: zap
+        if: inputs.runZap == true
+        continue-on-error: true
+        uses: zaproxy/action-full-scan@v0.12.0
+        with:
+          target: ${{ inputs.targetUrl }}
+          cmd_options: '-a'
+
+      - name: Nuclei scan
+        id: nuclei
+        if: inputs.runNuclei == true
+        continue-on-error: true
+        uses: projectdiscovery/nuclei-action@main
+        with:
+          target: ${{ inputs.targetUrl }}
+
+      - name: Nikto scan
+        id: nikto
+        if: inputs.runNikto == true
+        continue-on-error: true
+        shell: bash
+        env:
+          TARGET: ${{ inputs.targetUrl }}
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y nikto
+          nikto -h "$TARGET" -output nikto-results.txt -Format txt
+          cat nikto-results.txt
+
+      - name: Wapiti scan
+        id: wapiti
+        if: inputs.runWapiti == true
+        continue-on-error: true
+        shell: bash
+        env:
+          TARGET: ${{ inputs.targetUrl }}
+        run: |
+          pip install wapiti3 --break-system-packages
+          wapiti -u "$TARGET" -f txt -o wapiti-results.txt
+          cat wapiti-results.txt
+
+      - name: Upload scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-scan-reports-${{ github.run_id }}
+          path: |
+            nikto-results.txt
+            wapiti-results.txt
+          if-no-files-found: ignore
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Website Security Scan"
+            echo ""
+            echo "- Target: \`${{ inputs.targetUrl }}\`"
+            echo ""
+            echo "| Tool | Status |"
+            echo "|---|---|"
+            if [ "${{ inputs.runZap }}" = "true" ]; then
+              echo "| OWASP ZAP | ${{ steps.zap.outcome == 'success' && 'PASS' || 'FAIL' }} |"
+            else
+              echo "| OWASP ZAP | SKIPPED |"
+            fi
+            if [ "${{ inputs.runNuclei }}" = "true" ]; then
+              echo "| Nuclei | ${{ steps.nuclei.outcome == 'success' && 'PASS' || 'FAIL' }} |"
+            else
+              echo "| Nuclei | SKIPPED |"
+            fi
+            if [ "${{ inputs.runNikto }}" = "true" ]; then
+              echo "| Nikto | ${{ steps.nikto.outcome == 'success' && 'PASS' || 'FAIL' }} |"
+            else
+              echo "| Nikto | SKIPPED |"
+            fi
+            if [ "${{ inputs.runWapiti }}" = "true" ]; then
+              echo "| Wapiti | ${{ steps.wapiti.outcome == 'success' && 'PASS' || 'FAIL' }} |"
+            else
+              echo "| Wapiti | SKIPPED |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
