@@ -34,6 +34,7 @@ on:
 
 permissions:
   contents: read
+  issues: write # required by zaproxy/action-full-scan even with allow_issue_writing: false in some versions
 
 concurrency:
   group: website-scan-${{ inputs.targetUrl }}
