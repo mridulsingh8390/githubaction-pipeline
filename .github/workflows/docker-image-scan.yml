@@ -1,0 +1,285 @@
+name: Docker Image Security Scan
+
+# Standalone image vulnerability scan pipeline — no dependency on any other
+# pipeline or repo. Scans a single image from Docker Hub, Azure Container
+# Registry, Amazon ECR, or Google Artifact Registry using Trivy and Grype
+# (two independent CVE scanners, different vulnerability databases) and
+# Dockle (image best-practice lint). All three are individually toggleable.
+#
+# NOTE ON GITHUB ACTIONS UI LIMITATION:
+# workflow_dispatch forms cannot show/hide fields conditionally. All
+# registry-specific inputs are always visible; fill in only the block
+# matching your chosen registrySource.
+#
+# REQUIRED SECRETS (only the set matching your chosen source is needed):
+#   dockerhub: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN (optional — only needed
+#              for private images; public images pull with no auth)
+#   acr:       AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   ecr:       AWS_SCAN_ROLE_ARN (read-only role — see README for policy)
+#   gcr:       GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT
+
+on:
+  workflow_dispatch:
+    inputs:
+      registrySource:
+        description: "Where the image lives"
+        required: true
+        type: choice
+        default: "dockerhub"
+        options:
+          - dockerhub
+          - acr
+          - ecr
+          - gcr
+
+      # --- Common (all sources) ---
+      imageName:
+        description: "Image name/repository (e.g. 'library/nginx', 'my-app') — no registry prefix, that's built automatically per source"
+        required: true
+        type: string
+      imageTag:
+        description: "Image tag — required, no placeholder default on purpose"
+        required: true
+        type: string
+      runTrivy:
+        description: "Run Trivy (CVE/severity scan)"
+        required: false
+        default: true
+        type: boolean
+      runDockle:
+        description: "Run Dockle (Dockerfile/image best-practice lint)"
+        required: false
+        default: true
+        type: boolean
+      runGrype:
+        description: "Run Grype (Anchore CVE scan — complements Trivy, different vulnerability DB)"
+        required: false
+        default: true
+        type: boolean
+
+      # --- ACR-specific ---
+      acrRegistryName:
+        description: "[ACR] Registry name, e.g. 'myregistry' (no .azurecr.io)"
+        required: false
+        type: string
+
+      # --- ECR-specific ---
+      awsRegion:
+        description: "[ECR] AWS region"
+        required: false
+        default: "us-east-1"
+        type: string
+
+      # --- GCP Artifact Registry-specific ---
+      gcpArtifactLocation:
+        description: "[GCR] Artifact Registry location, e.g. us-central1"
+        required: false
+        type: string
+      gcpArtifactProject:
+        description: "[GCR] GCP project ID"
+        required: false
+        type: string
+      gcpArtifactRepository:
+        description: "[GCR] Artifact Registry repository name"
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+concurrency:
+  group: docker-image-scan-${{ inputs.registrySource }}-${{ inputs.imageName }}-${{ inputs.imageTag }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate required inputs for selected source
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ inputs.registrySource }}" in
+            acr)
+              [ -n "${{ inputs.acrRegistryName }}" ] || { echo "::error::acrRegistryName is required for ACR."; exit 1; }
+              ;;
+            gcr)
+              [ -n "${{ inputs.gcpArtifactLocation }}" ] && [ -n "${{ inputs.gcpArtifactProject }}" ] && [ -n "${{ inputs.gcpArtifactRepository }}" ] || { echo "::error::gcpArtifactLocation, gcpArtifactProject, and gcpArtifactRepository are all required for GCR."; exit 1; }
+              ;;
+          esac
+
+      # ---- Cloud logins (only the one matching registrySource actually runs) ----
+      - name: Azure login (OIDC)
+        if: inputs.registrySource == 'acr'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: AWS login (OIDC)
+        if: inputs.registrySource == 'ecr'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_SCAN_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: GCP login (Workload Identity Federation)
+        if: inputs.registrySource == 'gcr'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: inputs.registrySource == 'gcr'
+        uses: google-github-actions/setup-gcloud@v2
+
+      # ---- Registry login + build full image reference ----
+      - name: Docker Hub login (if credentials provided)
+        if: inputs.registrySource == 'dockerhub'
+        shell: bash
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${DOCKERHUB_USER:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USER" --password-stdin
+          else
+            echo "No Docker Hub credentials provided — assuming a public image."
+          fi
+
+      - name: ACR login
+        if: inputs.registrySource == 'acr'
+        shell: bash
+        env:
+          ACR_NAME: ${{ inputs.acrRegistryName }}
+        run: az acr login --name "$ACR_NAME"
+
+      - name: ECR login
+        if: inputs.registrySource == 'ecr'
+        shell: bash
+        env:
+          AWS_REGION_IN: ${{ inputs.awsRegion }}
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          REGISTRY="$ACCOUNT_ID.dkr.ecr.$AWS_REGION_IN.amazonaws.com"
+          aws ecr get-login-password --region "$AWS_REGION_IN" | docker login --username AWS --password-stdin "$REGISTRY"
+          echo "ECR_REGISTRY=$REGISTRY" >> "$GITHUB_ENV"
+
+      - name: GCP Artifact Registry login
+        if: inputs.registrySource == 'gcr'
+        shell: bash
+        env:
+          GCP_LOCATION: ${{ inputs.gcpArtifactLocation }}
+        run: gcloud auth configure-docker "$GCP_LOCATION-docker.pkg.dev" --quiet
+
+      - name: Build full image reference
+        id: image_ref
+        shell: bash
+        env:
+          SOURCE: ${{ inputs.registrySource }}
+          IMAGE_NAME: ${{ inputs.imageName }}
+          IMAGE_TAG: ${{ inputs.imageTag }}
+          ACR_NAME: ${{ inputs.acrRegistryName }}
+          GCP_LOCATION: ${{ inputs.gcpArtifactLocation }}
+          GCP_PROJECT: ${{ inputs.gcpArtifactProject }}
+          GCP_REPO: ${{ inputs.gcpArtifactRepository }}
+        run: |
+          set -euo pipefail
+          case "$SOURCE" in
+            dockerhub)
+              REF="$IMAGE_NAME:$IMAGE_TAG"
+              ;;
+            acr)
+              REF="$ACR_NAME.azurecr.io/$IMAGE_NAME:$IMAGE_TAG"
+              ;;
+            ecr)
+              REF="$ECR_REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+              ;;
+            gcr)
+              REF="$GCP_LOCATION-docker.pkg.dev/$GCP_PROJECT/$GCP_REPO/$IMAGE_NAME:$IMAGE_TAG"
+              ;;
+          esac
+          echo "Full image reference: $REF"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Pull image
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image_ref.outputs.ref }}
+        run: docker pull "$IMAGE_REF"
+
+      # ---- Scans ----
+      - name: Trivy scan
+        id: trivy
+        if: inputs.runTrivy == true
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.image_ref.outputs.ref }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+      - name: Upload Trivy SARIF
+        if: inputs.runTrivy == true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Dockle scan
+        id: dockle
+        if: inputs.runDockle == true
+        continue-on-error: true
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image_ref.outputs.ref }}
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            goodwithtech/dockle:latest --exit-code 1 --exit-level warn "$IMAGE_REF" \
+            | tee dockle-results.txt
+
+      - name: Grype scan
+        id: grype
+        if: inputs.runGrype == true
+        continue-on-error: true
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ steps.image_ref.outputs.ref }}
+          fail-build: false
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Docker Image Security Scan"
+            echo ""
+            echo "- Source: \`${{ inputs.registrySource }}\`"
+            echo "- Image: \`${{ steps.image_ref.outputs.ref }}\`"
+            echo ""
+            echo "| Tool | Status |"
+            echo "|---|---|"
+            if [ "${{ inputs.runTrivy }}" = "true" ]; then
+              echo "| Trivy | ${{ steps.trivy.outcome == 'success' && 'PASS' || 'FAIL' }} |"
+            else
+              echo "| Trivy | SKIPPED |"
+            fi
+            if [ "${{ inputs.runDockle }}" = "true" ]; then
+              echo "| Dockle | ${{ steps.dockle.outcome == 'success' && 'PASS' || 'FAIL' }} |"
+            else
+              echo "| Dockle | SKIPPED |"
+            fi
+            if [ "${{ inputs.runGrype }}" = "true" ]; then
+              echo "| Grype | ${{ steps.grype.outcome == 'success' && 'PASS' || 'FAIL' }} |"
+            else
+              echo "| Grype | SKIPPED |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
