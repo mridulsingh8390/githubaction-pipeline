@@ -1,0 +1,200 @@
+name: Deploy Single Service (AKS)
+
+# Redeploys ONE of the 4 services (discovery-service / car-service /
+# api-gateway / myhttpdimage101) into ONE environment (dev/staging/prod)
+# with a new image tag. Every other service - and the same service in
+# other environments - is untouched, because each (service, environment)
+# pair is its own independent Helm release.
+#
+# AUTH: reuses this repo's EXISTING AKS OIDC secrets. Nothing new to
+# configure - same secrets already used by deploy-multicloud-helm.yml,
+# upgrade-aks.yml, aks-cluster-info.yml, azure-import.yml.
+#
+# REQUIRED SECRETS (already configured in this repo):
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#
+# OPTIONAL SECRETS (skip the step entirely if unset):
+#   SLACK_WEBHOOK_URL              - success/failure notifications
+#   DOCKERHUB_USERNAME/DOCKERHUB_TOKEN - only if mridul08/* repos are private
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      service:
+        description: "Which service to deploy"
+        required: true
+        type: choice
+        options:
+          - discovery-service
+          - car-service
+          - api-gateway
+          - myhttpdimage101
+      imageTag:
+        description: "DockerHub image tag to deploy (e.g. v1.2.3, build-42)"
+        required: true
+        type: string
+      aksResourceGroup:
+        description: "AKS resource group"
+        required: true
+        type: string
+      aksClusterName:
+        description: "AKS cluster name"
+        required: true
+        type: string
+      namespace:
+        description: "Kubernetes namespace (e.g. myapp-dev, myapp-staging, myapp-prod)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: aks-deploy-${{ inputs.environment }}-${{ inputs.service }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ inputs.environment }} # prod: add required reviewers in Settings → Environments
+
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Reject mutable 'latest' tag in prod
+        if: inputs.environment == 'prod' && inputs.imageTag == 'latest'
+        run: |
+          echo "::error::Refusing to deploy 'latest' to prod — specify an immutable tag."
+          exit 1
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ inputs.aksResourceGroup }}
+          cluster-name: ${{ inputs.aksClusterName }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint chart
+        run: |
+          helm lint ./Multi-Cloud-Helm-Deployment/helm-chart \
+            -f ./Multi-Cloud-Helm-Deployment/helm-chart/values-${{ inputs.service }}.yaml \
+            -f ./Multi-Cloud-Helm-Deployment/helm-chart/values-${{ inputs.service }}-${{ inputs.environment }}.yaml
+
+      - name: Resolve image reference
+        id: image
+        run: |
+          REPO=$(grep -A2 '^image:' ./Multi-Cloud-Helm-Deployment/helm-chart/values-${{ inputs.service }}.yaml | grep 'repository:' | awk '{print $2}')
+          echo "ref=${REPO}:${{ inputs.imageTag }}" >> "$GITHUB_OUTPUT"
+          echo "Resolved image: ${REPO}:${{ inputs.imageTag }}"
+
+      - name: Docker login (only needed to scan private DockerHub images)
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.image.outputs.ref }}
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: true
+
+      # --atomic: rolls back to the last good revision automatically if
+      #   this fails for any reason (bad manifest, pod never Ready, timeout).
+      # --cleanup-on-fail: also removes anything a plain rollback wouldn't.
+      - name: Helm upgrade/install
+        id: deploy
+        run: |
+          helm upgrade --install ${{ inputs.service }} ./Multi-Cloud-Helm-Deployment/helm-chart \
+            -f ./Multi-Cloud-Helm-Deployment/helm-chart/values-${{ inputs.service }}.yaml \
+            -f ./Multi-Cloud-Helm-Deployment/helm-chart/values-${{ inputs.service }}-${{ inputs.environment }}.yaml \
+            --set image.tag=${{ inputs.imageTag }} \
+            --namespace ${{ inputs.namespace }} \
+            --create-namespace \
+            --atomic --cleanup-on-fail --timeout 5m
+
+      # Belt-and-suspenders: --atomic already rolled back if the step above
+      # failed. This step only surfaces that in the logs.
+      - name: Report automatic rollback (upgrade failed)
+        if: failure() && steps.deploy.outcome == 'failure'
+        run: |
+          echo "::error::Deploy of ${{ inputs.service }} to ${{ inputs.environment }} failed — Helm already rolled back automatically (--atomic)."
+          helm history ${{ inputs.service }} -n ${{ inputs.namespace }} --max 3
+          kubectl get events -n ${{ inputs.namespace }} --sort-by='.lastTimestamp' | tail -30
+
+      - name: Verify rollout
+        if: success()
+        run: |
+          kubectl rollout status deployment/${{ inputs.service }} -n ${{ inputs.namespace }} --timeout=120s
+          kubectl get pods -n ${{ inputs.namespace }} -l app.kubernetes.io/instance=${{ inputs.service }}
+
+      # Custom smoke test: --atomic only checks pod readiness, not whether
+      # the app actually serves correctly. Rolls back explicitly if it fails.
+      - name: Post-deploy smoke test
+        if: success()
+        id: smoke
+        run: |
+          kubectl run smoke-test-${{ inputs.service }} \
+            --rm -i --restart=Never \
+            --namespace ${{ inputs.namespace }} \
+            --image=curlimages/curl:8.9.1 \
+            --command -- curl -sf -m 10 -o /dev/null -w "%{http_code}" \
+            http://${{ inputs.service }}/
+
+      - name: Rollback on failed smoke test
+        if: failure() && steps.smoke.outcome == 'failure'
+        run: |
+          echo "::error::Smoke test failed — rolling back ${{ inputs.service }} in ${{ inputs.environment }}."
+          helm rollback ${{ inputs.service }} 0 -n ${{ inputs.namespace }} --wait --timeout 3m
+          kubectl rollout status deployment/${{ inputs.service }} -n ${{ inputs.namespace }}
+          exit 1
+
+      - name: Notify on success
+        if: success() && env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"✅ ${{ inputs.service }} deployed to *${{ inputs.environment }}* — tag \`${{ inputs.imageTag }}\` (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}" \
+            "$SLACK_WEBHOOK_URL"
+
+      - name: Notify on failure
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"❌ ${{ inputs.service }} deploy to *${{ inputs.environment }}* FAILED (tag \`${{ inputs.imageTag }}\`), auto-rolled back. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$SLACK_WEBHOOK_URL"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "## AKS Deployment"
+            echo ""
+            echo "- Service: \`${{ inputs.service }}\`"
+            echo "- Environment: \`${{ inputs.environment }}\`"
+            echo "- Namespace: \`${{ inputs.namespace }}\`"
+            echo "- Cluster: \`${{ inputs.aksClusterName }}\` (RG: \`${{ inputs.aksResourceGroup }}\`)"
+            echo "- Image: \`${{ steps.image.outputs.ref }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

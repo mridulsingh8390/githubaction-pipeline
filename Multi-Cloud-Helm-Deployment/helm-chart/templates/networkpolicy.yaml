@@ -1,0 +1,51 @@
+{{- if .Values.networkPolicy.enabled -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "generic-app.fullname" . }}
+  labels:
+    {{- include "generic-app.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "generic-app.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    {{- if .Values.networkPolicy.restrictEgress }}
+    - Egress
+    {{- end }}
+  ingress:
+    # Traffic from Application Gateway (AGIC) - required or AGIC can't
+    # reach the pod once a NetworkPolicy exists for it.
+    - from:
+        {{- range .Values.networkPolicy.ingressFromNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.service.targetPort }}
+    # Traffic from other pods in the same namespace (service-to-service
+    # calls between the 4 apps, if any).
+    - from:
+        - podSelector: {}
+      ports:
+        - port: {{ .Values.service.targetPort }}
+  {{- if .Values.networkPolicy.restrictEgress }}
+  egress:
+    # DNS - almost always required, left open regardless of restrictEgress.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- range .Values.networkPolicy.egressToNamespaces }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+    {{- end }}
+  {{- end }}
+{{- end }}

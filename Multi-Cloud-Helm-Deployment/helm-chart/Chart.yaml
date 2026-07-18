@@ -1,0 +1,10 @@
+apiVersion: v2
+name: generic-app
+description: >
+  Generic, reusable Helm chart used to deploy ANY one of the four microservices
+  (discovery-service, car-service, api-gateway, myhttpdimage101) behind Azure
+  Application Gateway Ingress Controller (AGIC) on AKS. The chart itself never
+  changes per deployment - only the values file / --set image.tag changes.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

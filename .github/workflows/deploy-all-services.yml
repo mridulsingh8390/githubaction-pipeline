@@ -1,0 +1,219 @@
+name: Deploy All Services (AKS Initial Setup)
+
+# Deploys all 4 services + ingresses into ONE chosen environment, for the
+# first time (or a deliberate bulk refresh). Each service is deployed
+# independently in a loop - one failing does not stop the others, and
+# each gets its own --atomic rollback.
+#
+# AUTH: reuses this repo's EXISTING AKS OIDC secrets. Nothing new to
+# configure - same secrets already used by deploy-multicloud-helm.yml,
+# upgrade-aks.yml, aks-cluster-info.yml, azure-import.yml.
+#
+# REQUIRED SECRETS (already configured in this repo):
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#
+# OPTIONAL SECRETS (skip the step entirely if unset):
+#   SLACK_WEBHOOK_URL              - success/failure notification
+#   DOCKERHUB_USERNAME/DOCKERHUB_TOKEN - only if mridul08/* repos are private
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      aksResourceGroup:
+        description: "AKS resource group"
+        required: true
+        type: string
+      aksClusterName:
+        description: "AKS cluster name"
+        required: true
+        type: string
+      namespace:
+        description: "Kubernetes namespace (e.g. myapp-dev, myapp-staging, myapp-prod)"
+        required: true
+        type: string
+      discoveryServiceTag:
+        description: "Tag for mridul08/discovery-service"
+        required: true
+        type: string
+        default: latest
+      carServiceTag:
+        description: "Tag for mridul08/car-service"
+        required: true
+        type: string
+        default: latest
+      apiGatewayTag:
+        description: "Tag for mridul08/api-gateway"
+        required: true
+        type: string
+        default: latest
+      myhttpdimage101Tag:
+        description: "Tag for mridul08/myhttpdimage101"
+        required: true
+        type: string
+        default: latest
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: aks-deploy-all-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-all:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.environment }} # prod: add required reviewers in Settings → Environments
+
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Reject mutable 'latest' tags in prod
+        if: inputs.environment == 'prod'
+        run: |
+          for tag in "${{ inputs.discoveryServiceTag }}" "${{ inputs.carServiceTag }}" "${{ inputs.apiGatewayTag }}" "${{ inputs.myhttpdimage101Tag }}"; do
+            if [ "$tag" = "latest" ]; then
+              echo "::error::Refusing to deploy 'latest' to prod — specify immutable tags for all 4 services."
+              exit 1
+            fi
+          done
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ inputs.aksResourceGroup }}
+          cluster-name: ${{ inputs.aksClusterName }}
+
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Docker login (only needed to scan private DockerHub images)
+        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Loops over all 4 services: scan -> helm upgrade --atomic -> verify
+      # rollout -> smoke test. Each service is independent - a failure in
+      # one is recorded and the loop continues to the rest; the job only
+      # fails at the end if anything in FAILED[] was recorded, so you get
+      # one clear pass/fail summary instead of stopping after service #1.
+      - name: Deploy all 4 services
+        id: deploy_all
+        run: |
+          set -uo pipefail
+
+          declare -A TAGS=(
+            [discovery-service]="${{ inputs.discoveryServiceTag }}"
+            [car-service]="${{ inputs.carServiceTag }}"
+            [api-gateway]="${{ inputs.apiGatewayTag }}"
+            [myhttpdimage101]="${{ inputs.myhttpdimage101Tag }}"
+          )
+
+          FAILED=()
+
+          for svc in "${!TAGS[@]}"; do
+            tag="${TAGS[$svc]}"
+            echo "::group::Deploying $svc ($tag)"
+
+            repo=$(grep -A2 '^image:' "./Multi-Cloud-Helm-Deployment/helm-chart/values-${svc}.yaml" | grep 'repository:' | awk '{print $2}')
+            image_ref="${repo}:${tag}"
+            echo "Image: $image_ref"
+
+            if ! trivy image --severity CRITICAL,HIGH --exit-code 1 --ignore-unfixed "$image_ref"; then
+              echo "::error::Vulnerability scan failed for $svc ($image_ref)"
+              FAILED+=("$svc:scan")
+              echo "::endgroup::"
+              continue
+            fi
+
+            if ! helm upgrade --install "$svc" ./Multi-Cloud-Helm-Deployment/helm-chart \
+                -f "./Multi-Cloud-Helm-Deployment/helm-chart/values-${svc}.yaml" \
+                -f "./Multi-Cloud-Helm-Deployment/helm-chart/values-${svc}-${{ inputs.environment }}.yaml" \
+                --set image.tag="$tag" \
+                --namespace "${{ inputs.namespace }}" \
+                --create-namespace \
+                --atomic --cleanup-on-fail --timeout 5m; then
+              echo "::error::Helm upgrade failed for $svc — automatically rolled back (--atomic)"
+              FAILED+=("$svc:deploy")
+              echo "::endgroup::"
+              continue
+            fi
+
+            kubectl rollout status "deployment/${svc}" -n "${{ inputs.namespace }}" --timeout=120s
+
+            if ! kubectl run "smoke-test-${svc}" --rm -i --restart=Never \
+                --namespace "${{ inputs.namespace }}" \
+                --image=curlimages/curl:8.9.1 \
+                --command -- curl -sf -m 10 -o /dev/null -w "%{http_code}" "http://${svc}/"; then
+              echo "::error::Smoke test failed for $svc — rolling back"
+              helm rollback "$svc" 0 -n "${{ inputs.namespace }}" --wait --timeout 3m
+              FAILED+=("$svc:smoke-test")
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "$svc deployed and verified OK"
+            echo "::endgroup::"
+          done
+
+          if [ ${#FAILED[@]} -gt 0 ]; then
+            echo "::error::The following services failed: ${FAILED[*]}"
+            echo "failed=${FAILED[*]}" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Notify on success
+        if: success() && env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"✅ All 4 services deployed to *${{ inputs.environment }}* (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}" \
+            "$SLACK_WEBHOOK_URL"
+
+      - name: Notify on failure
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"❌ Deploy-all to *${{ inputs.environment }}* had failures: \`${{ steps.deploy_all.outputs.failed }}\`. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$SLACK_WEBHOOK_URL"
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "## AKS Deploy All Services"
+            echo ""
+            echo "- Environment: \`${{ inputs.environment }}\`"
+            echo "- Namespace: \`${{ inputs.namespace }}\`"
+            echo "- Cluster: \`${{ inputs.aksClusterName }}\` (RG: \`${{ inputs.aksResourceGroup }}\`)"
+            echo "- discovery-service: \`${{ inputs.discoveryServiceTag }}\`"
+            echo "- car-service: \`${{ inputs.carServiceTag }}\`"
+            echo "- api-gateway: \`${{ inputs.apiGatewayTag }}\`"
+            echo "- myhttpdimage101: \`${{ inputs.myhttpdimage101Tag }}\`"
+            if [ -n "${{ steps.deploy_all.outputs.failed }}" ]; then
+              echo "- ⚠️ Failed: \`${{ steps.deploy_all.outputs.failed }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

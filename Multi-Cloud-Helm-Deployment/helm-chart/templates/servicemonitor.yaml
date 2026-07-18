@@ -1,0 +1,27 @@
+{{- if and .Values.monitoring.enabled .Values.monitoring.serviceMonitor.enabled -}}
+{{- if .Capabilities.APIVersions.Has "monitoring.coreos.com/v1" -}}
+# NOTE: this targets the Service's "http" port by name, i.e. it assumes
+# metrics are served on the same port as the app (service.targetPort).
+# If your app exposes metrics on a separate port, add a second named port
+# to templates/service.yaml and change `port: http` below to that name.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "generic-app.fullname" . }}
+  labels:
+    {{- include "generic-app.labels" . | nindent 4 }}
+    {{- with .Values.monitoring.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "generic-app.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      path: {{ .Values.monitoring.path }}
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+{{- else -}}
+{{- fail "monitoring.serviceMonitor.enabled=true but the ServiceMonitor CRD (monitoring.coreos.com/v1) is not installed on this cluster. Install kube-prometheus-stack first, or set serviceMonitor.enabled=false and rely on prometheus.io/* pod annotations instead." -}}
+{{- end -}}
+{{- end -}}

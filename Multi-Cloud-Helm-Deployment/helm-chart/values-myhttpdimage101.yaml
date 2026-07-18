@@ -1,0 +1,9 @@
+fullnameOverride: myhttpdimage101
+
+image:
+  repository: mridul08/myhttpdimage101
+  tag: latest
+
+service:
+  port: 80
+  targetPort: 80      # typical for an httpd-based image; change if different

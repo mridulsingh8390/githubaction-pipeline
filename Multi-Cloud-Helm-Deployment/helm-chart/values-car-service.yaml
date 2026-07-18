@@ -1,0 +1,9 @@
+fullnameOverride: car-service
+
+image:
+  repository: mridul08/car-service
+  tag: latest
+
+service:
+  port: 80
+  targetPort: 8080    # <-- change to the real port your container listens on

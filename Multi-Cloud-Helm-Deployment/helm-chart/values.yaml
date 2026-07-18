@@ -1,0 +1,98 @@
+# Default values. Every real deployment overrides these via the per-service
+# files in /values/*.yaml (host, image repo) and the pipeline overrides
+# image.tag with --set at deploy time.
+
+replicaCount: 2
+
+image:
+  repository: mridul08/discovery-service
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Only needed if the DockerHub repos are private. See README "Private images".
+imagePullSecrets: []
+# - name: dockerhub-secret
+
+nameOverride: ""
+fullnameOverride: ""
+
+podAnnotations: {}
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+ingress:
+  enabled: true
+  className: azure-application-gateway
+  host: example.com
+  path: /
+  pathType: Prefix
+  annotations:
+    kubernetes.io/ingress.class: azure/application-gateway
+    appgw.ingress.kubernetes.io/ssl-redirect: "true"
+  tls:
+    enabled: false
+    secretName: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+livenessProbe:
+  enabled: true
+  path: /
+  initialDelaySeconds: 15
+  periodSeconds: 20
+
+readinessProbe:
+  enabled: true
+  path: /
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# --- Prometheus / Grafana integration ---
+# Off by default. Turn on per-service in values/<env>/<service>.yaml if that
+# environment runs the Prometheus Operator (kube-prometheus-stack) or a
+# plain Prometheus with pod-annotation-based scraping.
+monitoring:
+  enabled: false
+  path: /metrics
+  port: 9090          # the port your app exposes metrics on (often same as app port)
+  # If true AND the ServiceMonitor CRD exists on the cluster, a ServiceMonitor
+  # is created (kube-prometheus-stack style). If your Prometheus instead
+  # relies on pod annotations, leave this false - annotations are always
+  # added whenever monitoring.enabled is true, regardless of this flag.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}         # e.g. { release: kube-prometheus-stack } - many
+                        # Prometheus Operator installs only pick up
+                        # ServiceMonitors carrying a specific label
+
+# --- NetworkPolicy ---
+# Off by default (adding it retroactively on a cluster with no existing
+# policies can silently break traffic if left misconfigured - enable
+# deliberately, test in dev/staging first).
+networkPolicy:
+  enabled: false
+  # Namespace(s) allowed to reach this pod on ingress, in addition to
+  # same-namespace traffic. Must include AGIC's namespace or the Application
+  # Gateway can't reach your pods once a policy is enforced.
+  ingressFromNamespaces:
+    - kube-system      # default AGIC namespace on AKS - confirm with:
+                        # kubectl get pods -n kube-system -l app=ingress-appgw
+  # Egress is left unrestricted by default (egress: [] + policyTypes below
+  # only lists Ingress) since most apps need DNS/external calls (DB, APIs).
+  # Set restrictEgress: true and list egressToNamespaces to lock it down too.
+  restrictEgress: false
+  egressToNamespaces: []

@@ -1,0 +1,12 @@
+# Environment-agnostic settings for discovery-service.
+# Anything that differs per environment (host, replicaCount, resources)
+# lives in values/<env>/discovery-service.yaml and is layered on top.
+fullnameOverride: discovery-service
+
+image:
+  repository: mridul08/discovery-service
+  tag: latest        # always overridden by --set image.tag=<TAG> in the pipeline
+
+service:
+  port: 80
+  targetPort: 8080    # <-- change to the real port your container listens on

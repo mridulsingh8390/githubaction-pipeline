@@ -1,0 +1,6 @@
+replicaCount: 3
+ingress:
+  host: login.example.com
+resources:
+  requests: { cpu: 200m, memory: 256Mi }
+  limits:   { cpu: 1,    memory: 512Mi }

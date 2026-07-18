@@ -1,0 +1,7 @@
+Release "{{ .Release.Name }}" deployed.
+
+Host:  {{ .Values.ingress.host }}
+Image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+
+Check rollout:
+  kubectl rollout status deployment/{{ include "generic-app.fullname" . }} -n {{ .Release.Namespace }}
