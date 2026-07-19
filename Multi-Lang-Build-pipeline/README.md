@@ -20,15 +20,20 @@ than `actions/checkout`).
 - **The source repo already has a Dockerfile.** This workflow does not
   generate one — it fails fast with a clear error if the Dockerfile isn't
   found at `dockerfile_path` (default: `Dockerfile` at the repo root).
-- **SonarQube is self-hosted** (e.g. running as a Docker container on your
-  own infrastructure) — the workflow points `sonar-scanner` at
-  `SONAR_HOST_URL`/`SONAR_TOKEN` rather than SonarCloud.
+- **SonarQube runs ephemerally, inside the pipeline job itself** — no
+  persistent server, no portal to log into. It starts as a GitHub Actions
+  **service container** at the beginning of the job, gets scanned against,
+  prints its results (Quality Gate pass/fail + key metrics) directly into
+  the job log and the run's **Summary** tab, and is torn down automatically
+  when the job ends. Nothing to provision ahead of time beyond the
+  `sonar_project_key` input (which just needs to be a name — it's created
+  fresh on the ephemeral server every run, not looked up on some
+  pre-existing instance).
 - **Trivy + OWASP Dependency-Check** round out the scanning, per your
-  answers. All three scanners (Trivy fs, Dependency-Check, SonarQube) and
-  the final Trivy image scan are **non-blocking by default** — findings get
-  reported (Security tab, artifact, or your Sonar server) but don't stop
-  the pipeline. See "Making a scan blocking" below if you want that to
-  change for any of them.
+  answers. Trivy's two scans and Dependency-Check are **non-blocking**
+  (findings reported, pipeline continues); the SonarQube step currently is
+  too (`continue-on-error: true`) even though it now has a real, reliable
+  pass/fail signal via the Quality Gate — see "Making a scan blocking" below.
 
 ## How to run it
 
@@ -44,10 +49,13 @@ than `actions/checkout`).
      repo root
    - **image_name**: your Docker Hub repo, e.g. `yourorg/yourapp`
    - **image_tag**: leave blank to auto-use the short git commit SHA
-   - **sonar_project_key**: must already exist as a project on your
-     SonarQube server
-3. Run. Watch the job's step-by-step log, or wait for it to finish and
-   check the **Summary** tab for a quick recap + where each report landed.
+   - **sonar_project_key**: any name you like — this becomes the project
+     name on the ephemeral SonarQube instance for this one run only
+3. Run. Watch the job's step-by-step log — the **"Print SonarQube results"**
+   step prints the Quality Gate result and key metrics (bugs,
+   vulnerabilities, code smells, coverage, lines of code) directly, no
+   clicking into anything external. Or check the **Summary** tab after the
+   run finishes for the same information plus the overall recap.
 
 ## Required GitHub secrets
 
@@ -58,19 +66,30 @@ Settings -> Secrets and variables -> Actions -> New repository secret
 |---|---|
 | `DOCKERHUB_USERNAME` | Docker Hub login |
 | `DOCKERHUB_TOKEN` | Docker Hub access token (Account Settings -> Security -> New Access Token — not your password) |
-| `SONAR_HOST_URL` | URL of your self-hosted SonarQube server, e.g. `https://sonar.yourcompany.com` |
-| `SONAR_TOKEN` | SonarQube user/project token (My Account -> Security -> Generate Token on your Sonar server) |
 | `SOURCE_REPO_TOKEN` | *Optional* — only needed if `repo_url` points at a **private** repo. A GitHub PAT (or equivalent for other git hosts) with read access. |
 | `NVD_API_KEY` | *Optional but recommended* — OWASP Dependency-Check hits the National Vulnerability Database, which rate-limits/blocks unauthenticated requests. Get a free key at https://nvd.nist.gov/developers/request-an-api-key. Without it, Dependency-Check may intermittently fail to update its database. |
 
-## Important: network access for self-hosted SonarQube
+Notice there's **no `SONAR_HOST_URL`/`SONAR_TOKEN` secret anymore** — the
+workflow generates its own token against the ephemeral server at
+`http://localhost:9000` every run and throws it away when the job ends.
 
-GitHub-hosted runners (`ubuntu-latest`) need to be able to reach
-`SONAR_HOST_URL` over the network. If your SonarQube server is inside a
-private network/VPN/corporate firewall, GitHub's hosted runners **cannot
-reach it** — you'll need either:
-- A [self-hosted GitHub Actions runner](https://docs.github.com/en/actions/hosting-your-own-runners) with network access to your SonarQube server, or
-- Expose SonarQube through a properly secured HTTPS endpoint reachable from the internet.
+## Cost of the "no portal" approach: added time per run
+
+Standing up SonarQube fresh every run (even the lightweight Community
+Edition with its embedded H2 database) costs real time — expect roughly
+1-2 extra minutes for the service container to report ready, on top of the
+scan itself. That's the trade-off for not maintaining a persistent server:
+every run pays a small "cold start" cost. The job's `timeout-minutes: 60`
+already accounts for this; adjust if your repos are large enough that the
+scan itself also runs long.
+
+Also worth knowing: because nothing persists between runs, you lose
+SonarQube's usual "trend over time" view (new issues vs. existing,
+historical charts, etc.) — every run is a clean-slate analysis of that one
+commit, not a comparison against a prior baseline. If you later want that
+history back, the fix is straightforward: point `SONAR_HOST_URL`/
+`SONAR_TOKEN` at a real persistent server instead of the ephemeral service
+container (I can wire that up as an alternate/toggle-able mode if useful).
 
 ## Making a scan blocking (fail the pipeline on findings)
 
@@ -83,10 +102,15 @@ tighten enforcement once you've established a baseline. To make one strict:
 - **OWASP Dependency-Check**: add `--failOnCVSS <score>` (e.g. `7`) to the
   `NVD_ARGS` line, and remove the trailing `|| echo ...` fallback so a
   non-zero exit actually fails the step.
-- **SonarQube**: remove `continue-on-error: true` from that step, and
-  configure a Quality Gate on your SonarQube server (the scan action fails
-  automatically if the Quality Gate fails, once you're not swallowing
-  errors with `continue-on-error`).
+- **SonarQube**: already computes a real Quality Gate result every run
+  (via `-Dsonar.qualitygate.wait=true`) — just delete the
+  `continue-on-error: true` line from the "SonarQube Scan" step and a
+  failed gate will stop the pipeline before it reaches Docker build/push.
+  The default Quality Gate ("Sonar way") is reasonable out of the box;
+  since the project is recreated fresh every run there's no custom gate
+  configuration to carry over between runs — if you want a stricter/looser
+  gate, that'd need to be set via the API right after project creation
+  (happy to add that step if you want a specific threshold).
 
 ## Adjusting per-platform build assumptions
 
