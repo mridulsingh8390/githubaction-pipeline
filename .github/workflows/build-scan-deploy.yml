@@ -7,15 +7,22 @@ name: Multi-Language Build, Scan & Deploy
 #   3. Build natively (Maven/Gradle, dotnet build, pip install, npm ci, go build)
 #   4. Trivy filesystem scan (source + dependencies)
 #   5. OWASP Dependency-Check (SCA against the NVD database)
-#   6. SonarQube scan — runs as an EPHEMERAL service container for just this
-#      job (spins up, gets scanned against, prints results, torn down when
-#      the job ends). No persistent server to stand up or log into — the
-#      quality gate pass/fail and key metrics print directly in this step's
-#      own log and the job Summary.
-#   7. docker build using the Dockerfile ALREADY IN that repo (this workflow
+#   6. docker build using the Dockerfile ALREADY IN that repo (this workflow
 #      does not generate one — see README "Design assumptions")
-#   8. Trivy image scan of the built image
-#   9. Push to Docker Hub
+#   7. Trivy image scan of the built image
+#   8. Push to Docker Hub
+#
+# ...and, IN PARALLEL, a separate `sonarqube-scan` job (only if
+# run_sonarqube is left at its default "true") that runs SonarQube as an
+# EPHEMERAL service container just for that job — spins up, gets scanned
+# against, prints results, torn down when the job ends. No persistent
+# server to stand up or log into. This lives in its own job (not a step in
+# the job above) specifically so that setting run_sonarqube to "false"
+# means the SonarQube service container never starts at all — GitHub
+# Actions services always start for a job that runs, regardless of any
+# input, so skipping it cleanly requires skipping the whole job via a
+# job-level `if:`, not just skipping a step inside a job that still has
+# the service attached.
 #
 # Trigger: Actions tab -> "Multi-Language Build, Scan & Deploy" -> Run workflow.
 
@@ -60,9 +67,17 @@ on:
         description: "Image tag (leave blank to use the short git commit SHA)"
         required: false
         type: string
-      sonar_project_key:
-        description: "SonarQube project key/name for this run — created fresh on the ephemeral server each time, doesn't need to pre-exist anywhere"
+      run_sonarqube:
+        description: "Run the SonarQube scan job? Set to false to skip it entirely (no service container started, no time spent on it)"
         required: true
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
+      sonar_project_key:
+        description: "SonarQube project key/name for this run — created fresh on the ephemeral server each time, doesn't need to pre-exist anywhere. Ignored if run_sonarqube is false."
+        required: false
         type: string
 
 permissions:
@@ -73,20 +88,6 @@ jobs:
   build-scan-deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    # SonarQube runs as a service container for the lifetime of this job —
-    # started before your steps run, reachable at localhost:9000, and torn
-    # down automatically when the job finishes. SONAR_ES_BOOTSTRAP_CHECKS_DISABLE
-    # skips Elasticsearch's vm.max_map_count host-level check, which you
-    # can't satisfy on a GitHub-hosted runner for a service container
-    # (there's no way to run a setup step before services start).
-    services:
-      sonarqube:
-        image: sonarqube:lts-community
-        ports:
-          - 9000:9000
-        env:
-          SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
-
     steps:
       # ============================================================
       # CLONE THE TARGET REPO (not this workflow's own repo)
@@ -268,6 +269,92 @@ jobs:
           path: dependency-check-report/
           retention-days: 30
 
+      # ============================================================
+      # DOCKER BUILD, IMAGE SCAN, PUSH
+      # ============================================================
+      - name: Docker build
+        run: |
+          set -euo pipefail
+          docker build -f "source/${{ inputs.dockerfile_path }}" -t "${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}" source
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}"
+          format: sarif
+          output: trivy-image-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'   # non-blocking — see README if you want failed scans to block the push
+
+      - name: Upload Trivy image SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-image
+
+      - name: Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push image
+        run: |
+          set -euo pipefail
+          docker push "${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Build, Scan & Deploy Summary"
+            echo ""
+            echo "- **Platform:** ${{ inputs.platform }} ${{ inputs.version }}"
+            echo "- **Source:** ${{ inputs.repo_url }} (branch \`${{ inputs.branch }}\`)"
+            echo "- **Image:** \`${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}\`"
+            echo ""
+            echo "**Reports:**"
+            echo "- Trivy (filesystem + image): Security tab -> Code scanning alerts"
+            echo "- OWASP Dependency-Check: this run's Artifacts"
+            if [ "${{ inputs.run_sonarqube }}" = "true" ]; then
+              echo "- SonarQube: see the separate \`sonarqube-scan\` job's Summary/log in this same workflow run"
+            else
+              echo "- SonarQube: skipped (run_sonarqube was set to false)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  sonarqube-scan:
+    # Its own job specifically so that run_sonarqube=false skips this
+    # ENTIRE job — service containers always start for a job that runs,
+    # regardless of any input, so this is the only way to avoid spinning up
+    # SonarQube at all when you don't want it. Runs in parallel with
+    # build-scan-deploy above (no `needs:`), so skipping it costs zero time
+    # either way, and running it doesn't slow the build/push down either.
+    if: inputs.run_sonarqube == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      sonarqube:
+        image: sonarqube:lts-community
+        ports:
+          - 9000:9000
+        env:
+          SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    steps:
+      - name: Clone source repository
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          BRANCH: ${{ inputs.branch }}
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SOURCE_REPO_TOKEN:-}" ]; then
+            CLONE_URL="$(printf '%s' "$REPO_URL" | sed -E "s#https://#https://x-access-token:${SOURCE_REPO_TOKEN}@#")"
+          else
+            CLONE_URL="$REPO_URL"
+          fi
+          git clone --branch "$BRANCH" --single-branch "$CLONE_URL" source
+
       - name: Wait for ephemeral SonarQube to be ready
         run: |
           set -euo pipefail
@@ -344,7 +431,9 @@ jobs:
         # Quality-gate pass/fail comes through as this step's own exit
         # code (via -Dsonar.qualitygate.wait=true above) — remove the
         # `continue-on-error` line below if you want a failed quality gate
-        # to stop the pipeline before it reaches the Docker build/push.
+        # to fail this job (it still won't block build-scan-deploy above,
+        # since the two jobs run independently — see README if you want
+        # them linked instead).
         continue-on-error: true
 
       - name: Print SonarQube results (no portal needed)
@@ -355,9 +444,9 @@ jobs:
           MEASURES="$(curl -s -u "${{ steps.sonar_setup.outputs.auth }}" "http://localhost:9000/api/measures/component?component=${{ inputs.sonar_project_key }}&metricKeys=${METRICS}" 2>/dev/null || true)"
 
           {
-            echo "## SonarQube Results (ephemeral scan — this server is gone once the job ends)"
+            echo "## SonarQube Results (ephemeral scan — this server is gone once this job ends)"
             echo ""
-            echo "- **Quality Gate:** ${{ steps.sonar_scan.outcome == 'success' && 'PASSED' || 'FAILED (see step log above for details)' }}"
+            echo "- **Quality Gate:** ${{ steps.sonar_scan.outcome == 'success' && 'PASSED' || 'FAILED (see the SonarQube Scan step log above for details)' }}"
             echo ""
             echo "| Metric | Value |"
             echo "|---|---|"
@@ -366,55 +455,5 @@ jobs:
               echo "| $m | ${VAL:-n/a} |"
             done
             echo ""
-            echo "Full issue list (if you want it, while the job is still running): \`curl -u <admin>:<password used this run> \"http://localhost:9000/api/issues/search?componentKeys=${{ inputs.sonar_project_key }}\"\` — only reachable while this job is still running, since the server is ephemeral."
+            echo "Full issue list (if you want it, while this job is still running): \`curl -u <admin>:<password used this run> \"http://localhost:9000/api/issues/search?componentKeys=${{ inputs.sonar_project_key }}\"\`"
           } | tee -a "$GITHUB_STEP_SUMMARY"
-
-      # ============================================================
-      # DOCKER BUILD, IMAGE SCAN, PUSH
-      # ============================================================
-      - name: Docker build
-        run: |
-          set -euo pipefail
-          docker build -f "source/${{ inputs.dockerfile_path }}" -t "${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}" source
-
-      - name: Trivy image scan
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: "${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}"
-          format: sarif
-          output: trivy-image-results.sarif
-          severity: CRITICAL,HIGH
-          exit-code: '0'   # non-blocking — see README if you want failed scans to block the push
-
-      - name: Upload Trivy image SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-image-results.sarif
-          category: trivy-image
-
-      - name: Docker Hub login
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Push image
-        run: |
-          set -euo pipefail
-          docker push "${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}"
-
-      - name: Summary
-        if: always()
-        run: |
-          {
-            echo "## Build, Scan & Deploy Summary"
-            echo ""
-            echo "- **Platform:** ${{ inputs.platform }} ${{ inputs.version }}"
-            echo "- **Source:** ${{ inputs.repo_url }} (branch \`${{ inputs.branch }}\`)"
-            echo "- **Image:** \`${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}\`"
-            echo ""
-            echo "**Reports:**"
-            echo "- Trivy (filesystem + image): Security tab -> Code scanning alerts"
-            echo "- OWASP Dependency-Check: this run's Artifacts"
-            echo "- SonarQube: your SonarQube server, project \`${{ inputs.sonar_project_key }}\`"
-          } >> "$GITHUB_STEP_SUMMARY"

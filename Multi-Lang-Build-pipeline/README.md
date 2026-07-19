@@ -15,6 +15,22 @@ public repo elsewhere on GitHub, or hosted on GitLab/Bitbucket (any `git`
 URL works, not just GitHub, since it clones with a plain `git clone` rather
 than `actions/checkout`).
 
+## Skipping SonarQube entirely
+
+Set **run_sonarqube** to `false` on the Run workflow form and the entire
+`sonarqube-scan` job is skipped — including its SonarQube service
+container, which never even starts. This matters because GitHub Actions
+service containers always start for a job that runs, regardless of any
+input inside that job; the only way to truly skip starting SonarQube (not
+just skip a step that uses it) is to skip the whole job it lives in, via a
+job-level `if:`. That's why SonarQube lives in its own `sonarqube-scan`
+job rather than as a step inside `build-scan-deploy`.
+
+Bonus of this split: the two jobs run **in parallel**, not one after the
+other — so having SonarQube enabled doesn't add its ~1-2 minute startup
+cost on top of the build job's own time; they overlap. `sonarqube_project_key`
+is ignored (and can be left blank) when `run_sonarqube` is `false`.
+
 ## Design assumptions (confirmed with you before building this)
 
 - **The source repo already has a Dockerfile.** This workflow does not
@@ -73,15 +89,17 @@ Notice there's **no `SONAR_HOST_URL`/`SONAR_TOKEN` secret anymore** — the
 workflow generates its own token against the ephemeral server at
 `http://localhost:9000` every run and throws it away when the job ends.
 
-## Cost of the "no portal" approach: added time per run
+## Cost of the "no portal" approach: added time per run (if enabled)
 
 Standing up SonarQube fresh every run (even the lightweight Community
 Edition with its embedded H2 database) costs real time — expect roughly
 1-2 extra minutes for the service container to report ready, on top of the
-scan itself. That's the trade-off for not maintaining a persistent server:
-every run pays a small "cold start" cost. The job's `timeout-minutes: 60`
-already accounts for this; adjust if your repos are large enough that the
-scan itself also runs long.
+scan itself. Since `sonarqube-scan` runs as its own job in parallel with
+`build-scan-deploy` (see "Skipping SonarQube entirely" above), this cost
+is mostly hidden behind the build job's own runtime rather than added on
+top of it sequentially — but it's still real machine time being spent if
+you don't need the scan that run, which is exactly what `run_sonarqube:
+false` avoids paying at all.
 
 Also worth knowing: because nothing persists between runs, you lose
 SonarQube's usual "trend over time" view (new issues vs. existing,
@@ -103,9 +121,16 @@ tighten enforcement once you've established a baseline. To make one strict:
   `NVD_ARGS` line, and remove the trailing `|| echo ...` fallback so a
   non-zero exit actually fails the step.
 - **SonarQube**: already computes a real Quality Gate result every run
-  (via `-Dsonar.qualitygate.wait=true`) — just delete the
-  `continue-on-error: true` line from the "SonarQube Scan" step and a
-  failed gate will stop the pipeline before it reaches Docker build/push.
+  (via `-Dsonar.qualitygate.wait=true`) — delete the `continue-on-error:
+  true` line from the "SonarQube Scan" step and a failed gate will fail
+  the `sonarqube-scan` job itself. Note this job runs independently of
+  `build-scan-deploy` (no `needs:` between them, by design — see
+  "Skipping SonarQube entirely"), so a failed Sonar quality gate will
+  **not** stop the Docker build/push on its own; you'd need to add
+  `needs: [sonarqube-scan]` to `build-scan-deploy` if you want the push to
+  wait on and depend on Sonar's result (trade-off: that also removes the
+  parallel-speed benefit, since the build would then wait for Sonar to
+  finish first). Happy to wire that up if you want it.
   The default Quality Gate ("Sonar way") is reasonable out of the box;
   since the project is recreated fresh every run there's no custom gate
   configuration to carry over between runs — if you want a stricter/looser
