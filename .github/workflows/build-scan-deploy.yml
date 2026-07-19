@@ -1,0 +1,313 @@
+name: Multi-Language Build, Scan & Deploy
+
+# Reusable workflow: pick a platform + version, point it at ANY external
+# repo (not this one) via repo_url + branch, and it will:
+#   1. Clone that repo
+#   2. Set up the requested language runtime
+#   3. Build natively (Maven/Gradle, dotnet build, pip install, npm ci, go build)
+#   4. Trivy filesystem scan (source + dependencies)
+#   5. OWASP Dependency-Check (SCA against the NVD database)
+#   6. SonarQube scan (self-hosted server — SONAR_HOST_URL/SONAR_TOKEN)
+#   7. docker build using the Dockerfile ALREADY IN that repo (this workflow
+#      does not generate one — see README "Design assumptions")
+#   8. Trivy image scan of the built image
+#   9. Push to Docker Hub
+#
+# Trigger: Actions tab -> "Multi-Language Build, Scan & Deploy" -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Programming platform"
+        required: true
+        type: choice
+        options:
+          - java
+          - dotnet
+          - python
+          - nodejs
+          - go
+      version:
+        description: >
+          Runtime version. Format depends on platform:
+          Java "17" or "21" | .NET "8.0.x" | Python "3.12" | Node.js "20" | Go "1.22"
+        required: true
+        type: string
+      repo_url:
+        description: "Git URL of the source repo to build, e.g. https://github.com/org/app.git"
+        required: true
+        type: string
+      branch:
+        description: "Branch to build"
+        required: true
+        default: "main"
+        type: string
+      dockerfile_path:
+        description: "Path to the Dockerfile within that repo (it must already exist there)"
+        required: false
+        default: "Dockerfile"
+        type: string
+      image_name:
+        description: "Docker Hub repository to push to, e.g. yourorg/yourapp"
+        required: true
+        type: string
+      image_tag:
+        description: "Image tag (leave blank to use the short git commit SHA)"
+        required: false
+        type: string
+      sonar_project_key:
+        description: "SonarQube project key (created on your SonarQube server ahead of time)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  security-events: write   # required for uploading Trivy SARIF to the Security tab
+
+jobs:
+  build-scan-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # ============================================================
+      # CLONE THE TARGET REPO (not this workflow's own repo)
+      # ============================================================
+      - name: Clone source repository
+        env:
+          REPO_URL: ${{ inputs.repo_url }}
+          BRANCH: ${{ inputs.branch }}
+          # Optional: only needed if repo_url points at a private repo.
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${SOURCE_REPO_TOKEN:-}" ]; then
+            CLONE_URL="$(printf '%s' "$REPO_URL" | sed -E "s#https://#https://x-access-token:${SOURCE_REPO_TOKEN}@#")"
+          else
+            CLONE_URL="$REPO_URL"
+          fi
+          # Full (non-shallow) clone: SonarQube's analysis quality benefits
+          # from full history, and it's cheap for most application repos.
+          git clone --branch "$BRANCH" --single-branch "$CLONE_URL" source
+          cd source && git log -1 --oneline
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            echo "tag=${{ inputs.image_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(git -C source rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify Dockerfile exists
+        run: |
+          set -euo pipefail
+          if [ ! -f "source/${{ inputs.dockerfile_path }}" ]; then
+            echo "::error::No Dockerfile found at source/${{ inputs.dockerfile_path }}. This workflow expects the source repo to already contain one — see dockerfile_path input."
+            exit 1
+          fi
+
+      # ============================================================
+      # LANGUAGE RUNTIME SETUP (only the one matching `platform` runs)
+      # ============================================================
+      - name: Setup Java
+        if: inputs.platform == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.version }}
+
+      - name: Setup .NET
+        if: inputs.platform == 'dotnet'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ inputs.version }}
+
+      - name: Setup Python
+        if: inputs.platform == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.version }}
+
+      - name: Setup Node.js
+        if: inputs.platform == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.version }}
+
+      - name: Setup Go
+        if: inputs.platform == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.version }}
+
+      # ============================================================
+      # NATIVE BUILD (before touching Docker at all — fast feedback,
+      # and gives Sonar/Dependency-Check real build artifacts to work with)
+      # ============================================================
+      - name: Build (Java)
+        if: inputs.platform == 'java'
+        working-directory: source
+        run: |
+          set -euo pipefail
+          if [ -f pom.xml ]; then
+            mvn -B clean package
+          elif [ -f build.gradle ] || [ -f build.gradle.kts ]; then
+            chmod +x ./gradlew 2>/dev/null || true
+            ./gradlew build
+          else
+            echo "No pom.xml or build.gradle(.kts) found at repo root — skipping native build step; the Dockerfile's own build stage will handle it."
+          fi
+
+      - name: Build (.NET)
+        if: inputs.platform == 'dotnet'
+        working-directory: source
+        run: |
+          set -euo pipefail
+          dotnet restore
+          dotnet build --configuration Release
+
+      - name: Build (Python)
+        if: inputs.platform == 'python'
+        working-directory: source
+        run: |
+          set -euo pipefail
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          elif [ -f pyproject.toml ]; then
+            pip install .
+          else
+            echo "No requirements.txt or pyproject.toml found — skipping dependency install."
+          fi
+
+      - name: Build (Node.js)
+        if: inputs.platform == 'nodejs'
+        working-directory: source
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+          npm run build --if-present
+
+      - name: Build (Go)
+        if: inputs.platform == 'go'
+        working-directory: source
+        run: |
+          set -euo pipefail
+          go build ./...
+
+      # ============================================================
+      # SCANS — source/dependencies, then SAST/quality, before any Docker step
+      # ============================================================
+      - name: Trivy filesystem scan (source & dependencies)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: source
+          format: sarif
+          output: trivy-fs-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'   # non-blocking: report findings, don't fail the run
+
+      - name: Upload Trivy filesystem SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs-results.sarif
+          category: trivy-filesystem
+
+      - name: OWASP Dependency-Check
+        run: |
+          set -euo pipefail
+          mkdir -p dependency-check-data dependency-check-report
+          NVD_ARGS=""
+          if [ -n "${{ secrets.NVD_API_KEY }}" ]; then
+            NVD_ARGS="--nvdApiKey ${{ secrets.NVD_API_KEY }}"
+          fi
+          # Non-blocking (report-only) by default, matching Trivy above —
+          # add --failOnCVSS <n> to NVD_ARGS if you want this to fail the run.
+          docker run --rm \
+            -v "${{ github.workspace }}/source:/src:rw" \
+            -v "${{ github.workspace }}/dependency-check-data:/usr/share/dependency-check/data:rw" \
+            -v "${{ github.workspace }}/dependency-check-report:/report:rw" \
+            owasp/dependency-check:latest \
+            --scan /src \
+            --format HTML --format JSON \
+            --project "${{ inputs.image_name }}" \
+            --out /report \
+            $NVD_ARGS \
+            || echo "Dependency-Check reported findings or a transient error (e.g. NVD rate limit) — see the uploaded report artifact."
+
+      - name: Upload OWASP Dependency-Check report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: dependency-check-report/
+          retention-days: 30
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        continue-on-error: true   # non-blocking: same posture as the other scanners above
+        with:
+          projectBaseDir: source
+          args: >
+            -Dsonar.projectKey=${{ inputs.sonar_project_key }}
+            -Dsonar.sources=.
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # ============================================================
+      # DOCKER BUILD, IMAGE SCAN, PUSH
+      # ============================================================
+      - name: Docker build
+        run: |
+          set -euo pipefail
+          docker build -f "source/${{ inputs.dockerfile_path }}" -t "${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}" source
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}"
+          format: sarif
+          output: trivy-image-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '0'   # non-blocking — see README if you want failed scans to block the push
+
+      - name: Upload Trivy image SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image-results.sarif
+          category: trivy-image
+
+      - name: Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push image
+        run: |
+          set -euo pipefail
+          docker push "${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Build, Scan & Deploy Summary"
+            echo ""
+            echo "- **Platform:** ${{ inputs.platform }} ${{ inputs.version }}"
+            echo "- **Source:** ${{ inputs.repo_url }} (branch \`${{ inputs.branch }}\`)"
+            echo "- **Image:** \`${{ inputs.image_name }}:${{ steps.tag.outputs.tag }}\`"
+            echo ""
+            echo "**Reports:**"
+            echo "- Trivy (filesystem + image): Security tab -> Code scanning alerts"
+            echo "- OWASP Dependency-Check: this run's Artifacts"
+            echo "- SonarQube: your SonarQube server, project \`${{ inputs.sonar_project_key }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
