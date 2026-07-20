@@ -1,4 +1,4 @@
-name: 09 - Velero GKE Restore
+name: Velero GKE Restore
 
 # Place this file at: .github/workflows/09-velero-gke-restore.yml
 #
