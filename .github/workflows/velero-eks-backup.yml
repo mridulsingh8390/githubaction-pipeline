@@ -1,4 +1,4 @@
-name: Velero EKS Backup
+name: 05 - Velero EKS Backup
 
 # Place this file at: .github/workflows/05-velero-eks-backup.yml
 #
@@ -80,7 +80,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: velero-eks-backup-${{ inputs.cluster_name }}
+  group: velero-eks-backup-${{ inputs.aws_region }}-${{ inputs.cluster_name }}
   cancel-in-progress: false
 
 env:
@@ -100,9 +100,13 @@ jobs:
           aws-region: ${{ inputs.aws_region }}
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: "latest"
+        run: |
+          set -euo pipefail
+          KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
