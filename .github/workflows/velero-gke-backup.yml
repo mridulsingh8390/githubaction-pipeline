@@ -1,4 +1,4 @@
-name: 08 - Velero GKE Backup
+name: Velero GKE Backup
 
 # Place this file at: .github/workflows/08-velero-gke-backup.yml
 #
