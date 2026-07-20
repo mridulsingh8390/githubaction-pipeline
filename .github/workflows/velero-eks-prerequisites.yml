@@ -1,4 +1,4 @@
-name: 04 - Velero EKS Prerequisites (Install & Configure)
+name: Velero EKS Prerequisites (Install & Configure)
 
 # Place this file at: .github/workflows/04-velero-eks-prerequisites.yml
 #
