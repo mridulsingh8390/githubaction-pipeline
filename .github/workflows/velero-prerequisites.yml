@@ -1,4 +1,4 @@
-name: 01 - Velero Prerequisites (Install & Configure)
+name: Velero Prerequisites (Install & Configure)
 
 # Place this file at: .github/workflows/01-velero-prerequisites.yml
 #
