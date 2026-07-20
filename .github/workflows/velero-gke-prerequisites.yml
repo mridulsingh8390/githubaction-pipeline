@@ -1,0 +1,295 @@
+name: 07 - Velero GKE Prerequisites (Install & Configure)
+
+# Place this file at: .github/workflows/07-velero-gke-prerequisites.yml
+#
+# Purpose: One-time / re-runnable setup pipeline for GKE + GCS backend.
+#   - Creates GCS bucket (idempotent)
+#   - Installs kubectl / helm / velero CLI / gcloud / jq on the runner
+#   - Installs Velero into the target GKE cluster with the GCP plugin
+#   - Configures BackupStorageLocation (BSL) against GCS
+#   - Wires auth via GKE Workload Identity (preferred) or a Service
+#     Account JSON key (fallback)
+#
+# Required GitHub Secrets:
+#   GCP_WORKLOAD_IDENTITY_PROVIDER  - full resource name of the WIF provider
+#                                     used by google-github-actions/auth for
+#                                     the RUNNER's own gcloud commands
+#   GCP_SERVICE_ACCOUNT             - email of the GSA the runner impersonates
+#                                     (needs GKE/IAM/Storage admin rights to
+#                                     run this pipeline)
+#
+# Only required if auth_method = service_account_key:
+#   VELERO_GCP_SA_KEY_BASE64  - base64-encoded JSON key for the Velero GSA
+#
+# NOTE (Workload Identity timing): same pattern as AKS/EKS -- the GSA,
+# bucket IAM binding, and WI binding are created first, Velero is
+# installed with --no-secret, THEN the Kubernetes service account is
+# annotated with the GSA email and the deployment is restarted.
+#
+# NOTE: enabling Workload Identity on an EXISTING cluster
+# (`gcloud container clusters update --workload-pool=...`) triggers a
+# node pool upgrade/recreation. For clusters already running workloads,
+# consider enabling Workload Identity ahead of time during a maintenance
+# window instead of relying on this pipeline to do it inline.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gcp_project_id:
+        description: "GCP project ID containing the GKE cluster and bucket"
+        required: true
+        type: string
+      gke_cluster_name:
+        description: "GKE cluster name to install Velero into"
+        required: true
+        type: string
+      gke_location:
+        description: "GKE cluster location (zone e.g. us-central1-a, or region e.g. us-central1)"
+        required: true
+        type: string
+      gke_location_type:
+        description: "Whether gke_location is a zone or a region"
+        required: true
+        type: choice
+        options:
+          - zone
+          - region
+        default: zone
+      gcs_bucket:
+        description: "GCS bucket name for Velero backups (must be globally unique)"
+        required: true
+        type: string
+      velero_namespace:
+        description: "Kubernetes namespace to install Velero into"
+        required: true
+        default: "velero"
+        type: string
+      auth_method:
+        description: "How Velero authenticates to GCS"
+        required: true
+        type: choice
+        options:
+          - workload_identity
+          - service_account_key
+        default: workload_identity
+      velero_plugin_version:
+        description: "velero-plugin-for-gcp image tag"
+        required: true
+        default: "v1.10.1"
+        type: string
+      velero_version:
+        description: "Velero CLI/server version -- MUST match backup/restore pipelines"
+        required: true
+        default: "v1.14.1"
+        type: string
+      enable_node_agent:
+        description: "Install node-agent (for filesystem backup / non-CSI PV data)"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write   # needed for google-github-actions/auth OIDC/WIF
+  contents: read
+
+concurrency:
+  group: velero-gke-prereq-${{ inputs.gke_cluster_name }}
+  cancel-in-progress: false
+
+env:
+  PROJECT: ${{ inputs.gcp_project_id }}
+  CLUSTER: ${{ inputs.gke_cluster_name }}
+  LOCATION: ${{ inputs.gke_location }}
+  BUCKET: ${{ inputs.gcs_bucket }}
+  VELERO_NS: ${{ inputs.velero_namespace }}
+
+jobs:
+  prerequisites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (Workload Identity Federation)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.gcp_project_id }}
+
+      - name: Install gke-gcloud-auth-plugin
+        run: gcloud components install gke-gcloud-auth-plugin --quiet
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "latest"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "latest"
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Install Velero CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL -o velero.tar.gz \
+            "https://github.com/vmware-tanzu/velero/releases/download/${{ inputs.velero_version }}/velero-${{ inputs.velero_version }}-linux-amd64.tar.gz"
+          tar -xzf velero.tar.gz
+          sudo mv velero-${{ inputs.velero_version }}-linux-amd64/velero /usr/local/bin/velero
+          velero version --client-only
+
+      - name: Ensure GCS bucket exists
+        run: |
+          if ! gcloud storage buckets describe "gs://${BUCKET}" >/dev/null 2>&1; then
+            gcloud storage buckets create "gs://${BUCKET}" \
+              --project "$PROJECT" \
+              --location "$LOCATION" \
+              --uniform-bucket-level-access
+          fi
+
+      - name: Get GKE credentials
+        run: |
+          if [ "${{ inputs.gke_location_type }}" = "region" ]; then
+            gcloud container clusters get-credentials "$CLUSTER" --region "$LOCATION" --project "$PROJECT"
+          else
+            gcloud container clusters get-credentials "$CLUSTER" --zone "$LOCATION" --project "$PROJECT"
+          fi
+          kubectl create namespace "$VELERO_NS" --dry-run=client -o yaml | kubectl apply -f -
+
+      # ---------------------------------------------------------------
+      # AUTH METHOD A: Workload Identity (preferred)
+      # ---------------------------------------------------------------
+      - name: "[Workload Identity] Ensure Workload Identity is enabled on cluster"
+        if: inputs.auth_method == 'workload_identity'
+        run: |
+          WI_POOL=$(gcloud container clusters describe "$CLUSTER" \
+            --project "$PROJECT" \
+            $( [ "${{ inputs.gke_location_type }}" = "region" ] && echo "--region $LOCATION" || echo "--zone $LOCATION" ) \
+            --format="value(workloadIdentityConfig.workloadPool)")
+
+          if [ -z "$WI_POOL" ]; then
+            echo "::warning::Workload Identity is not enabled on $CLUSTER. Attempting to enable it now (this can trigger a node pool upgrade)."
+            gcloud container clusters update "$CLUSTER" \
+              --project "$PROJECT" \
+              $( [ "${{ inputs.gke_location_type }}" = "region" ] && echo "--region $LOCATION" || echo "--zone $LOCATION" ) \
+              --workload-pool="${PROJECT}.svc.id.goog"
+          fi
+
+      - name: "[Workload Identity] Create/reuse Google Service Account"
+        if: inputs.auth_method == 'workload_identity'
+        run: |
+          GSA_NAME="velero-gsa-${CLUSTER}"
+          GSA_EMAIL="${GSA_NAME}@${PROJECT}.iam.gserviceaccount.com"
+
+          gcloud iam service-accounts describe "$GSA_EMAIL" >/dev/null 2>&1 || \
+            gcloud iam service-accounts create "$GSA_NAME" \
+              --project "$PROJECT" \
+              --display-name "Velero backup GSA for ${CLUSTER}"
+
+          echo "GSA_EMAIL=$GSA_EMAIL" >> "$GITHUB_ENV"
+
+      - name: "[Workload Identity] Grant GSA storage access on bucket"
+        if: inputs.auth_method == 'workload_identity'
+        run: |
+          gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+            --member="serviceAccount:${GSA_EMAIL}" \
+            --role="roles/storage.objectAdmin"
+
+      - name: "[Workload Identity] Bind Kubernetes SA to GSA via Workload Identity"
+        if: inputs.auth_method == 'workload_identity'
+        run: |
+          gcloud iam service-accounts add-iam-policy-binding "$GSA_EMAIL" \
+            --project "$PROJECT" \
+            --role="roles/iam.workloadIdentityUser" \
+            --member="serviceAccount:${PROJECT}.svc.id.goog[${VELERO_NS}/velero]"
+
+      # ---------------------------------------------------------------
+      # AUTH METHOD B: Service Account Key (fallback / simple lab setup)
+      # ---------------------------------------------------------------
+      - name: "[Service Account Key] Decode key and validate access"
+        if: inputs.auth_method == 'service_account_key'
+        run: |
+          echo "${{ secrets.VELERO_GCP_SA_KEY_BASE64 }}" | base64 -d > gcp-credentials.json
+          gcloud auth activate-service-account --key-file=gcp-credentials.json
+          if ! gcloud storage buckets describe "gs://${BUCKET}" --impersonate-service-account="$(jq -r .client_email gcp-credentials.json)" >/dev/null 2>&1; then
+            echo "::warning::Could not confirm bucket access via impersonation check; continuing -- verify the key's SA has roles/storage.objectAdmin on ${BUCKET}."
+          fi
+          # Re-auth as the runner's own identity for subsequent gcloud/kubectl calls
+          gcloud auth login --brief --cred-file="${GOOGLE_GHA_CREDS_PATH}" || true
+
+      # ---------------------------------------------------------------
+      # Install Velero
+      # ---------------------------------------------------------------
+      - name: Install Velero (Workload Identity)
+        if: inputs.auth_method == 'workload_identity'
+        run: |
+          NODE_AGENT_FLAG=""
+          if [ "${{ inputs.enable_node_agent }}" = "true" ]; then NODE_AGENT_FLAG="--use-node-agent"; fi
+
+          velero install \
+            --namespace "$VELERO_NS" \
+            --provider gcp \
+            --plugins velero/velero-plugin-for-gcp:${{ inputs.velero_plugin_version }} \
+            --bucket "$BUCKET" \
+            --no-secret \
+            $NODE_AGENT_FLAG \
+            --wait
+
+          kubectl annotate serviceaccount velero \
+            -n "$VELERO_NS" \
+            iam.gke.io/gcp-service-account="$GSA_EMAIL" --overwrite
+
+          kubectl rollout restart deployment velero -n "$VELERO_NS"
+          kubectl rollout status deployment velero -n "$VELERO_NS" --timeout=180s
+
+      - name: Install Velero (Service Account Key)
+        if: inputs.auth_method == 'service_account_key'
+        run: |
+          NODE_AGENT_FLAG=""
+          if [ "${{ inputs.enable_node_agent }}" = "true" ]; then NODE_AGENT_FLAG="--use-node-agent"; fi
+
+          velero install \
+            --namespace "$VELERO_NS" \
+            --provider gcp \
+            --plugins velero/velero-plugin-for-gcp:${{ inputs.velero_plugin_version }} \
+            --bucket "$BUCKET" \
+            --secret-file ./gcp-credentials.json \
+            $NODE_AGENT_FLAG \
+            --wait
+
+      - name: Validate Velero install
+        run: |
+          echo "== Pods in $VELERO_NS =="
+          kubectl get pods -n "$VELERO_NS" -o wide
+
+          echo "== Velero CRDs =="
+          kubectl get crd backups.velero.io restores.velero.io backupstoragelocations.velero.io
+
+          echo "== BackupStorageLocation status =="
+          for i in $(seq 1 10); do
+            STATUS=$(velero backup-location get -n "$VELERO_NS" -o json | jq -r '.items[0].status.phase' 2>/dev/null || echo "")
+            echo "Attempt $i: BSL status = $STATUS"
+            if [ "$STATUS" = "Available" ]; then break; fi
+            sleep 10
+          done
+
+          velero backup-location get -n "$VELERO_NS"
+
+          if [ "$STATUS" != "Available" ]; then
+            echo "::error::BackupStorageLocation did not reach Available state"
+            kubectl logs -n "$VELERO_NS" deployment/velero --tail=200
+            exit 1
+          fi
+
+      - name: Cleanup local secrets
+        if: always()
+        run: rm -f gcp-credentials.json

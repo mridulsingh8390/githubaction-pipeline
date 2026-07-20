@@ -1,0 +1,321 @@
+name: 04 - Velero EKS Prerequisites (Install & Configure)
+
+# Place this file at: .github/workflows/04-velero-eks-prerequisites.yml
+#
+# Purpose: One-time / re-runnable setup pipeline for EKS + S3 backend.
+#   - Creates S3 bucket (idempotent)
+#   - Installs kubectl / helm / velero CLI / eksctl / jq on the runner
+#   - Installs Velero into the target EKS cluster with the AWS plugin
+#   - Configures BackupStorageLocation (BSL) against S3
+#   - Wires auth via IRSA (preferred) or static IAM user credentials (fallback)
+#
+# Required GitHub Secrets:
+#   AWS_ROLE_TO_ASSUME     - IAM role ARN the GitHub Actions runner assumes via OIDC
+#                            (needs EKS/IAM/S3 admin rights to run this pipeline)
+#
+# Only required if auth_method = static_credentials:
+#   VELERO_AWS_ACCESS_KEY_ID
+#   VELERO_AWS_SECRET_ACCESS_KEY
+#
+# NOTE (IRSA timing): same pattern as the AKS pipeline -- the IAM role +
+# trust policy are created first, Velero is installed with --no-secret,
+# THEN the service account is annotated with the role ARN and the
+# deployment is restarted. This avoids `velero install` clobbering a
+# pre-annotated service account.
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS region of the EKS cluster and S3 bucket"
+        required: true
+        default: "us-east-1"
+        type: string
+      cluster_name:
+        description: "EKS cluster name to install Velero into"
+        required: true
+        type: string
+      s3_bucket:
+        description: "S3 bucket name for Velero backups (must be globally unique)"
+        required: true
+        type: string
+      velero_namespace:
+        description: "Kubernetes namespace to install Velero into"
+        required: true
+        default: "velero"
+        type: string
+      auth_method:
+        description: "How Velero authenticates to S3"
+        required: true
+        type: choice
+        options:
+          - irsa
+          - static_credentials
+        default: irsa
+      velero_plugin_version:
+        description: "velero-plugin-for-aws image tag"
+        required: true
+        default: "v1.10.1"
+        type: string
+      velero_version:
+        description: "Velero CLI/server version -- MUST match backup/restore pipelines"
+        required: true
+        default: "v1.14.1"
+        type: string
+      enable_node_agent:
+        description: "Install node-agent (for filesystem backup / non-CSI PV data)"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write   # needed for aws-actions/configure-aws-credentials OIDC
+  contents: read
+
+concurrency:
+  group: velero-eks-prereq-${{ inputs.cluster_name }}
+  cancel-in-progress: false
+
+env:
+  REGION: ${{ inputs.aws_region }}
+  CLUSTER: ${{ inputs.cluster_name }}
+  BUCKET: ${{ inputs.s3_bucket }}
+  VELERO_NS: ${{ inputs.velero_namespace }}
+
+jobs:
+  prerequisites:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "latest"
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: "latest"
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Install eksctl
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" -o eksctl.tar.gz
+          tar -xzf eksctl.tar.gz
+          sudo mv eksctl /usr/local/bin/eksctl
+          eksctl version
+
+      - name: Install Velero CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL -o velero.tar.gz \
+            "https://github.com/vmware-tanzu/velero/releases/download/${{ inputs.velero_version }}/velero-${{ inputs.velero_version }}-linux-amd64.tar.gz"
+          tar -xzf velero.tar.gz
+          sudo mv velero-${{ inputs.velero_version }}-linux-amd64/velero /usr/local/bin/velero
+          velero version --client-only
+
+      - name: Ensure S3 bucket exists
+        run: |
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            if [ "$REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+                --create-bucket-configuration LocationConstraint="$REGION"
+            fi
+            aws s3api put-bucket-versioning --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+            aws s3api put-public-access-block --bucket "$BUCKET" \
+              --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          fi
+
+      - name: Get EKS credentials
+        run: |
+          aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER"
+          kubectl create namespace "$VELERO_NS" --dry-run=client -o yaml | kubectl apply -f -
+
+      # ---------------------------------------------------------------
+      # AUTH METHOD A: IRSA (IAM Roles for Service Accounts) -- preferred
+      # ---------------------------------------------------------------
+      - name: "[IRSA] Associate IAM OIDC provider with cluster"
+        if: inputs.auth_method == 'irsa'
+        run: |
+          eksctl utils associate-iam-oidc-provider --cluster "$CLUSTER" --region "$REGION" --approve
+
+      - name: "[IRSA] Create/reuse IAM policy for S3 bucket access"
+        if: inputs.auth_method == 'irsa'
+        run: |
+          POLICY_NAME="velero-s3-policy-${CLUSTER}"
+          cat > velero-s3-policy.json << POLICYEOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Action": ["ec2:DescribeSnapshots", "ec2:DescribeVolumes", "ec2:CreateSnapshot", "ec2:DeleteSnapshot", "ec2:CreateTags"],
+                "Resource": "*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:DeleteObject", "s3:PutObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+                "Resource": "arn:aws:s3:::${BUCKET}/*"
+              },
+              {
+                "Effect": "Allow",
+                "Action": ["s3:ListBucket"],
+                "Resource": "arn:aws:s3:::${BUCKET}"
+              }
+            ]
+          }
+          POLICYEOF
+
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          POLICY_ARN="arn:aws:iam::${ACCOUNT_ID}:policy/${POLICY_NAME}"
+
+          if ! aws iam get-policy --policy-arn "$POLICY_ARN" >/dev/null 2>&1; then
+            aws iam create-policy --policy-name "$POLICY_NAME" --policy-document file://velero-s3-policy.json
+          fi
+          echo "POLICY_ARN=$POLICY_ARN" >> "$GITHUB_ENV"
+
+      - name: "[IRSA] Create IAM role trusted by cluster OIDC provider"
+        if: inputs.auth_method == 'irsa'
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          OIDC_ISSUER=$(aws eks describe-cluster --name "$CLUSTER" --region "$REGION" --query "cluster.identity.oidc.issuer" --output text)
+          OIDC_HOST=$(echo "$OIDC_ISSUER" | sed 's|https://||')
+          ROLE_NAME="velero-irsa-role-${CLUSTER}"
+
+          cat > trust-policy.json << TRUSTEOF
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Federated": "arn:aws:iam::${ACCOUNT_ID}:oidc-provider/${OIDC_HOST}"
+                },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "${OIDC_HOST}:sub": "system:serviceaccount:${VELERO_NS}:velero",
+                    "${OIDC_HOST}:aud": "sts.amazonaws.com"
+                  }
+                }
+              }
+            ]
+          }
+          TRUSTEOF
+
+          if aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            aws iam update-assume-role-policy --role-name "$ROLE_NAME" --policy-document file://trust-policy.json
+          else
+            aws iam create-role --role-name "$ROLE_NAME" --assume-role-policy-document file://trust-policy.json
+          fi
+
+          aws iam attach-role-policy --role-name "$ROLE_NAME" --policy-arn "$POLICY_ARN"
+          echo "ROLE_ARN=arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # AUTH METHOD B: Static IAM user credentials (fallback / simple lab setup)
+      # ---------------------------------------------------------------
+      - name: "[Static Credentials] Write credentials-velero file"
+        if: inputs.auth_method == 'static_credentials'
+        run: |
+          cat <<EOF > credentials-velero
+          [default]
+          aws_access_key_id=${{ secrets.VELERO_AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key=${{ secrets.VELERO_AWS_SECRET_ACCESS_KEY }}
+          EOF
+
+      - name: "[Static Credentials] Validate IAM user has S3 access"
+        if: inputs.auth_method == 'static_credentials'
+        run: |
+          export AWS_ACCESS_KEY_ID="${{ secrets.VELERO_AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.VELERO_AWS_SECRET_ACCESS_KEY }}"
+          if ! aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" 2>/dev/null; then
+            echo "::error::VELERO_AWS_ACCESS_KEY_ID/SECRET cannot access bucket $BUCKET. Grant s3:GetObject/PutObject/DeleteObject/ListBucket on it."
+            exit 1
+          fi
+          echo "Static credentials confirmed access to bucket."
+
+      # ---------------------------------------------------------------
+      # Install Velero
+      # ---------------------------------------------------------------
+      - name: Install Velero (IRSA)
+        if: inputs.auth_method == 'irsa'
+        run: |
+          NODE_AGENT_FLAG=""
+          if [ "${{ inputs.enable_node_agent }}" = "true" ]; then NODE_AGENT_FLAG="--use-node-agent"; fi
+
+          velero install \
+            --namespace "$VELERO_NS" \
+            --provider aws \
+            --plugins velero/velero-plugin-for-aws:${{ inputs.velero_plugin_version }} \
+            --bucket "$BUCKET" \
+            --backup-location-config region="$REGION" \
+            --no-secret \
+            $NODE_AGENT_FLAG \
+            --wait
+
+          kubectl annotate serviceaccount velero \
+            -n "$VELERO_NS" \
+            eks.amazonaws.com/role-arn="$ROLE_ARN" --overwrite
+
+          kubectl rollout restart deployment velero -n "$VELERO_NS"
+          kubectl rollout status deployment velero -n "$VELERO_NS" --timeout=180s
+
+      - name: Install Velero (Static Credentials)
+        if: inputs.auth_method == 'static_credentials'
+        run: |
+          NODE_AGENT_FLAG=""
+          if [ "${{ inputs.enable_node_agent }}" = "true" ]; then NODE_AGENT_FLAG="--use-node-agent"; fi
+
+          velero install \
+            --namespace "$VELERO_NS" \
+            --provider aws \
+            --plugins velero/velero-plugin-for-aws:${{ inputs.velero_plugin_version }} \
+            --bucket "$BUCKET" \
+            --secret-file ./credentials-velero \
+            --backup-location-config region="$REGION" \
+            $NODE_AGENT_FLAG \
+            --wait
+
+      - name: Validate Velero install
+        run: |
+          echo "== Pods in $VELERO_NS =="
+          kubectl get pods -n "$VELERO_NS" -o wide
+
+          echo "== Velero CRDs =="
+          kubectl get crd backups.velero.io restores.velero.io backupstoragelocations.velero.io
+
+          echo "== BackupStorageLocation status =="
+          for i in $(seq 1 10); do
+            STATUS=$(velero backup-location get -n "$VELERO_NS" -o json | jq -r '.items[0].status.phase' 2>/dev/null || echo "")
+            echo "Attempt $i: BSL status = $STATUS"
+            if [ "$STATUS" = "Available" ]; then break; fi
+            sleep 10
+          done
+
+          velero backup-location get -n "$VELERO_NS"
+
+          if [ "$STATUS" != "Available" ]; then
+            echo "::error::BackupStorageLocation did not reach Available state"
+            kubectl logs -n "$VELERO_NS" deployment/velero --tail=200
+            exit 1
+          fi
+
+      - name: Cleanup local secrets
+        if: always()
+        run: rm -f credentials-velero trust-policy.json velero-s3-policy.json
