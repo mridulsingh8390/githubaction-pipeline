@@ -1,4 +1,4 @@
-name: 07 - Velero GKE Prerequisites (Install & Configure)
+name: Velero GKE Prerequisites (Install & Configure)
 
 # Place this file at: .github/workflows/07-velero-gke-prerequisites.yml
 #
