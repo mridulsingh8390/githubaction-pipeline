@@ -9,6 +9,10 @@ name: Velero Backup
 #
 # Required GitHub Secrets:
 #   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID  (OIDC login)
+#
+# IMPORTANT: velero_version default below must match what was used to
+# install Velero in 01-velero-prerequisites.yml (CLI/server skew across
+# minor versions can cause subtle API incompatibilities).
 
 on:
   workflow_dispatch:
@@ -22,13 +26,18 @@ on:
         required: true
         type: string
       namespace:
-        description: "Namespace to back up. Use '*' for ALL namespaces, or comma-separated list (ns1,ns2)"
+        description: "Namespace(s) to back up. Use '*' for ALL namespaces, or comma-separated list (ns1,ns2 -- no spaces needed, they'll be stripped)"
         required: true
         type: string
       velero_namespace:
         description: "Namespace where Velero is installed"
         required: true
         default: "velero"
+        type: string
+      velero_version:
+        description: "Velero CLI version -- keep in sync with prerequisites pipeline"
+        required: true
+        default: "v1.14.1"
         type: string
       backup_name:
         description: "Optional backup name. Leave blank to auto-generate (backup-<ns>-<run>-<timestamp>)"
@@ -40,10 +49,23 @@ on:
         default: "720h0m0s"
         type: string
       snapshot_volumes:
-        description: "Snapshot PV volumes as part of backup"
+        description: "Snapshot PV volumes as part of backup (CSI/native snapshots)"
         required: true
         type: boolean
         default: true
+      default_volumes_to_fs_backup:
+        description: "Use Velero File System Backup (node-agent) for all volumes instead of snapshots"
+        required: true
+        type: boolean
+        default: false
+      include_resources:
+        description: "Optional: comma-separated resource types to INCLUDE (e.g. deployments,services). Leave blank for all"
+        required: false
+        type: string
+      exclude_resources:
+        description: "Optional: comma-separated resource types to EXCLUDE (e.g. events,events.events.k8s.io). Leave blank for none"
+        required: false
+        type: string
       wait_for_completion:
         description: "Block the pipeline until the backup finishes"
         required: true
@@ -54,6 +76,10 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: velero-backup-${{ inputs.resource_group }}-${{ inputs.aks_name }}
+  cancel-in-progress: false
+
 env:
   RG: ${{ inputs.resource_group }}
   AKS: ${{ inputs.aks_name }}
@@ -62,6 +88,7 @@ env:
 jobs:
   backup:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -75,10 +102,13 @@ jobs:
         with:
           version: "latest"
 
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Install Velero CLI
         run: |
           set -euo pipefail
-          VERSION="v1.14.1"
+          VERSION="${{ inputs.velero_version }}"
           curl -fsSL -o velero.tar.gz \
             "https://github.com/vmware-tanzu/velero/releases/download/${VERSION}/velero-${VERSION}-linux-amd64.tar.gz"
           tar -xzf velero.tar.gz
@@ -88,8 +118,9 @@ jobs:
       - name: Get AKS credentials
         run: az aks get-credentials -g "$RG" -n "$AKS" --overwrite-existing
 
-      - name: Verify Velero is healthy before backing up
+      - name: Verify Velero CRDs and health before backing up
         run: |
+          kubectl get crd backups.velero.io restores.velero.io backupstoragelocations.velero.io
           kubectl get pods -n "$VELERO_NS"
           PHASE=$(velero backup-location get -n "$VELERO_NS" -o json | jq -r '.items[0].status.phase')
           echo "BSL phase: $PHASE"
@@ -98,10 +129,12 @@ jobs:
             exit 1
           fi
 
-      - name: Compute backup name and namespace flag
+      - name: Compute backup name and flags
         id: vars
         run: |
-          NS="${{ inputs.namespace }}"
+          # Sanitize namespace input: strip all whitespace so "ns1, ns2" -> "ns1,ns2"
+          NS=$(echo "${{ inputs.namespace }}" | tr -d '[:space:]')
+
           if [ -z "${{ inputs.backup_name }}" ]; then
             SAFE_NS=$(echo "$NS" | tr -c 'a-zA-Z0-9-' '-' | tr 'A-Z' 'a-z')
             NAME="backup-${SAFE_NS}-${{ github.run_number }}-$(date -u +%Y%m%d%H%M%S)"
@@ -116,6 +149,21 @@ jobs:
             echo "ns_flag=--include-namespaces $NS" >> "$GITHUB_OUTPUT"
           fi
 
+          INCLUDE_RES=$(echo "${{ inputs.include_resources }}" | tr -d '[:space:]')
+          EXCLUDE_RES=$(echo "${{ inputs.exclude_resources }}" | tr -d '[:space:]')
+
+          if [ -n "$INCLUDE_RES" ]; then
+            echo "include_res_flag=--include-resources $INCLUDE_RES" >> "$GITHUB_OUTPUT"
+          else
+            echo "include_res_flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -n "$EXCLUDE_RES" ]; then
+            echo "exclude_res_flag=--exclude-resources $EXCLUDE_RES" >> "$GITHUB_OUTPUT"
+          else
+            echo "exclude_res_flag=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create backup
         run: |
           WAIT_FLAG=""
@@ -124,8 +172,11 @@ jobs:
           velero backup create "${{ steps.vars.outputs.backup_name }}" \
             -n "$VELERO_NS" \
             ${{ steps.vars.outputs.ns_flag }} \
+            ${{ steps.vars.outputs.include_res_flag }} \
+            ${{ steps.vars.outputs.exclude_res_flag }} \
             --ttl "${{ inputs.ttl }}" \
             --snapshot-volumes="${{ inputs.snapshot_volumes }}" \
+            --default-volumes-to-fs-backup="${{ inputs.default_volumes_to_fs_backup }}" \
             $WAIT_FLAG
 
       - name: Describe backup
