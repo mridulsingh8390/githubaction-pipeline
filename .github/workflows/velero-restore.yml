@@ -1,4 +1,4 @@
-name: 03 - Velero Restore
+name: Velero Restore
 
 # Place this file at: .github/workflows/03-velero-restore.yml
 #
