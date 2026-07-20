@@ -1,0 +1,259 @@
+name: 10 - Multi-Cloud Cluster Health (AKS/EKS/GKE)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: "Cloud provider"
+        required: true
+        type: choice
+        options: [aks, eks, gke]
+      cluster_name:
+        description: "Cluster name"
+        required: true
+        type: string
+      location_or_region:
+        description: "AKS: resource group | EKS: region | GKE: zone/region"
+        required: true
+        type: string
+      gcp_project_id:
+        description: "Required only for GKE"
+        required: false
+        type: string
+      gke_location_type:
+        description: "For GKE location input"
+        required: false
+        type: choice
+        options: [zone, region]
+        default: zone
+      velero_namespace:
+        description: "Velero namespace"
+        required: true
+        default: velero
+        type: string
+      fail_on_warning:
+        description: "Fail job on WARN findings"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: cluster-health-${{ inputs.cloud }}-${{ inputs.cluster_name }}-${{ inputs.location_or_region }}
+  cancel-in-progress: false
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CLOUD: ${{ inputs.cloud }}
+      CLUSTER: ${{ inputs.cluster_name }}
+      LOC: ${{ inputs.location_or_region }}
+      GCP_PROJECT: ${{ inputs.gcp_project_id }}
+      GKE_LOC_TYPE: ${{ inputs.gke_location_type }}
+      VELERO_NS: ${{ inputs.velero_namespace }}
+      FAIL_ON_WARNING: ${{ inputs.fail_on_warning }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- Auth ----------
+      - name: Azure login (AKS)
+        if: inputs.cloud == 'aks'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: AWS auth (EKS)
+        if: inputs.cloud == 'eks'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ inputs.location_or_region }}
+
+      - name: GCP auth (GKE)
+        if: inputs.cloud == 'gke'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud (GKE)
+        if: inputs.cloud == 'gke'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.gcp_project_id }}
+
+      - name: Install gke auth plugin (GKE)
+        if: inputs.cloud == 'gke'
+        run: gcloud components install gke-gcloud-auth-plugin --quiet
+
+      # ---------- Tools ----------
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: latest
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Install Velero CLI
+        run: |
+          set -euo pipefail
+          VERSION="v1.14.1"
+          curl -fsSL -o velero.tar.gz \
+            "https://github.com/vmware-tanzu/velero/releases/download/${VERSION}/velero-${VERSION}-linux-amd64.tar.gz"
+          tar -xzf velero.tar.gz
+          sudo mv velero-${VERSION}-linux-amd64/velero /usr/local/bin/velero
+          velero version --client-only
+
+      # ---------- Kubeconfig ----------
+      - name: Get AKS credentials
+        if: inputs.cloud == 'aks'
+        run: az aks get-credentials -g "$LOC" -n "$CLUSTER" --overwrite-existing
+
+      - name: Get EKS credentials
+        if: inputs.cloud == 'eks'
+        run: aws eks update-kubeconfig --region "$LOC" --name "$CLUSTER"
+
+      - name: Get GKE credentials
+        if: inputs.cloud == 'gke'
+        run: |
+          if [ "$GKE_LOC_TYPE" = "region" ]; then
+            gcloud container clusters get-credentials "$CLUSTER" --region "$LOC" --project "$GCP_PROJECT"
+          else
+            gcloud container clusters get-credentials "$CLUSTER" --zone "$LOC" --project "$GCP_PROJECT"
+          fi
+
+      # ---------- Health Checks ----------
+      - name: Run health checks
+        id: checks
+        run: |
+          set +e
+          WARN=0
+          FAIL=0
+
+          mkdir -p reports
+
+          {
+            echo "Cluster Health Report"
+            echo "Date: $(date -u)"
+            echo "Cloud: $CLOUD"
+            echo "Cluster: $CLUSTER"
+            echo "Location/Region/RG: $LOC"
+            echo "======================================"
+          } | tee reports/cluster-summary.txt
+
+          # API + version
+          kubectl version --short >> reports/cluster-summary.txt 2>&1
+          if [ $? -ne 0 ]; then
+            echo "FAIL: Kubernetes API not reachable" | tee -a reports/cluster-summary.txt
+            FAIL=$((FAIL+1))
+          fi
+
+          # Nodes
+          kubectl get nodes -o wide | tee reports/nodes.txt
+          NOT_READY=$(kubectl get nodes --no-headers 2>/dev/null | awk '$2!="Ready"{count++} END{print count+0}')
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "FAIL: $NOT_READY node(s) are not Ready" | tee -a reports/cluster-summary.txt
+            FAIL=$((FAIL+1))
+          fi
+
+          # System pods
+          kubectl get pods -n kube-system -o wide | tee reports/kube-system-pods.txt
+          SYS_BAD=$(kubectl get pods -n kube-system --no-headers 2>/dev/null | awk '$3!="Running" && $3!="Completed"{count++} END{print count+0}')
+          if [ "$SYS_BAD" -gt 0 ]; then
+            echo "WARN: $SYS_BAD kube-system pod(s) not Running/Completed" | tee -a reports/cluster-summary.txt
+            WARN=$((WARN+1))
+          fi
+
+          # Workload issues
+          kubectl get pods -A --field-selector=status.phase=Pending | tee reports/pods-pending.txt
+          kubectl get pods -A | grep -E 'CrashLoopBackOff|Error|ImagePullBackOff' | tee reports/pods-problematic.txt
+          PROB_PODS=$(wc -l < reports/pods-problematic.txt 2>/dev/null)
+          if [ "$PROB_PODS" -gt 0 ]; then
+            echo "WARN: $PROB_PODS problematic pod(s) found" | tee -a reports/cluster-summary.txt
+            WARN=$((WARN+1))
+          fi
+
+          # PVC health
+          kubectl get pvc -A | tee reports/pvc.txt
+          PVC_PENDING=$(kubectl get pvc -A --no-headers 2>/dev/null | awk '$3!="Bound"{count++} END{print count+0}')
+          if [ "$PVC_PENDING" -gt 0 ]; then
+            echo "WARN: $PVC_PENDING PVC(s) not Bound" | tee -a reports/cluster-summary.txt
+            WARN=$((WARN+1))
+          fi
+
+          # Events
+          kubectl get events -A --field-selector type=Warning --sort-by=.lastTimestamp | tail -n 200 | tee reports/warning-events.txt
+          EVT_COUNT=$(wc -l < reports/warning-events.txt 2>/dev/null)
+          if [ "$EVT_COUNT" -gt 50 ]; then
+            echo "WARN: High warning event volume ($EVT_COUNT lines captured)" | tee -a reports/cluster-summary.txt
+            WARN=$((WARN+1))
+          fi
+
+          # Metrics (optional)
+          kubectl top nodes > reports/top-nodes.txt 2>&1
+          if [ $? -ne 0 ]; then
+            echo "WARN: metrics-server not available (kubectl top nodes failed)" | tee -a reports/cluster-summary.txt
+            WARN=$((WARN+1))
+          fi
+
+          # Velero checks (optional)
+          kubectl get ns "$VELERO_NS" >/dev/null 2>&1
+          if [ $? -eq 0 ]; then
+            kubectl get pods -n "$VELERO_NS" | tee reports/velero-pods.txt
+            velero backup-location get -n "$VELERO_NS" -o json > reports/velero-bsl.json 2>/dev/null
+            if [ $? -eq 0 ]; then
+              BSL_PHASE=$(jq -r '.items[0].status.phase // "Unknown"' reports/velero-bsl.json)
+              echo "Velero BSL phase: $BSL_PHASE" | tee reports/velero-health.txt
+              if [ "$BSL_PHASE" != "Available" ]; then
+                echo "FAIL: Velero BSL is not Available ($BSL_PHASE)" | tee -a reports/cluster-summary.txt
+                FAIL=$((FAIL+1))
+              fi
+            else
+              echo "WARN: Unable to read Velero BSL" | tee -a reports/cluster-summary.txt
+              WARN=$((WARN+1))
+            fi
+
+            velero backup get -n "$VELERO_NS" > reports/velero-backups.txt 2>&1
+            velero restore get -n "$VELERO_NS" > reports/velero-restores.txt 2>&1
+          else
+            echo "WARN: Velero namespace '$VELERO_NS' not found (skipping Velero checks)" | tee -a reports/cluster-summary.txt
+            WARN=$((WARN+1))
+          fi
+
+          echo "======================================" | tee -a reports/cluster-summary.txt
+          echo "FAIL_COUNT=$FAIL" | tee -a reports/cluster-summary.txt
+          echo "WARN_COUNT=$WARN" | tee -a reports/cluster-summary.txt
+
+          echo "fail_count=$FAIL" >> "$GITHUB_OUTPUT"
+          echo "warn_count=$WARN" >> "$GITHUB_OUTPUT"
+
+          if [ "$FAIL" -gt 0 ]; then
+            exit 2
+          fi
+          if [ "$WARN" -gt 0 ] && [ "$FAIL_ON_WARNING" = "true" ]; then
+            exit 3
+          fi
+          exit 0
+
+      - name: Upload health artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-health-${{ inputs.cloud }}-${{ inputs.cluster_name }}-${{ github.run_number }}
+          path: reports/
+          retention-days: 14
+
+      - name: Final status summary
+        if: always()
+        run: |
+          echo "Fail count: ${{ steps.checks.outputs.fail_count }}"
+          echo "Warn count: ${{ steps.checks.outputs.warn_count }}"
