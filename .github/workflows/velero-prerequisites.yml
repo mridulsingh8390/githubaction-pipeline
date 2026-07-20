@@ -1,4 +1,4 @@
-name: Velero Prerequisites (Install & Configure)
+name: Velero AKS Prerequisites (Install & Configure)
 
 # Place this file at: .github/workflows/01-velero-prerequisites.yml
 #
