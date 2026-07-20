@@ -14,6 +14,9 @@ name: Velero Restore
 #
 # Tip: run with list_backups_only=true first if you just need to see what
 # backup names are available before choosing one.
+#
+# IMPORTANT: velero_version default below must match what was used to
+# install Velero in 01-velero-prerequisites.yml.
 
 on:
   workflow_dispatch:
@@ -30,6 +33,11 @@ on:
         description: "Namespace where Velero is installed on this cluster"
         required: true
         default: "velero"
+        type: string
+      velero_version:
+        description: "Velero CLI version -- keep in sync with prerequisites pipeline"
+        required: true
+        default: "v1.14.1"
         type: string
       list_backups_only:
         description: "If true, just list available backups and exit (no restore performed)"
@@ -53,6 +61,19 @@ on:
         required: true
         type: boolean
         default: true
+      existing_resource_policy:
+        description: "How to handle resources that already exist on the target cluster"
+        required: true
+        type: choice
+        options:
+          - none
+          - update
+        default: none
+      preserve_nodeports:
+        description: "Preserve original NodePort values on Services during restore"
+        required: true
+        type: boolean
+        default: false
       wait_for_completion:
         description: "Block the pipeline until the restore finishes"
         required: true
@@ -63,6 +84,10 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: velero-restore-${{ inputs.resource_group }}-${{ inputs.aks_name }}
+  cancel-in-progress: false
+
 env:
   RG: ${{ inputs.resource_group }}
   AKS: ${{ inputs.aks_name }}
@@ -71,6 +96,7 @@ env:
 jobs:
   restore:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Azure login (OIDC)
         uses: azure/login@v2
@@ -84,10 +110,13 @@ jobs:
         with:
           version: "latest"
 
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Install Velero CLI
         run: |
           set -euo pipefail
-          VERSION="v1.14.1"
+          VERSION="${{ inputs.velero_version }}"
           curl -fsSL -o velero.tar.gz \
             "https://github.com/vmware-tanzu/velero/releases/download/${VERSION}/velero-${VERSION}-linux-amd64.tar.gz"
           tar -xzf velero.tar.gz
@@ -97,8 +126,9 @@ jobs:
       - name: Get AKS credentials (target cluster for restore)
         run: az aks get-credentials -g "$RG" -n "$AKS" --overwrite-existing
 
-      - name: Verify Velero is healthy on this cluster
+      - name: Verify Velero CRDs and health on this cluster
         run: |
+          kubectl get crd backups.velero.io restores.velero.io backupstoragelocations.velero.io
           kubectl get pods -n "$VELERO_NS"
           PHASE=$(velero backup-location get -n "$VELERO_NS" -o json | jq -r '.items[0].status.phase')
           echo "BSL phase: $PHASE"
@@ -113,7 +143,7 @@ jobs:
       - name: Stop here if list-only mode
         if: inputs.list_backups_only == true
         run: |
-          echo "list_backups_only=true — exiting after listing backups. No restore performed."
+          echo "list_backups_only=true -- exiting after listing backups. No restore performed."
           exit 0
 
       - name: Validate backup_name was provided
@@ -148,10 +178,17 @@ jobs:
           fi
           echo "restore_name=$NAME" >> "$GITHUB_OUTPUT"
 
-          if [ -n "${{ inputs.namespace_mapping }}" ]; then
-            echo "ns_map_flag=--namespace-mappings ${{ inputs.namespace_mapping }}" >> "$GITHUB_OUTPUT"
+          NSMAP=$(echo "${{ inputs.namespace_mapping }}" | tr -d '[:space:]')
+          if [ -n "$NSMAP" ]; then
+            echo "ns_map_flag=--namespace-mappings $NSMAP" >> "$GITHUB_OUTPUT"
           else
             echo "ns_map_flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "${{ inputs.preserve_nodeports }}" = "true" ]; then
+            echo "nodeport_flag=--preserve-nodeports" >> "$GITHUB_OUTPUT"
+          else
+            echo "nodeport_flag=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create restore
@@ -164,7 +201,9 @@ jobs:
             -n "$VELERO_NS" \
             --from-backup "${{ inputs.backup_name }}" \
             ${{ steps.vars.outputs.ns_map_flag }} \
+            ${{ steps.vars.outputs.nodeport_flag }} \
             --restore-volumes="${{ inputs.restore_volumes }}" \
+            --existing-resource-policy="${{ inputs.existing_resource_policy }}" \
             $WAIT_FLAG
 
       - name: Describe restore
