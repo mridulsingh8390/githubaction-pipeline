@@ -1,0 +1,163 @@
+name: 02 - Velero Backup
+
+# Place this file at: .github/workflows/02-velero-backup.yml
+#
+# Purpose: On-demand backup pipeline.
+#   - User selects Resource Group + AKS cluster + namespace(s)
+#   - Triggers a Velero backup against the pre-configured BSL (Azure Blob)
+#   - Waits for completion, validates phase, publishes logs as an artifact
+#
+# Required GitHub Secrets:
+#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID  (OIDC login)
+
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: "Resource Group of the AKS cluster to back up"
+        required: true
+        type: string
+      aks_name:
+        description: "AKS cluster name to back up"
+        required: true
+        type: string
+      namespace:
+        description: "Namespace to back up. Use '*' for ALL namespaces, or comma-separated list (ns1,ns2)"
+        required: true
+        type: string
+      velero_namespace:
+        description: "Namespace where Velero is installed"
+        required: true
+        default: "velero"
+        type: string
+      backup_name:
+        description: "Optional backup name. Leave blank to auto-generate (backup-<ns>-<run>-<timestamp>)"
+        required: false
+        type: string
+      ttl:
+        description: "Backup retention (Go duration, e.g. 720h0m0s = 30 days)"
+        required: true
+        default: "720h0m0s"
+        type: string
+      snapshot_volumes:
+        description: "Snapshot PV volumes as part of backup"
+        required: true
+        type: boolean
+        default: true
+      wait_for_completion:
+        description: "Block the pipeline until the backup finishes"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RG: ${{ inputs.resource_group }}
+  AKS: ${{ inputs.aks_name }}
+  VELERO_NS: ${{ inputs.velero_namespace }}
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "latest"
+
+      - name: Install Velero CLI
+        run: |
+          set -euo pipefail
+          VERSION="v1.14.1"
+          curl -fsSL -o velero.tar.gz \
+            "https://github.com/vmware-tanzu/velero/releases/download/${VERSION}/velero-${VERSION}-linux-amd64.tar.gz"
+          tar -xzf velero.tar.gz
+          sudo mv velero-${VERSION}-linux-amd64/velero /usr/local/bin/velero
+          velero version --client-only
+
+      - name: Get AKS credentials
+        run: az aks get-credentials -g "$RG" -n "$AKS" --overwrite-existing
+
+      - name: Verify Velero is healthy before backing up
+        run: |
+          kubectl get pods -n "$VELERO_NS"
+          PHASE=$(velero backup-location get -n "$VELERO_NS" -o json | jq -r '.items[0].status.phase')
+          echo "BSL phase: $PHASE"
+          if [ "$PHASE" != "Available" ]; then
+            echo "::error::BackupStorageLocation is not Available (phase=$PHASE). Run the prerequisites pipeline first."
+            exit 1
+          fi
+
+      - name: Compute backup name and namespace flag
+        id: vars
+        run: |
+          NS="${{ inputs.namespace }}"
+          if [ -z "${{ inputs.backup_name }}" ]; then
+            SAFE_NS=$(echo "$NS" | tr -c 'a-zA-Z0-9-' '-' | tr 'A-Z' 'a-z')
+            NAME="backup-${SAFE_NS}-${{ github.run_number }}-$(date -u +%Y%m%d%H%M%S)"
+          else
+            NAME="${{ inputs.backup_name }}"
+          fi
+          echo "backup_name=$NAME" >> "$GITHUB_OUTPUT"
+
+          if [ "$NS" = "*" ]; then
+            echo "ns_flag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "ns_flag=--include-namespaces $NS" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create backup
+        run: |
+          WAIT_FLAG=""
+          if [ "${{ inputs.wait_for_completion }}" = "true" ]; then WAIT_FLAG="--wait"; fi
+
+          velero backup create "${{ steps.vars.outputs.backup_name }}" \
+            -n "$VELERO_NS" \
+            ${{ steps.vars.outputs.ns_flag }} \
+            --ttl "${{ inputs.ttl }}" \
+            --snapshot-volumes="${{ inputs.snapshot_volumes }}" \
+            $WAIT_FLAG
+
+      - name: Describe backup
+        if: always()
+        run: |
+          velero backup describe "${{ steps.vars.outputs.backup_name }}" -n "$VELERO_NS" --details \
+            | tee backup-describe.txt
+
+      - name: Fetch backup logs
+        if: always()
+        run: |
+          velero backup logs "${{ steps.vars.outputs.backup_name }}" -n "$VELERO_NS" > backup-logs.txt 2>&1 || true
+
+      - name: Fail pipeline if backup did not complete
+        if: inputs.wait_for_completion == true
+        run: |
+          PHASE=$(velero backup get "${{ steps.vars.outputs.backup_name }}" -n "$VELERO_NS" -o json | jq -r '.status.phase')
+          echo "Final backup phase: $PHASE"
+          if [ "$PHASE" != "Completed" ] && [ "$PHASE" != "PartiallyFailed" ]; then
+            echo "::error::Backup ${{ steps.vars.outputs.backup_name }} did not complete (phase=$PHASE)"
+            exit 1
+          fi
+          if [ "$PHASE" = "PartiallyFailed" ]; then
+            echo "::warning::Backup completed with some failures. Review backup-logs.txt"
+          fi
+
+      - name: Upload backup artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: velero-backup-${{ steps.vars.outputs.backup_name }}
+          path: |
+            backup-describe.txt
+            backup-logs.txt
+          retention-days: 30
