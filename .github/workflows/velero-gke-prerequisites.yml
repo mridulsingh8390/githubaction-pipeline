@@ -93,7 +93,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: velero-gke-prereq-${{ inputs.gke_cluster_name }}
+  group: velero-gke-prereq-${{ inputs.gcp_project_id }}-${{ inputs.gke_cluster_name }}
   cancel-in-progress: false
 
 env:
@@ -126,9 +126,13 @@ jobs:
         run: gcloud components install gke-gcloud-auth-plugin --quiet
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: "latest"
+        run: |
+          set -euo pipefail
+          KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -200,31 +204,67 @@ jobs:
       - name: "[Workload Identity] Grant GSA storage access on bucket"
         if: inputs.auth_method == 'workload_identity'
         run: |
-          gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
-            --member="serviceAccount:${GSA_EMAIL}" \
-            --role="roles/storage.objectAdmin"
+          set -euo pipefail
+          for i in $(seq 1 5); do
+            if gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+                --member="serviceAccount:${GSA_EMAIL}" \
+                --role="roles/storage.objectAdmin"; then
+              break
+            fi
+            echo "Retrying IAM binding (attempt $i/5) -- likely propagation delay after GSA creation..."
+            sleep 15
+            if [ "$i" = "5" ]; then
+              echo "::error::Failed to grant GSA storage access after 5 attempts"
+              exit 1
+            fi
+          done
 
       - name: "[Workload Identity] Bind Kubernetes SA to GSA via Workload Identity"
         if: inputs.auth_method == 'workload_identity'
         run: |
-          gcloud iam service-accounts add-iam-policy-binding "$GSA_EMAIL" \
-            --project "$PROJECT" \
-            --role="roles/iam.workloadIdentityUser" \
-            --member="serviceAccount:${PROJECT}.svc.id.goog[${VELERO_NS}/velero]"
+          set -euo pipefail
+          for i in $(seq 1 5); do
+            if gcloud iam service-accounts add-iam-policy-binding "$GSA_EMAIL" \
+                --project "$PROJECT" \
+                --role="roles/iam.workloadIdentityUser" \
+                --member="serviceAccount:${PROJECT}.svc.id.goog[${VELERO_NS}/velero]"; then
+              break
+            fi
+            echo "Retrying Workload Identity binding (attempt $i/5) -- likely propagation delay after GSA creation..."
+            sleep 15
+            if [ "$i" = "5" ]; then
+              echo "::error::Failed to bind Kubernetes SA to GSA after 5 attempts"
+              exit 1
+            fi
+          done
 
       # ---------------------------------------------------------------
       # AUTH METHOD B: Service Account Key (fallback / simple lab setup)
       # ---------------------------------------------------------------
-      - name: "[Service Account Key] Decode key and validate access"
+      - name: "[Service Account Key] Decode and validate key file"
         if: inputs.auth_method == 'service_account_key'
         run: |
+          set -euo pipefail
           echo "${{ secrets.VELERO_GCP_SA_KEY_BASE64 }}" | base64 -d > gcp-credentials.json
-          gcloud auth activate-service-account --key-file=gcp-credentials.json
-          if ! gcloud storage buckets describe "gs://${BUCKET}" --impersonate-service-account="$(jq -r .client_email gcp-credentials.json)" >/dev/null 2>&1; then
-            echo "::warning::Could not confirm bucket access via impersonation check; continuing -- verify the key's SA has roles/storage.objectAdmin on ${BUCKET}."
-          fi
-          # Re-auth as the runner's own identity for subsequent gcloud/kubectl calls
-          gcloud auth login --brief --cred-file="${GOOGLE_GHA_CREDS_PATH}" || true
+
+          # Validate JSON structure only -- do NOT run `gcloud auth
+          # activate-service-account` or `gcloud auth login` here. Either
+          # would switch the runner's active gcloud identity away from the
+          # Workload Identity Federation credentials set up by
+          # google-github-actions/auth. `gcloud auth login` in particular is
+          # interactive-oriented and behaves unpredictably on CI runners.
+          # This key file is only ever consumed by Velero itself via
+          # --secret-file in the install step below -- the runner keeps
+          # using its own WIF identity for every other gcloud/kubectl call.
+          for field in type client_email private_key project_id; do
+            VALUE=$(jq -r --arg f "$field" '.[$f] // empty' gcp-credentials.json)
+            if [ -z "$VALUE" ]; then
+              echo "::error::VELERO_GCP_SA_KEY_BASE64 does not decode to a valid service account JSON key (missing '$field')"
+              exit 1
+            fi
+          done
+          echo "Service account key structure looks valid."
+          echo "Reminder: this key's SA must have roles/storage.objectAdmin on gs://${BUCKET} (grant it manually if using this fallback auth method)."
 
       # ---------------------------------------------------------------
       # Install Velero
