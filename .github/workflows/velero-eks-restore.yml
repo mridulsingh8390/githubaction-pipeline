@@ -1,4 +1,4 @@
-name: 06 - Velero EKS Restore
+name: Velero EKS Restore
 
 # Place this file at: .github/workflows/06-velero-eks-restore.yml
 #
