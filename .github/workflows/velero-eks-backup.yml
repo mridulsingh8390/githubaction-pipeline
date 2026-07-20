@@ -1,4 +1,4 @@
-name: 05 - Velero EKS Backup
+name: Velero EKS Backup
 
 # Place this file at: .github/workflows/05-velero-eks-backup.yml
 #
