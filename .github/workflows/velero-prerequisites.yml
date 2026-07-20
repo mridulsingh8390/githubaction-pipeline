@@ -4,7 +4,7 @@ name: Velero Prerequisites (Install & Configure)
 #
 # Purpose: One-time / re-runnable setup pipeline.
 #   - Creates Azure Resource Group / Storage Account / Blob Container (idempotent)
-#   - Installs kubectl / helm / velero CLI on the runner
+#   - Installs kubectl / helm / velero CLI / jq on the runner
 #   - Installs Velero into the target AKS cluster with the Azure plugin
 #   - Configures BackupStorageLocation (BSL) against Azure Blob
 #   - Wires auth via Workload Identity (preferred) or Service Principal (fallback)
@@ -17,6 +17,18 @@ name: Velero Prerequisites (Install & Configure)
 # Only required if auth_method = service_principal:
 #   VELERO_SP_CLIENT_ID
 #   VELERO_SP_CLIENT_SECRET
+#
+# NOTE (Workload Identity timing): the SA annotation/label + deployment
+# pod-template label are applied AFTER `velero install --wait` completes,
+# then the deployment is explicitly rolled restarted and re-checked for
+# rollout status. This is intentional and safe (`velero install` brings
+# pods up first without the identity wired, then we wire identity and
+# force a clean restart) -- do not reorder without also removing the
+# rollout restart step below it.
+#
+# IMPORTANT: velero_version here must match the version hardcoded/used
+# in 02-velero-backup.yml and 03-velero-restore.yml. Keep all three in
+# sync (or migrate to a repository variable VELERO_VERSION).
 
 on:
   workflow_dispatch:
@@ -61,8 +73,8 @@ on:
         required: true
         default: "v1.11.0"
         type: string
-      velero_cli_version:
-        description: "Velero CLI/server version"
+      velero_version:
+        description: "Velero CLI/server version -- MUST match backup/restore pipelines"
         required: true
         default: "v1.14.1"
         type: string
@@ -76,6 +88,10 @@ permissions:
   id-token: write   # needed for azure/login OIDC
   contents: read
 
+concurrency:
+  group: velero-prereq-${{ inputs.resource_group }}-${{ inputs.aks_name }}
+  cancel-in-progress: false
+
 env:
   RG: ${{ inputs.resource_group }}
   AKS: ${{ inputs.aks_name }}
@@ -86,6 +102,7 @@ env:
 jobs:
   prerequisites:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -107,13 +124,16 @@ jobs:
         with:
           version: "latest"
 
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
       - name: Install Velero CLI
         run: |
           set -euo pipefail
           curl -fsSL -o velero.tar.gz \
-            "https://github.com/vmware-tanzu/velero/releases/download/${{ inputs.velero_cli_version }}/velero-${{ inputs.velero_cli_version }}-linux-amd64.tar.gz"
+            "https://github.com/vmware-tanzu/velero/releases/download/${{ inputs.velero_version }}/velero-${{ inputs.velero_version }}-linux-amd64.tar.gz"
           tar -xzf velero.tar.gz
-          sudo mv velero-${{ inputs.velero_cli_version }}-linux-amd64/velero /usr/local/bin/velero
+          sudo mv velero-${{ inputs.velero_version }}-linux-amd64/velero /usr/local/bin/velero
           velero version --client-only
 
       - name: Ensure Resource Group exists
@@ -198,6 +218,25 @@ jobs:
           AZURE_CLOUD_NAME=AzurePublicCloud
           EOF
 
+      - name: "[Service Principal] Validate SP has Blob rights on Storage Account"
+        if: inputs.auth_method == 'service_principal'
+        run: |
+          SA_ID=$(az storage account show -n "$SA" -g "$RG" --query id -o tsv)
+          SP_OBJECT_ID=$(az ad sp show --id "${{ secrets.VELERO_SP_CLIENT_ID }}" --query id -o tsv)
+
+          ASSIGNMENTS=$(az role assignment list \
+            --assignee "$SP_OBJECT_ID" \
+            --scope "$SA_ID" \
+            --query "[?roleDefinitionName=='Storage Blob Data Contributor' || roleDefinitionName=='Contributor' || roleDefinitionName=='Owner'] | length(@)" \
+            -o tsv)
+
+          if [ "$ASSIGNMENTS" -eq 0 ]; then
+            echo "::error::Service Principal ${{ secrets.VELERO_SP_CLIENT_ID }} has no Blob-capable role assignment on $SA."
+            echo "::error::Grant it, e.g.: az role assignment create --assignee-object-id $SP_OBJECT_ID --assignee-principal-type ServicePrincipal --role 'Storage Blob Data Contributor' --scope $SA_ID"
+            exit 1
+          fi
+          echo "SP role assignment confirmed on storage account."
+
       # ---------------------------------------------------------------
       # Install Velero
       # ---------------------------------------------------------------
@@ -217,6 +256,8 @@ jobs:
             $NODE_AGENT_FLAG \
             --wait
 
+          # Wire Workload Identity onto the service account + deployment
+          # AFTER install, then force a clean rollout (see NOTE at top of file).
           kubectl annotate serviceaccount velero \
             -n "$VELERO_NS" \
             azure.workload.identity/client-id="$IDENTITY_CLIENT_ID" --overwrite
@@ -249,6 +290,9 @@ jobs:
         run: |
           echo "== Pods in $VELERO_NS =="
           kubectl get pods -n "$VELERO_NS" -o wide
+
+          echo "== Velero CRDs =="
+          kubectl get crd backups.velero.io restores.velero.io backupstoragelocations.velero.io
 
           echo "== BackupStorageLocation status =="
           for i in $(seq 1 10); do
