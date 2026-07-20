@@ -73,7 +73,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: velero-eks-prereq-${{ inputs.cluster_name }}
+  group: velero-eks-prereq-${{ inputs.aws_region }}-${{ inputs.cluster_name }}
   cancel-in-progress: false
 
 env:
@@ -97,9 +97,13 @@ jobs:
           aws-region: ${{ inputs.aws_region }}
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: "latest"
+        run: |
+          set -euo pipefail
+          KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -158,6 +162,13 @@ jobs:
         if: inputs.auth_method == 'irsa'
         run: |
           POLICY_NAME="velero-s3-policy-${CLUSTER}"
+          # NOTE (optional hardening): ec2:DescribeSnapshots/DescribeVolumes require
+          # Resource: "*" (AWS does not support resource-level permissions for these
+          # read-only describe calls). CreateSnapshot/DeleteSnapshot/CreateTags are
+          # left wildcard here for lab simplicity; for production, restrict them with
+          # a Condition block on aws:ResourceTag (e.g. requiring a tag your EBS
+          # volumes/snapshots consistently carry) so Velero can only snapshot/delete
+          # resources it tagged itself.
           cat > velero-s3-policy.json << POLICYEOF
           {
             "Version": "2012-10-17",
