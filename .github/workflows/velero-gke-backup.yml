@@ -90,7 +90,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: velero-gke-backup-${{ inputs.gke_cluster_name }}
+  group: velero-gke-backup-${{ inputs.gcp_project_id }}-${{ inputs.gke_cluster_name }}
   cancel-in-progress: false
 
 env:
@@ -119,9 +119,13 @@ jobs:
         run: gcloud components install gke-gcloud-auth-plugin --quiet
 
       - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-        with:
-          version: "latest"
+        run: |
+          set -euo pipefail
+          KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
