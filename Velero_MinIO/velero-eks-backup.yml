@@ -1,0 +1,219 @@
+name: Velero EKS Backup
+
+# Place this file at: .github/workflows/05-velero-eks-backup.yml
+#
+# Purpose: On-demand backup pipeline for EKS + S3 backend.
+#   - User selects AWS region + EKS cluster + namespace(s)
+#   - Triggers a Velero backup against the pre-configured BSL (S3)
+#   - Waits for completion, validates phase, publishes logs as an artifact
+#
+# Required GitHub Secrets:
+#   AWS_ROLE_TO_ASSUME  (OIDC role the runner assumes -- only needs
+#                        eks:DescribeCluster / eks:AccessKubernetesApi;
+#                        actual S3 access is done in-cluster by Velero's
+#                        own IRSA role, not by this runner)
+#
+# IMPORTANT: velero_version default below must match what was used to
+# install Velero in 04-velero-eks-prerequisites.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS region of the EKS cluster"
+        required: true
+        default: "us-east-1"
+        type: string
+      cluster_name:
+        description: "EKS cluster name to back up"
+        required: true
+        type: string
+      namespace:
+        description: "Namespace(s) to back up. Use '*' for ALL namespaces, or comma-separated list (ns1,ns2)"
+        required: true
+        type: string
+      velero_namespace:
+        description: "Namespace where Velero is installed"
+        required: true
+        default: "velero"
+        type: string
+      velero_version:
+        description: "Velero CLI version -- keep in sync with prerequisites pipeline"
+        required: true
+        default: "v1.14.1"
+        type: string
+      backup_name:
+        description: "Optional backup name. Leave blank to auto-generate"
+        required: false
+        type: string
+      ttl:
+        description: "Backup retention (Go duration, e.g. 720h0m0s = 30 days)"
+        required: true
+        default: "720h0m0s"
+        type: string
+      snapshot_volumes:
+        description: "Snapshot PV volumes as part of backup (EBS snapshots)"
+        required: true
+        type: boolean
+        default: true
+      default_volumes_to_fs_backup:
+        description: "Use Velero File System Backup (node-agent) for all volumes instead of EBS snapshots"
+        required: true
+        type: boolean
+        default: false
+      include_resources:
+        description: "Optional: comma-separated resource types to INCLUDE. Leave blank for all"
+        required: false
+        type: string
+      exclude_resources:
+        description: "Optional: comma-separated resource types to EXCLUDE. Leave blank for none"
+        required: false
+        type: string
+      wait_for_completion:
+        description: "Block the pipeline until the backup finishes"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: velero-eks-backup-${{ inputs.aws_region }}-${{ inputs.cluster_name }}
+  cancel-in-progress: false
+
+env:
+  REGION: ${{ inputs.aws_region }}
+  CLUSTER: ${{ inputs.cluster_name }}
+  VELERO_NS: ${{ inputs.velero_namespace }}
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Install kubectl
+        run: |
+          set -euo pipefail
+          KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Install Velero CLI
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.velero_version }}"
+          curl -fsSL -o velero.tar.gz \
+            "https://github.com/vmware-tanzu/velero/releases/download/${VERSION}/velero-${VERSION}-linux-amd64.tar.gz"
+          tar -xzf velero.tar.gz
+          sudo mv velero-${VERSION}-linux-amd64/velero /usr/local/bin/velero
+          velero version --client-only
+
+      - name: Get EKS credentials
+        run: aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER"
+
+      - name: Verify Velero CRDs and health before backing up
+        run: |
+          kubectl get crd backups.velero.io restores.velero.io backupstoragelocations.velero.io
+          kubectl get pods -n "$VELERO_NS"
+          PHASE=$(velero backup-location get -n "$VELERO_NS" -o json | jq -r '.items[0].status.phase')
+          echo "BSL phase: $PHASE"
+          if [ "$PHASE" != "Available" ]; then
+            echo "::error::BackupStorageLocation is not Available (phase=$PHASE). Run the EKS prerequisites pipeline first."
+            exit 1
+          fi
+
+      - name: Compute backup name and flags
+        id: vars
+        run: |
+          NS=$(echo "${{ inputs.namespace }}" | tr -d '[:space:]')
+
+          if [ -z "${{ inputs.backup_name }}" ]; then
+            SAFE_NS=$(echo "$NS" | tr -c 'a-zA-Z0-9-' '-' | tr 'A-Z' 'a-z')
+            NAME="backup-${SAFE_NS}-${{ github.run_number }}-$(date -u +%Y%m%d%H%M%S)"
+          else
+            NAME="${{ inputs.backup_name }}"
+          fi
+          echo "backup_name=$NAME" >> "$GITHUB_OUTPUT"
+
+          if [ "$NS" = "*" ]; then
+            echo "ns_flag=" >> "$GITHUB_OUTPUT"
+          else
+            echo "ns_flag=--include-namespaces $NS" >> "$GITHUB_OUTPUT"
+          fi
+
+          INCLUDE_RES=$(echo "${{ inputs.include_resources }}" | tr -d '[:space:]')
+          EXCLUDE_RES=$(echo "${{ inputs.exclude_resources }}" | tr -d '[:space:]')
+
+          if [ -n "$INCLUDE_RES" ]; then
+            echo "include_res_flag=--include-resources $INCLUDE_RES" >> "$GITHUB_OUTPUT"
+          else
+            echo "include_res_flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -n "$EXCLUDE_RES" ]; then
+            echo "exclude_res_flag=--exclude-resources $EXCLUDE_RES" >> "$GITHUB_OUTPUT"
+          else
+            echo "exclude_res_flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create backup
+        run: |
+          WAIT_FLAG=""
+          if [ "${{ inputs.wait_for_completion }}" = "true" ]; then WAIT_FLAG="--wait"; fi
+
+          velero backup create "${{ steps.vars.outputs.backup_name }}" \
+            -n "$VELERO_NS" \
+            ${{ steps.vars.outputs.ns_flag }} \
+            ${{ steps.vars.outputs.include_res_flag }} \
+            ${{ steps.vars.outputs.exclude_res_flag }} \
+            --ttl "${{ inputs.ttl }}" \
+            --snapshot-volumes="${{ inputs.snapshot_volumes }}" \
+            --default-volumes-to-fs-backup="${{ inputs.default_volumes_to_fs_backup }}" \
+            $WAIT_FLAG
+
+      - name: Describe backup
+        if: always()
+        run: |
+          velero backup describe "${{ steps.vars.outputs.backup_name }}" -n "$VELERO_NS" --details \
+            | tee backup-describe.txt
+
+      - name: Fetch backup logs
+        if: always()
+        run: |
+          velero backup logs "${{ steps.vars.outputs.backup_name }}" -n "$VELERO_NS" > backup-logs.txt 2>&1 || true
+
+      - name: Fail pipeline if backup did not complete
+        if: inputs.wait_for_completion == true
+        run: |
+          PHASE=$(velero backup get "${{ steps.vars.outputs.backup_name }}" -n "$VELERO_NS" -o json | jq -r '.status.phase')
+          echo "Final backup phase: $PHASE"
+          if [ "$PHASE" != "Completed" ] && [ "$PHASE" != "PartiallyFailed" ]; then
+            echo "::error::Backup ${{ steps.vars.outputs.backup_name }} did not complete (phase=$PHASE)"
+            exit 1
+          fi
+          if [ "$PHASE" = "PartiallyFailed" ]; then
+            echo "::warning::Backup completed with some failures. Review backup-logs.txt"
+          fi
+
+      - name: Upload backup artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: velero-eks-backup-${{ steps.vars.outputs.backup_name }}
+          path: |
+            backup-describe.txt
+            backup-logs.txt
+          retention-days: 30

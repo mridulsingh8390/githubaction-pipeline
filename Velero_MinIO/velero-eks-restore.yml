@@ -1,0 +1,258 @@
+name: Velero EKS Restore
+
+# Place this file at: .github/workflows/06-velero-eks-restore.yml
+#
+# Purpose: On-demand restore pipeline for EKS + S3 backend.
+#   - User selects AWS region + EKS cluster to restore INTO (source or target)
+#   - User picks the backup name to restore from
+#   - Optionally remaps namespaces for cross-cluster restore
+#
+# Required GitHub Secrets:
+#   AWS_ROLE_TO_ASSUME  (OIDC role the runner assumes)
+#
+# Tip: run with list_backups_only=true first if you just need to see what
+# backup names are available before choosing one.
+#
+# IMPORTANT: velero_version default below must match what was used to
+# install Velero in 04-velero-eks-prerequisites.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: "AWS region of the EKS cluster to restore INTO"
+        required: true
+        default: "us-east-1"
+        type: string
+      cluster_name:
+        description: "EKS cluster name to restore INTO (source or target cluster)"
+        required: true
+        type: string
+      velero_namespace:
+        description: "Namespace where Velero is installed on this cluster"
+        required: true
+        default: "velero"
+        type: string
+      velero_version:
+        description: "Velero CLI version -- keep in sync with prerequisites pipeline"
+        required: true
+        default: "v1.14.1"
+        type: string
+      list_backups_only:
+        description: "If true, just list available backups and exit (no restore performed)"
+        required: true
+        type: boolean
+        default: false
+      backup_name:
+        description: "Backup name to restore from (required unless list_backups_only=true)"
+        required: false
+        type: string
+      restore_name:
+        description: "Optional restore name. Leave blank to auto-generate"
+        required: false
+        type: string
+      namespace_mapping:
+        description: "Optional namespace remap, format old1:new1,old2:new2"
+        required: false
+        type: string
+      restore_volumes:
+        description: "Restore PV data as part of restore"
+        required: true
+        type: boolean
+        default: true
+      existing_resource_policy:
+        description: "How to handle resources that already exist on the target cluster"
+        required: true
+        type: choice
+        options:
+          - none
+          - update
+        default: none
+      preserve_nodeports:
+        description: "Preserve original NodePort values on Services during restore"
+        required: true
+        type: boolean
+        default: false
+      wait_for_completion:
+        description: "Block the pipeline until the restore finishes"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: velero-eks-restore-${{ inputs.aws_region }}-${{ inputs.cluster_name }}
+  cancel-in-progress: false
+
+env:
+  REGION: ${{ inputs.aws_region }}
+  CLUSTER: ${{ inputs.cluster_name }}
+  VELERO_NS: ${{ inputs.velero_namespace }}
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Install kubectl
+        run: |
+          set -euo pipefail
+          KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+          kubectl version --client
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Install Velero CLI
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.velero_version }}"
+          curl -fsSL -o velero.tar.gz \
+            "https://github.com/vmware-tanzu/velero/releases/download/${VERSION}/velero-${VERSION}-linux-amd64.tar.gz"
+          tar -xzf velero.tar.gz
+          sudo mv velero-${VERSION}-linux-amd64/velero /usr/local/bin/velero
+          velero version --client-only
+
+      - name: Get EKS credentials (target cluster for restore)
+        run: aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER"
+
+      - name: Verify Velero CRDs and health on this cluster
+        run: |
+          kubectl get crd backups.velero.io restores.velero.io backupstoragelocations.velero.io
+          kubectl get pods -n "$VELERO_NS"
+          PHASE=$(velero backup-location get -n "$VELERO_NS" -o json | jq -r '.items[0].status.phase')
+          echo "BSL phase: $PHASE"
+          if [ "$PHASE" != "Available" ]; then
+            echo "::error::BackupStorageLocation is not Available (phase=$PHASE) on this cluster. Run the EKS prerequisites pipeline against $CLUSTER first."
+            exit 1
+          fi
+
+      - name: List available backups
+        run: velero backup get -n "$VELERO_NS"
+
+      - name: Stop here if list-only mode
+        if: inputs.list_backups_only == true
+        run: |
+          echo "list_backups_only=true -- exiting after listing backups. No restore performed."
+          exit 0
+
+      - name: Validate backup_name was provided
+        if: inputs.list_backups_only == false
+        run: |
+          if [ -z "${{ inputs.backup_name }}" ]; then
+            echo "::error::backup_name is required when list_backups_only=false"
+            exit 1
+          fi
+
+      - name: Confirm backup exists and is restorable
+        if: inputs.list_backups_only == false
+        run: |
+          velero backup describe "${{ inputs.backup_name }}" -n "$VELERO_NS" || {
+            echo "::error::Backup '${{ inputs.backup_name }}' not found in $VELERO_NS on cluster $CLUSTER"
+            exit 1
+          }
+          PHASE=$(velero backup get "${{ inputs.backup_name }}" -n "$VELERO_NS" -o json | jq -r '.status.phase')
+          if [ "$PHASE" != "Completed" ] && [ "$PHASE" != "PartiallyFailed" ]; then
+            echo "::error::Backup '${{ inputs.backup_name }}' is not in a restorable state (phase=$PHASE)"
+            exit 1
+          fi
+
+      - name: Compute restore name and optional flags
+        if: inputs.list_backups_only == false
+        id: vars
+        run: |
+          if [ -z "${{ inputs.restore_name }}" ]; then
+            NAME="restore-${{ inputs.backup_name }}-${{ github.run_number }}-$(date -u +%Y%m%d%H%M%S)"
+          else
+            NAME="${{ inputs.restore_name }}"
+          fi
+          echo "restore_name=$NAME" >> "$GITHUB_OUTPUT"
+
+          NSMAP=$(echo "${{ inputs.namespace_mapping }}" | tr -d '[:space:]')
+          if [ -n "$NSMAP" ]; then
+            echo "ns_map_flag=--namespace-mappings $NSMAP" >> "$GITHUB_OUTPUT"
+          else
+            echo "ns_map_flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "${{ inputs.preserve_nodeports }}" = "true" ]; then
+            echo "nodeport_flag=--preserve-nodeports" >> "$GITHUB_OUTPUT"
+          else
+            echo "nodeport_flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create restore
+        if: inputs.list_backups_only == false
+        run: |
+          WAIT_FLAG=""
+          if [ "${{ inputs.wait_for_completion }}" = "true" ]; then WAIT_FLAG="--wait"; fi
+
+          velero restore create "${{ steps.vars.outputs.restore_name }}" \
+            -n "$VELERO_NS" \
+            --from-backup "${{ inputs.backup_name }}" \
+            ${{ steps.vars.outputs.ns_map_flag }} \
+            ${{ steps.vars.outputs.nodeport_flag }} \
+            --restore-volumes="${{ inputs.restore_volumes }}" \
+            --existing-resource-policy="${{ inputs.existing_resource_policy }}" \
+            $WAIT_FLAG
+
+      - name: Describe restore
+        if: always() && inputs.list_backups_only == false
+        run: |
+          velero restore describe "${{ steps.vars.outputs.restore_name }}" -n "$VELERO_NS" --details \
+            | tee restore-describe.txt
+
+      - name: Fetch restore logs
+        if: always() && inputs.list_backups_only == false
+        run: |
+          velero restore logs "${{ steps.vars.outputs.restore_name }}" -n "$VELERO_NS" > restore-logs.txt 2>&1 || true
+
+      - name: Fail pipeline if restore did not complete
+        if: inputs.wait_for_completion == true && inputs.list_backups_only == false
+        run: |
+          PHASE=$(velero restore get "${{ steps.vars.outputs.restore_name }}" -n "$VELERO_NS" -o json | jq -r '.status.phase')
+          echo "Final restore phase: $PHASE"
+          if [ "$PHASE" != "Completed" ] && [ "$PHASE" != "PartiallyFailed" ]; then
+            echo "::error::Restore ${{ steps.vars.outputs.restore_name }} did not complete (phase=$PHASE)"
+            exit 1
+          fi
+          if [ "$PHASE" = "PartiallyFailed" ]; then
+            echo "::warning::Restore completed with some failures. Review restore-logs.txt"
+          fi
+
+      - name: Post-restore validation snapshot (pods / pvc / events)
+        if: always() && inputs.list_backups_only == false
+        run: |
+          {
+            echo "== Namespaces =="
+            kubectl get ns
+            echo "== Pods (all namespaces touched by restore) =="
+            kubectl get pods -A
+            echo "== PVCs =="
+            kubectl get pvc -A
+            echo "== Recent warning events =="
+            kubectl get events -A --field-selector type=Warning --sort-by=.lastTimestamp | tail -n 50
+          } | tee post-restore-validation.txt
+
+      - name: Upload restore artifacts
+        if: always() && inputs.list_backups_only == false
+        uses: actions/upload-artifact@v4
+        with:
+          name: velero-eks-restore-${{ steps.vars.outputs.restore_name }}
+          path: |
+            restore-describe.txt
+            restore-logs.txt
+            post-restore-validation.txt
+          retention-days: 30
