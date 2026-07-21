@@ -1,4 +1,4 @@
-name: PR Validation
+name: DB PR Validation
 
 # Runs automatically on every pull request — catches syntax errors,
 # malformed workflows, and broken Helm charts BEFORE merge, rather than
