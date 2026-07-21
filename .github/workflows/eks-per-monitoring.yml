@@ -1,0 +1,446 @@
+name: EKS Performance Monitoring
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      cluster:
+        description: 'EKS cluster name (auto-detected if empty)'
+        required: false
+        default: ''
+      region:
+        description: 'AWS region (default: us-east-1)'
+        required: false
+        default: 'us-east-1'
+      namespace:
+        description: 'Target namespace (default: all)'
+        required: false
+        default: 'all'
+      duration:
+        description: 'Metrics collection duration in minutes (1-10)'
+        required: false
+        default: '1'
+      cpu_threshold:
+        description: 'CPU alert threshold % (default: 80)'
+        required: false
+        default: '80'
+      memory_threshold:
+        description: 'Memory alert threshold % (default: 85)'
+        required: false
+        default: '85'
+      enable_issues:
+        description: 'Create GitHub issues for alerts'
+        required: false
+        default: 'true'
+      enable_slack:
+        description: 'Send Slack notifications for alerts'
+        required: false
+        default: 'false'
+
+env:
+  DEFAULT_CPU_THRESHOLD: 80
+  DEFAULT_MEMORY_THRESHOLD: 85
+  KUBE_CAPACITY_VERSION: 0.8.0
+  ALLOWED_MANUAL_BRANCH: main
+
+concurrency:
+  group: eks-monitor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  monitor-eks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Enforce Branch for Manual Runs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.ref_name }}" != "${{ env.ALLOWED_MANUAL_BRANCH }}" ]; then
+            echo "Error: Manual runs are only allowed from the '${{ env.ALLOWED_MANUAL_BRANCH }}' branch."
+            echo "Current branch: ${{ github.ref_name }}"
+            exit 1
+          fi
+          echo "✅ Manual run from allowed branch: ${{ github.ref_name }}"
+
+      - name: Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: AWS Login (OIDC)
+        uses: aws-actions/configure-aws-credentials@4d281fbd4e61c15be56bb14b817fb5f5e6245a6f # v6.2.1
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-eks-monitor-${{ github.run_id }}
+          aws-region: ${{ github.event.inputs.region || secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Resolve Cluster, Region & Thresholds
+        id: cfg
+        run: |
+          REGION="${{ github.event.inputs.region || secrets.AWS_REGION || 'us-east-1' }}"
+          echo "region=$REGION" >> $GITHUB_OUTPUT
+
+          CLUSTER_INPUT="${{ github.event.inputs.cluster }}"
+          CLUSTER_SECRET="${{ secrets.EKS_CLUSTER_NAME }}"
+
+          if [ -n "$CLUSTER_INPUT" ]; then
+            CLUSTER="$CLUSTER_INPUT"
+            echo "Using explicitly provided cluster: $CLUSTER"
+          elif [ -n "$CLUSTER_SECRET" ]; then
+            CLUSTER="$CLUSTER_SECRET"
+            echo "Using cluster from secrets: $CLUSTER"
+          else
+            echo "Auto-detecting EKS clusters in region $REGION..."
+            CLUSTERS=$(aws eks list-clusters --region "$REGION" --query 'clusters' --output text)
+            CLUSTER_COUNT=$(echo "$CLUSTERS" | wc -w)
+            
+            if [ "$CLUSTER_COUNT" -eq 0 ] || [ -z "$CLUSTERS" ] || [ "$CLUSTERS" = "None" ]; then
+              echo "Error: No EKS clusters found in $REGION"
+              exit 1
+            elif [ "$CLUSTER_COUNT" -eq 1 ]; then
+              CLUSTER="$CLUSTERS"
+              echo "Auto-detected single cluster: $CLUSTER"
+            else
+              echo "Error: Multiple EKS clusters found in $REGION:"
+              for c in $CLUSTERS; do echo "  - $c"; done
+              echo ""
+              echo "Please specify a cluster explicitly via the 'cluster' input."
+              exit 1
+            fi
+          fi
+          
+          echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+
+          NS="${{ github.event.inputs.namespace || 'all' }}"
+          if [ "$NS" = "all" ]; then
+            echo "flag=--all-namespaces" >> $GITHUB_OUTPUT
+            echo "label=all" >> $GITHUB_OUTPUT
+          else
+            echo "flag=-n $NS" >> $GITHUB_OUTPUT
+            echo "label=$NS" >> $GITHUB_OUTPUT
+          fi
+
+          DUR="${{ github.event.inputs.duration || '1' }}"
+          if ! [[ "$DUR" =~ ^[0-9]+$ ]] || [ "$DUR" -lt 1 ]; then
+            DUR=1
+          elif [ "$DUR" -gt 10 ]; then
+            DUR=10
+          fi
+          echo "duration=$DUR" >> $GITHUB_OUTPUT
+
+          CPU="${{ github.event.inputs.cpu_threshold || env.DEFAULT_CPU_THRESHOLD }}"
+          if ! [[ "$CPU" =~ ^[0-9]+$ ]] || [ "$CPU" -lt 1 ] || [ "$CPU" -gt 100 ]; then
+            CPU=${{ env.DEFAULT_CPU_THRESHOLD }}
+          fi
+          echo "cpu_threshold=$CPU" >> $GITHUB_OUTPUT
+
+          MEM="${{ github.event.inputs.memory_threshold || env.DEFAULT_MEMORY_THRESHOLD }}"
+          if ! [[ "$MEM" =~ ^[0-9]+$ ]] || [ "$MEM" -lt 1 ] || [ "$MEM" -gt 100 ]; then
+            MEM=${{ env.DEFAULT_MEMORY_THRESHOLD }}
+          fi
+          echo "memory_threshold=$MEM" >> $GITHUB_OUTPUT
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "issues=true" >> $GITHUB_OUTPUT
+            echo "slack=false" >> $GITHUB_OUTPUT
+          else
+            echo "issues=${{ github.event.inputs.enable_issues }}" >> $GITHUB_OUTPUT
+            echo "slack=${{ github.event.inputs.enable_slack }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ steps.cfg.outputs.region }} \
+            --name ${{ steps.cfg.outputs.cluster }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@3e0aecbd2ecf0c20f8a8720b94e3912fba3d491b # v4
+
+      - name: Install kube-capacity
+        run: |
+          curl -fsSL "https://github.com/robscott/kube-capacity/releases/download/v${KUBE_CAPACITY_VERSION}/kube-capacity-linux-amd64" -o kube-capacity
+          chmod +x kube-capacity
+          sudo mv kube-capacity /usr/local/bin/
+
+      - name: Collect Cluster Overview
+        run: |
+          {
+            echo "# EKS Performance Report"
+            echo "**Cluster:** ${{ steps.cfg.outputs.cluster }}"
+            echo "**Region:** ${{ steps.cfg.outputs.region }}"
+            echo "**Namespace:** ${{ steps.cfg.outputs.label }}"
+            echo "**CPU Threshold:** ${{ steps.cfg.outputs.cpu_threshold }}%"
+            echo "**Memory Threshold:** ${{ steps.cfg.outputs.memory_threshold }}%"
+            echo "**Timestamp:** $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "## Node Status"
+            kubectl get nodes -o wide
+            echo ""
+            echo "## Node Ready Conditions"
+            kubectl get nodes -o json | jq -r '
+              .items[] 
+              | .metadata.name as $n 
+              | (.status.conditions[] | select(.type=="Ready")) as $r 
+              | "\($n): Ready=\($r.status) (\($r.reason // "N/A"))"'
+            echo ""
+          } > report.md
+
+      - name: Collect Resource Utilization (Sampled)
+        run: |
+          DUR=${{ steps.cfg.outputs.duration }}
+          echo "## Node Resource Usage (${DUR}m sample)" >> report.md
+          for i in $(seq 1 "$DUR"); do
+            echo "### Sample $i ($(date -u +%H:%M:%SZ))" >> report.md
+            kubectl top nodes 2>/dev/null >> report.md || echo "_Metrics server unavailable — ensure metrics-server is installed_" >> report.md
+            echo "" >> report.md
+            [ "$i" -lt "$DUR" ] && sleep 60
+          done
+
+          echo "## Pod Resource Usage" >> report.md
+          kubectl top pods ${{ steps.cfg.outputs.flag }} 2>/dev/null >> report.md || echo "_Metrics server unavailable — ensure metrics-server is installed_" >> report.md
+          echo "" >> report.md
+
+          echo "## Capacity vs Requests vs Limits" >> report.md
+          kube-capacity --pods --util 2>/dev/null >> report.md || echo "_kube-capacity failed_" >> report.md
+          echo "" >> report.md
+
+      - name: Collect Pod Health
+        run: |
+          {
+            echo "## Non-Running / Non-Succeeded Pods"
+            kubectl get pods ${{ steps.cfg.outputs.flag }} --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null || echo "_None or error_"
+            echo ""
+            echo "## Recent Warning Events"
+            kubectl get events ${{ steps.cfg.outputs.flag }} --field-selector=type=Warning --sort-by='.lastTimestamp' 2>/dev/null | tail -20 || echo "_No events or error_"
+            echo ""
+            echo "## High Restart Count Pods (>5)"
+            kubectl get pods ${{ steps.cfg.outputs.flag }} -o json 2>/dev/null | \
+              jq -r '.items[] 
+                | select((.status.containerStatuses? // []) | map(.restartCount // 0) | add > 5) 
+                | "\(.metadata.namespace)/\(.metadata.name): \([.status.containerStatuses[]? // [] | .restartCount // 0] | add) restarts"' \
+              || echo "_Error parsing restarts_"
+            echo ""
+          } >> report.md
+
+      - name: Collect HPA & Storage
+        run: |
+          {
+            echo "## HPA Status"
+            kubectl get hpa ${{ steps.cfg.outputs.flag }} 2>/dev/null || echo "_No HPA found_"
+            echo ""
+            echo "## Persistent Volume Claims"
+            kubectl get pvc ${{ steps.cfg.outputs.flag }} 2>/dev/null || echo "_No PVCs found_"
+            echo ""
+          } >> report.md
+
+      - name: CloudWatch Metrics
+        run: |
+          {
+            echo "## CloudWatch - Cluster CPU % (1h avg)"
+            aws cloudwatch get-metric-statistics \
+              --namespace AWS/EKS \
+              --metric-name node_cpu_utilization \
+              --dimensions Name=ClusterName,Value=${{ steps.cfg.outputs.cluster }} \
+              --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ) \
+              --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+              --period 3600 \
+              --statistics Average Maximum \
+              --region ${{ steps.cfg.outputs.region }} \
+              --output table 2>/dev/null || echo "_CloudWatch metrics unavailable (Container Insights may not be enabled)_"
+            echo ""
+          } >> report.md
+
+      - name: Check Thresholds
+        id: threshold-check
+        run: |
+          ALERTS=""
+          ALERT_COUNT=0
+          CPU_THR=${{ steps.cfg.outputs.cpu_threshold }}
+          MEM_THR=${{ steps.cfg.outputs.memory_threshold }}
+          TOP_NODES=$(kubectl top nodes --no-headers 2>/dev/null || true)
+
+          if [ -n "$TOP_NODES" ]; then
+            NODE_CPU=$(echo "$TOP_NODES" | awk '{print $3}' | sed 's/%//' | sort -nr | head -1)
+            if [ -n "$NODE_CPU" ] && [ "$NODE_CPU" -gt "$CPU_THR" ] 2>/dev/null; then
+              ALERTS="${ALERTS}🚨 **HIGH CPU**: Node CPU at ${NODE_CPU}% (threshold: ${CPU_THR}%)\\n"
+              ALERT_COUNT=$((ALERT_COUNT + 1))
+            fi
+
+            NODE_MEM=$(echo "$TOP_NODES" | awk '{print $5}' | sed 's/%//' | sort -nr | head -1)
+            if [ -n "$NODE_MEM" ] && [ "$NODE_MEM" -gt "$MEM_THR" ] 2>/dev/null; then
+              ALERTS="${ALERTS}🚨 **HIGH MEMORY**: Node memory at ${NODE_MEM}% (threshold: ${MEM_THR}%)\\n"
+              ALERT_COUNT=$((ALERT_COUNT + 1))
+            fi
+          fi
+
+          RESTART_PODS=$(kubectl get pods ${{ steps.cfg.outputs.flag }} -o json 2>/dev/null | \
+            jq '[.items[] | select((.status.containerStatuses? // []) | map(.restartCount // 0) | add > 10)] | length' || echo "0")
+
+          if [ "$RESTART_PODS" -gt 0 ] 2>/dev/null; then
+            ALERTS="${ALERTS}⚠️ **POD RESTARTS**: ${RESTART_PODS} pods with >10 restarts\\n"
+            ALERT_COUNT=$((ALERT_COUNT + 1))
+          fi
+
+          PENDING_PODS=$(kubectl get pods ${{ steps.cfg.outputs.flag }} --field-selector=status.phase=Pending --no-headers 2>/dev/null | wc -l)
+          if [ "$PENDING_PODS" -gt 5 ] 2>/dev/null; then
+            ALERTS="${ALERTS}⚠️ **PENDING PODS**: ${PENDING_PODS} pods stuck in Pending\\n"
+            ALERT_COUNT=$((ALERT_COUNT + 1))
+          fi
+
+          echo "alert_count=$ALERT_COUNT" >> $GITHUB_OUTPUT
+
+          if [ -n "$ALERTS" ]; then
+            echo "alerts=true" >> $GITHUB_OUTPUT
+            {
+              echo ""
+              echo "## ⚠️ ALERTS DETECTED (${ALERT_COUNT})"
+              echo -e "$ALERTS"
+            } >> report.md
+
+            {
+              echo "## 🚨 EKS Alert Summary (${ALERT_COUNT})"
+              echo -e "$ALERTS"
+              echo ""
+              echo "[View Full Report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            } >> $GITHUB_STEP_SUMMARY
+          else
+            echo "alerts=false" >> $GITHUB_OUTPUT
+            echo "" >> report.md
+            echo "## ✅ All metrics within normal thresholds" >> report.md
+
+            {
+              echo "## ✅ EKS Health Check Passed"
+              echo "All metrics within normal thresholds."
+              echo ""
+              echo "[View Full Report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Report
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: eks-report-${{ steps.cfg.outputs.cluster }}-${{ steps.cfg.outputs.label }}-${{ github.run_id }}
+          path: report.md
+          retention-days: 30
+
+      - name: Pass Alert State
+        id: pass-state
+        run: |
+          echo "alerts=${{ steps.threshold-check.outputs.alerts }}" >> $GITHUB_OUTPUT
+          echo "alert_count=${{ steps.threshold-check.outputs.alert_count }}" >> $GITHUB_OUTPUT
+          echo "label=${{ steps.cfg.outputs.label }}" >> $GITHUB_OUTPUT
+          echo "issues=${{ steps.cfg.outputs.issues }}" >> $GITHUB_OUTPUT
+          echo "slack=${{ steps.cfg.outputs.slack }}" >> $GITHUB_OUTPUT
+          echo "cluster=${{ steps.cfg.outputs.cluster }}" >> $GITHUB_OUTPUT
+          echo "region=${{ steps.cfg.outputs.region }}" >> $GITHUB_OUTPUT
+          echo "cpu_threshold=${{ steps.cfg.outputs.cpu_threshold }}" >> $GITHUB_OUTPUT
+          echo "memory_threshold=${{ steps.cfg.outputs.memory_threshold }}" >> $GITHUB_OUTPUT
+
+    outputs:
+      alerts: ${{ steps.pass-state.outputs.alerts }}
+      alert_count: ${{ steps.pass-state.outputs.alert_count }}
+      label: ${{ steps.pass-state.outputs.label }}
+      issues: ${{ steps.pass-state.outputs.issues }}
+      slack: ${{ steps.pass-state.outputs.slack }}
+      cluster: ${{ steps.pass-state.outputs.cluster }}
+      region: ${{ steps.pass-state.outputs.region }}
+      cpu_threshold: ${{ steps.pass-state.outputs.cpu_threshold }}
+      memory_threshold: ${{ steps.pass-state.outputs.memory_threshold }}
+
+  alert-issues:
+    needs: monitor-eks
+    if: needs.monitor-eks.outputs.alerts == 'true' && needs.monitor-eks.outputs.issues == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Download Report
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: eks-report-${{ needs.monitor-eks.outputs.cluster }}-${{ needs.monitor-eks.outputs.label }}-${{ github.run_id }}
+          path: ./artifact
+
+      - name: Find Existing Alert Issue
+        id: find-issue
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const date = new Date().toISOString().split('T')[0];
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'eks-monitoring,alert',
+              state: 'open',
+              per_page: 50
+            });
+            const existing = issues.data.find(i =>
+              i.title.startsWith('🚨 EKS Alert:') && i.title.endsWith(`- ${date}`)
+            );
+            if (existing) {
+              core.setOutput('issue_number', existing.number);
+              core.setOutput('exists', 'true');
+            } else {
+              core.setOutput('exists', 'false');
+            }
+
+      - name: Create or Update Alert Issue
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('./artifact/report.md', 'utf8');
+            const count = '${{ needs.monitor-eks.outputs.alert_count }}';
+            const cpuThr = '${{ needs.monitor-eks.outputs.cpu_threshold }}';
+            const memThr = '${{ needs.monitor-eks.outputs.memory_threshold }}';
+            const body = `## 🚨 EKS Performance Alert (${count} alert${count === '1' ? '' : 's'})\n\n**Cluster:** ${{ needs.monitor-eks.outputs.cluster }}\n**Region:** ${{ needs.monitor-eks.outputs.region }}\n**Namespace:** ${{ needs.monitor-eks.outputs.label }}\n**Thresholds:** CPU ${cpuThr}%, Memory ${memThr}%\n**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n---\n\n${report}`;
+            const title = `🚨 EKS Alert: ${count} threshold${count === '1' ? '' : 's'} exceeded - ${new Date().toISOString().split('T')[0]}`;
+            
+            if ('${{ steps.find-issue.outputs.exists }}' === 'true') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: parseInt('${{ steps.find-issue.outputs.issue_number }}'),
+                body: `**Updated at ${new Date().toISOString()}** (${count} alert${count === '1' ? '' : 's'})\n\n${body}`
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['eks-monitoring', 'alert', 'performance']
+              });
+            }
+
+  alert-slack:
+    needs: monitor-eks
+    if: needs.monitor-eks.outputs.alerts == 'true' && needs.monitor-eks.outputs.slack == 'true' && secrets.SLACK_WEBHOOK_URL != ''
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@37ebaef184d7626c5f204ab8d3baff4262dd30f0 # v1.27.0
+        with:
+          payload: |
+            {
+              "text": "🚨 EKS Performance Alert",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*EKS Cluster Alert*\n*Cluster:* ${{ needs.monitor-eks.outputs.cluster }}\n*Region:* ${{ needs.monitor-eks.outputs.region }}\n*Namespace:* ${{ needs.monitor-eks.outputs.label }}\n*Thresholds:* CPU ${{ needs.monitor-eks.outputs.cpu_threshold }}%, Memory ${{ needs.monitor-eks.outputs.memory_threshold }}%\n*Alerts:* ${{ needs.monitor-eks.outputs.alert_count }}\n*Status:* Thresholds exceeded\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
