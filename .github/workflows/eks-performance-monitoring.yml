@@ -422,11 +422,22 @@ jobs:
 
   alert-slack:
     needs: monitor-eks
-    if: needs.monitor-eks.outputs.alerts == 'true' && needs.monitor-eks.outputs.slack == 'true' && secrets.SLACK_WEBHOOK_URL != ''
+    if: needs.monitor-eks.outputs.alerts == 'true' && needs.monitor-eks.outputs.slack == 'true'
     runs-on: ubuntu-latest
     permissions: {}
     steps:
+      - name: Check Slack Secret
+        id: slack-check
+        run: |
+          if [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "has_secret=false" >> $GITHUB_OUTPUT
+            echo "Warning: SLACK_WEBHOOK_URL secret is not set. Skipping Slack notification."
+          else
+            echo "has_secret=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Notify Slack
+        if: steps.slack-check.outputs.has_secret == 'true'
         uses: slackapi/slack-github-action@37ebaef184d7626c5f204ab8d3baff4262dd30f0
         with:
           payload: |
