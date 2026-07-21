@@ -1,22 +1,5 @@
 name: Deploy Single Service (AKS)
 
-# Redeploys ONE of the 4 services (discovery-service / car-service /
-# api-gateway / myhttpdimage101) into ONE environment (dev/staging/prod)
-# with a new image tag. Every other service - and the same service in
-# other environments - is untouched, because each (service, environment)
-# pair is its own independent Helm release.
-#
-# AUTH: reuses this repo's EXISTING AKS OIDC secrets. Nothing new to
-# configure - same secrets already used by deploy-multicloud-helm.yml,
-# upgrade-aks.yml, aks-cluster-info.yml, azure-import.yml.
-#
-# REQUIRED SECRETS (already configured in this repo):
-#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
-#
-# OPTIONAL SECRETS (skip the step entirely if unset):
-#   SLACK_WEBHOOK_URL              - success/failure notifications
-#   DOCKERHUB_USERNAME/DOCKERHUB_TOKEN - only if mridul08/* repos are private
-
 on:
   workflow_dispatch:
     inputs:
@@ -35,7 +18,7 @@ on:
           - api-gateway
           - myhttpdimage101
       imageTag:
-        description: "DockerHub image tag to deploy (e.g. v1.2.3, build-42)"
+        description: "DockerHub image tag to deploy"
         required: true
         type: string
       aksResourceGroup:
@@ -47,7 +30,7 @@ on:
         required: true
         type: string
       namespace:
-        description: "Kubernetes namespace (e.g. myapp-dev, myapp-staging, myapp-prod)"
+        description: "Kubernetes namespace"
         required: true
         type: string
 
@@ -63,16 +46,13 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    environment: ${{ inputs.environment }} # prod: add required reviewers in Settings → Environments
-
-    env:
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    environment: ${{ inputs.environment }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Reject mutable 'latest' tag in prod
+      - name: Reject mutable latest tag in prod
         if: inputs.environment == 'prod' && inputs.imageTag == 'latest'
         run: |
           echo "::error::Refusing to deploy 'latest' to prod — specify an immutable tag."
@@ -107,8 +87,17 @@ jobs:
           echo "ref=${REPO}:${{ inputs.imageTag }}" >> "$GITHUB_OUTPUT"
           echo "Resolved image: ${REPO}:${{ inputs.imageTag }}"
 
-      - name: Docker login (only needed to scan private DockerHub images)
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+      - name: Check DockerHub secret
+        id: docker-check
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            echo "has_docker=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_docker=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Docker login
+        if: steps.docker-check.outputs.has_docker == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -122,9 +111,6 @@ jobs:
           exit-code: '1'
           ignore-unfixed: true
 
-      # --atomic: rolls back to the last good revision automatically if
-      #   this fails for any reason (bad manifest, pod never Ready, timeout).
-      # --cleanup-on-fail: also removes anything a plain rollback wouldn't.
       - name: Helm upgrade/install
         id: deploy
         run: |
@@ -136,8 +122,6 @@ jobs:
             --create-namespace \
             --atomic --cleanup-on-fail --timeout 5m
 
-      # Belt-and-suspenders: --atomic already rolled back if the step above
-      # failed. This step only surfaces that in the logs.
       - name: Report automatic rollback (upgrade failed)
         if: failure() && steps.deploy.outcome == 'failure'
         run: |
@@ -151,8 +135,6 @@ jobs:
           kubectl rollout status deployment/${{ inputs.service }} -n ${{ inputs.namespace }} --timeout=120s
           kubectl get pods -n ${{ inputs.namespace }} -l app.kubernetes.io/instance=${{ inputs.service }}
 
-      # Custom smoke test: --atomic only checks pod readiness, not whether
-      # the app actually serves correctly. Rolls back explicitly if it fails.
       - name: Post-deploy smoke test
         if: success()
         id: smoke
@@ -172,19 +154,29 @@ jobs:
           kubectl rollout status deployment/${{ inputs.service }} -n ${{ inputs.namespace }}
           exit 1
 
+      - name: Check Slack secret
+        id: slack-check
+        if: always()
+        run: |
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "has_slack=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_slack=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Notify on success
-        if: success() && env.SLACK_WEBHOOK_URL != ''
+        if: success() && steps.slack-check.outputs.has_slack == 'true'
         run: |
           curl -s -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"✅ ${{ inputs.service }} deployed to *${{ inputs.environment }}* — tag \`${{ inputs.imageTag }}\` (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}" \
-            "$SLACK_WEBHOOK_URL"
+            --data "{\"text\":\"${{ inputs.service }} deployed to *${{ inputs.environment }}* — tag \`${{ inputs.imageTag }}\` (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
 
       - name: Notify on failure
-        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        if: failure() && steps.slack-check.outputs.has_slack == 'true'
         run: |
           curl -s -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"❌ ${{ inputs.service }} deploy to *${{ inputs.environment }}* FAILED (tag \`${{ inputs.imageTag }}\`), auto-rolled back. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
-            "$SLACK_WEBHOOK_URL"
+            --data "{\"text\":\"${{ inputs.service }} deploy to *${{ inputs.environment }}* FAILED (tag \`${{ inputs.imageTag }}\`), auto-rolled back. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
 
       - name: Deployment summary
         if: always()
