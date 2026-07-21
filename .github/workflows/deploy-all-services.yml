@@ -1,21 +1,5 @@
 name: Deploy All Services (AKS Initial Setup)
 
-# Deploys all 4 services + ingresses into ONE chosen environment, for the
-# first time (or a deliberate bulk refresh). Each service is deployed
-# independently in a loop - one failing does not stop the others, and
-# each gets its own --atomic rollback.
-#
-# AUTH: reuses this repo's EXISTING AKS OIDC secrets. Nothing new to
-# configure - same secrets already used by deploy-multicloud-helm.yml,
-# upgrade-aks.yml, aks-cluster-info.yml, azure-import.yml.
-#
-# REQUIRED SECRETS (already configured in this repo):
-#   AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
-#
-# OPTIONAL SECRETS (skip the step entirely if unset):
-#   SLACK_WEBHOOK_URL              - success/failure notification
-#   DOCKERHUB_USERNAME/DOCKERHUB_TOKEN - only if mridul08/* repos are private
-
 on:
   workflow_dispatch:
     inputs:
@@ -33,7 +17,7 @@ on:
         required: true
         type: string
       namespace:
-        description: "Kubernetes namespace (e.g. myapp-dev, myapp-staging, myapp-prod)"
+        description: "Kubernetes namespace"
         required: true
         type: string
       discoveryServiceTag:
@@ -69,16 +53,13 @@ jobs:
   deploy-all:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment: ${{ inputs.environment }} # prod: add required reviewers in Settings → Environments
-
-    env:
-      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    environment: ${{ inputs.environment }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Reject mutable 'latest' tags in prod
+      - name: Reject mutable latest tags in prod
         if: inputs.environment == 'prod'
         run: |
           for tag in "${{ inputs.discoveryServiceTag }}" "${{ inputs.carServiceTag }}" "${{ inputs.apiGatewayTag }}" "${{ inputs.myhttpdimage101Tag }}"; do
@@ -109,18 +90,22 @@ jobs:
           curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
             | sh -s -- -b /usr/local/bin
 
-      - name: Docker login (only needed to scan private DockerHub images)
-        if: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+      - name: Check DockerHub secret
+        id: docker-check
+        run: |
+          if [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            echo "has_docker=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_docker=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Docker login
+        if: steps.docker-check.outputs.has_docker == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Loops over all 4 services: scan -> helm upgrade --atomic -> verify
-      # rollout -> smoke test. Each service is independent - a failure in
-      # one is recorded and the loop continues to the rest; the job only
-      # fails at the end if anything in FAILED[] was recorded, so you get
-      # one clear pass/fail summary instead of stopping after service #1.
       - name: Deploy all 4 services
         id: deploy_all
         run: |
@@ -186,19 +171,29 @@ jobs:
             exit 1
           fi
 
+      - name: Check Slack secret
+        id: slack-check
+        if: always()
+        run: |
+          if [ -n "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "has_slack=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_slack=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Notify on success
-        if: success() && env.SLACK_WEBHOOK_URL != ''
+        if: success() && steps.slack-check.outputs.has_slack == 'true'
         run: |
           curl -s -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"✅ All 4 services deployed to *${{ inputs.environment }}* (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}" \
-            "$SLACK_WEBHOOK_URL"
+            --data "{\"text\":\"All 4 services deployed to *${{ inputs.environment }}* (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
 
       - name: Notify on failure
-        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        if: failure() && steps.slack-check.outputs.has_slack == 'true'
         run: |
           curl -s -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"❌ Deploy-all to *${{ inputs.environment }}* had failures: \`${{ steps.deploy_all.outputs.failed }}\`. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
-            "$SLACK_WEBHOOK_URL"
+            --data "{\"text\":\"Deploy-all to *${{ inputs.environment }}* had failures: \`${{ steps.deploy_all.outputs.failed }}\`. ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "${{ secrets.SLACK_WEBHOOK_URL }}"
 
       - name: Deployment summary
         if: always()
@@ -214,6 +209,6 @@ jobs:
             echo "- api-gateway: \`${{ inputs.apiGatewayTag }}\`"
             echo "- myhttpdimage101: \`${{ inputs.myhttpdimage101Tag }}\`"
             if [ -n "${{ steps.deploy_all.outputs.failed }}" ]; then
-              echo "- ⚠️ Failed: \`${{ steps.deploy_all.outputs.failed }}\`"
+              echo "- Failed: \`${{ steps.deploy_all.outputs.failed }}\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
