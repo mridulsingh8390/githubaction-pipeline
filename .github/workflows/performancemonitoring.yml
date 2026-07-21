@@ -5,6 +5,14 @@ on:
     - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
+      cluster:
+        description: 'AKS cluster name (e.g., aks-prod-eastus)'
+        required: true
+        default: 'aks-prod-eastus'
+      resource_group:
+        description: 'Resource group (auto-detected if left empty)'
+        required: false
+        default: ''
       namespace:
         description: 'Target namespace (default: all)'
         required: false
@@ -24,8 +32,6 @@ on:
 
 env:
   AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-  RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
-  CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
   ALERT_CPU_THRESHOLD: 80
   ALERT_MEMORY_THRESHOLD: 85
   KUBE_CAPACITY_VERSION: 0.8.0
@@ -55,24 +61,41 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Set AKS Context
-        uses: azure/aks-set-context@5c33da734abc0bfe82b89c1221c9b5c5d985f810 # v3
-        with:
-          resource-group: ${{ env.RESOURCE_GROUP }}
-          cluster-name: ${{ env.CLUSTER_NAME }}
-
-      - name: Setup kubectl
-        uses: azure/setup-kubectl@3e0aecbd2ecf0c20f8a8720b94e3912fba3d491b # v4
-
-      - name: Install kube-capacity
-        run: |
-          curl -fsSL "https://github.com/robscott/kube-capacity/releases/download/v${KUBE_CAPACITY_VERSION}/kube-capacity-linux-amd64" -o kube-capacity
-          chmod +x kube-capacity
-          sudo mv kube-capacity /usr/local/bin/
-
-      - name: Resolve Namespace & Duration
+      - name: Resolve Cluster & Resource Group
         id: cfg
         run: |
+          # Resolve cluster name
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            CLUSTER="${{ secrets.AKS_CLUSTER_NAME }}"
+          else
+            CLUSTER="${{ github.event.inputs.cluster }}"
+          fi
+
+          if [ -z "$CLUSTER" ]; then
+            echo "Error: Cluster name is required"
+            exit 1
+          fi
+          echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+
+          # Resolve resource group
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            RG="${{ secrets.AKS_RESOURCE_GROUP }}"
+          else
+            RG="${{ github.event.inputs.resource_group }}"
+          fi
+
+          if [ -z "$RG" ]; then
+            echo "Auto-detecting resource group for cluster: $CLUSTER"
+            RG=$(az aks list --query "[?name=='$CLUSTER'].resourceGroup" -o tsv 2>/dev/null)
+            if [ -z "$RG" ]; then
+              echo "Error: Could not auto-detect resource group for cluster '$CLUSTER'. Please provide it explicitly."
+              exit 1
+            fi
+            echo "Detected resource group: $RG"
+          fi
+          echo "resource_group=$RG" >> $GITHUB_OUTPUT
+
+          # Resolve namespace
           NS="${{ github.event.inputs.namespace || 'all' }}"
           if [ "$NS" = "all" ]; then
             echo "flag=--all-namespaces" >> $GITHUB_OUTPUT
@@ -100,12 +123,27 @@ jobs:
             echo "slack=${{ github.event.inputs.enable_slack }}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Set AKS Context
+        uses: azure/aks-set-context@5c33da734abc0bfe82b89c1221c9b5c5d985f810 # v3
+        with:
+          resource-group: ${{ steps.cfg.outputs.resource_group }}
+          cluster-name: ${{ steps.cfg.outputs.cluster }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@3e0aecbd2ecf0c20f8a8720b94e3912fba3d491b # v4
+
+      - name: Install kube-capacity
+        run: |
+          curl -fsSL "https://github.com/robscott/kube-capacity/releases/download/v${KUBE_CAPACITY_VERSION}/kube-capacity-linux-amd64" -o kube-capacity
+          chmod +x kube-capacity
+          sudo mv kube-capacity /usr/local/bin/
+
       - name: Collect Cluster Overview
         run: |
           {
             echo "# AKS Performance Report"
-            echo "**Cluster:** ${{ env.CLUSTER_NAME }}"
-            echo "**Resource Group:** ${{ env.RESOURCE_GROUP }}"
+            echo "**Cluster:** ${{ steps.cfg.outputs.cluster }}"
+            echo "**Resource Group:** ${{ steps.cfg.outputs.resource_group }}"
             echo "**Namespace:** ${{ steps.cfg.outputs.label }}"
             echo "**Timestamp:** $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo ""
@@ -174,7 +212,7 @@ jobs:
           {
             echo "## Azure Monitor - Node CPU % (1h avg)"
             az monitor metrics list \
-              --resource "$(az aks show -g ${{ env.RESOURCE_GROUP }} -n ${{ env.CLUSTER_NAME }} --query id -o tsv)" \
+              --resource "$(az aks show -g ${{ steps.cfg.outputs.resource_group }} -n ${{ steps.cfg.outputs.cluster }} --query id -o tsv)" \
               --metric "node_cpu_usage_percentage" \
               --interval PT1H \
               --aggregation Average Maximum \
@@ -250,7 +288,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
         with:
-          name: aks-report-${{ env.CLUSTER_NAME }}-${{ steps.cfg.outputs.label }}-${{ github.run_id }}
+          name: aks-report-${{ steps.cfg.outputs.cluster }}-${{ steps.cfg.outputs.label }}-${{ github.run_id }}
           path: report.md
           retention-days: 30
 
@@ -262,7 +300,8 @@ jobs:
           echo "label=${{ steps.cfg.outputs.label }}" >> $GITHUB_OUTPUT
           echo "issues=${{ steps.cfg.outputs.issues }}" >> $GITHUB_OUTPUT
           echo "slack=${{ steps.cfg.outputs.slack }}" >> $GITHUB_OUTPUT
-          echo "cluster=${{ env.CLUSTER_NAME }}" >> $GITHUB_OUTPUT
+          echo "cluster=${{ steps.cfg.outputs.cluster }}" >> $GITHUB_OUTPUT
+          echo "resource_group=${{ steps.cfg.outputs.resource_group }}" >> $GITHUB_OUTPUT
 
     outputs:
       alerts: ${{ steps.pass-state.outputs.alerts }}
@@ -271,6 +310,7 @@ jobs:
       issues: ${{ steps.pass-state.outputs.issues }}
       slack: ${{ steps.pass-state.outputs.slack }}
       cluster: ${{ steps.pass-state.outputs.cluster }}
+      resource_group: ${{ steps.pass-state.outputs.resource_group }}
 
   alert-issues:
     needs: monitor-aks
@@ -290,19 +330,20 @@ jobs:
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         with:
           script: |
-            const label = 'aks-monitoring';
             const date = new Date().toISOString().split('T')[0];
-            const titlePrefix = `🚨 AKS Alert: Performance threshold exceeded - ${date}`;
             
             const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              labels: [label, 'alert'],
+              labels: 'aks-monitoring,alert',
               state: 'open',
-              per_page: 10
+              per_page: 50
             });
             
-            const existing = issues.data.find(i => i.title.startsWith(titlePrefix));
+            const existing = issues.data.find(i =>
+              i.title.startsWith('🚨 AKS Alert:') && i.title.endsWith(`- ${date}`)
+            );
+            
             if (existing) {
               core.setOutput('issue_number', existing.number);
               core.setOutput('exists', 'true');
@@ -317,7 +358,7 @@ jobs:
             const fs = require('fs');
             const report = fs.readFileSync('./artifact/report.md', 'utf8');
             const count = '${{ needs.monitor-aks.outputs.alert_count }}';
-            const body = `## 🚨 AKS Performance Alert (${count} alert${count === '1' ? '' : 's'})\n\n**Cluster:** ${{ needs.monitor-aks.outputs.cluster }}\n**Namespace:** ${{ needs.monitor-aks.outputs.label }}\n**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n---\n\n${report}`;
+            const body = `## 🚨 AKS Performance Alert (${count} alert${count === '1' ? '' : 's'})\n\n**Cluster:** ${{ needs.monitor-aks.outputs.cluster }}\n**Resource Group:** ${{ needs.monitor-aks.outputs.resource_group }}\n**Namespace:** ${{ needs.monitor-aks.outputs.label }}\n**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n---\n\n${report}`;
             const title = `🚨 AKS Alert: ${count} threshold${count === '1' ? '' : 's'} exceeded - ${new Date().toISOString().split('T')[0]}`;
             
             if ('${{ steps.find-issue.outputs.exists }}' === 'true') {
@@ -354,7 +395,7 @@ jobs:
                   "type": "section",
                   "text": {
                     "type": "mrkdwn",
-                    "text": "*AKS Cluster Alert*\n*Cluster:* ${{ needs.monitor-aks.outputs.cluster }}\n*Namespace:* ${{ needs.monitor-aks.outputs.label }}\n*Alerts:* ${{ needs.monitor-aks.outputs.alert_count }}\n*Status:* Thresholds exceeded\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                    "text": "*AKS Cluster Alert*\n*Cluster:* ${{ needs.monitor-aks.outputs.cluster }}\n*Resource Group:* ${{ needs.monitor-aks.outputs.resource_group }}\n*Namespace:* ${{ needs.monitor-aks.outputs.label }}\n*Alerts:* ${{ needs.monitor-aks.outputs.alert_count }}\n*Status:* Thresholds exceeded\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
                   }
                 }
               ]
