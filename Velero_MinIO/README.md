@@ -11,7 +11,8 @@ native object storage as the Velero backend:
 | EKS (Amazon Elastic Kubernetes Service) | S3 bucket | `04-*` / `05-*` / `06-*` |
 | GKE (Google Kubernetes Engine) | GCS bucket | `07-*` / `08-*` / `09-*` |
 
-Nine workflow files total, three per provider:
+Ten workflow files total — three per provider, plus one shared read-only
+"what backups exist" pipeline:
 
 | # | Workflow file | Purpose |
 |---|----------------|---------|
@@ -24,6 +25,7 @@ Nine workflow files total, three per provider:
 | 7 | `07-velero-gke-prerequisites.yml` | Install/configure Velero on GKE, wired to GCS |
 | 8 | `08-velero-gke-backup.yml` | Backup a namespace on a GKE cluster |
 | 9 | `09-velero-gke-restore.yml` | Restore a backup into a GKE cluster |
+| 10 | `10-velero-list-backups.yml` | **Read-only**: list available backups (name/date/status) on any of the three platforms — no backup or restore is performed |
 
 All nine are `workflow_dispatch` (manual trigger with input form) so they
 can be run from the **Actions** tab whenever needed, in any order, across
@@ -157,6 +159,7 @@ Repo → Settings → Secrets and variables → Actions:
     07-velero-gke-prerequisites.yml
     08-velero-gke-backup.yml
     09-velero-gke-restore.yml
+    10-velero-list-backups.yml
 README.md
 ```
 
@@ -467,7 +470,33 @@ and `preserve_nodeports`.
 
 ---
 
-## 8. Cross-cluster restore notes
+## 8. List available backups (any platform)
+
+Actions tab → **10 - Velero List Backups** → Run workflow, then:
+
+1. Set `platform` to `aks`, `eks`, or `gke`.
+2. Fill in **only** the input group for that platform (the others are
+   ignored — e.g. picking `platform: eks` means only `eks_aws_region` and
+   `eks_cluster_name` matter; leave the AKS/GKE fields blank).
+3. Run it.
+
+This is read-only — it never creates a backup or restore. It authenticates
+to the chosen cluster, confirms the BackupStorageLocation, then runs
+`velero backup get` and renders a table (Name / Status / Created / Expires
+/ Namespaces, newest first) both:
+- in the **job summary** on the Actions run page (no need to open logs), and
+- as a downloadable `backups.json` + `backup-report.md` artifact.
+
+Use this before every restore to get the exact backup name and confirm
+its creation date, instead of guessing or digging through backup-pipeline
+run history. It complements (doesn't replace) the `list_backups_only`
+toggle already built into pipelines 3/6/9 — this one is handy when you
+just want a quick look without stepping through a restore form, or when
+you want to check all three platforms from one place across separate runs.
+
+---
+
+## 9. Cross-cluster restore notes
 
 - Run **Pipeline 1 / 4 / 7** (matching provider) against the target cluster
   too, pointing at the **same** bucket/container so it can see the source
@@ -489,7 +518,7 @@ and `preserve_nodeports`.
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 | Symptom | Likely cause / fix |
 |---|---|
@@ -504,7 +533,7 @@ and `preserve_nodeports`.
 
 ---
 
-## 10. Security notes
+## 11. Security notes
 
 - Prefer the identity-federation auth method (`workload_identity` /
   `irsa` / `workload_identity` for AKS/EKS/GKE respectively) over the
@@ -521,7 +550,7 @@ and `preserve_nodeports`.
 
 ---
 
-## 11. Recommended hardening: pin actions to commit SHAs
+## 12. Recommended hardening: pin actions to commit SHAs
 
 All marketplace actions used here (`azure/login`, `aws-actions/configure-aws-credentials`,
 `google-github-actions/auth`, `google-github-actions/setup-gcloud`,
