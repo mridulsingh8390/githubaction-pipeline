@@ -1,0 +1,156 @@
+name: PostgreSQL Backup to S3
+
+# Standalone backup pipeline — dumps a target Postgres database, checksums
+# it, and uploads both (encrypted at rest) to S3. Runnable manually or on
+# a schedule.
+#
+# REQUIRED SECRETS:
+#   AWS_BACKUP_ROLE_ARN — OIDC role with s3:PutObject ONLY on the backup
+#     bucket (write-only, deliberately — see IAM note at bottom)
+#   <ENV>_DB_HOST, <ENV>_DB_PORT, <ENV>_DB_NAME, <ENV>_DB_USER, <ENV>_DB_PASSWORD
+
+on:
+  workflow_dispatch:
+    inputs:
+      targetEnvironment:
+        description: "Which database to back up"
+        required: true
+        type: choice
+        options: [DEV, STAGING, PROD]
+      s3Bucket:
+        description: "S3 bucket name for backup storage"
+        required: true
+        type: string
+      kmsKeyId:
+        description: "KMS key ARN for encryption (blank = SSE-S3/AES256 instead of KMS)"
+        required: false
+        default: ""
+        type: string
+      awsRegion:
+        description: "AWS region"
+        required: false
+        default: "us-east-1"
+        type: string
+  schedule:
+    - cron: '0 3 * * *' # Daily at 03:00 UTC. Schedule triggers have no
+                          # workflow_dispatch inputs — see "Scheduled run
+                          # defaults" step below.
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: db-backup-${{ inputs.targetEnvironment || 'scheduled' }}
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Scheduled run defaults
+        id: defaults
+        shell: bash
+        run: |
+          # Edit these lines to match your actual scheduled-backup target,
+          # or remove the `schedule:` trigger above for manual-only.
+          echo "target=${{ inputs.targetEnvironment || 'PROD' }}" >> "$GITHUB_OUTPUT"
+          echo "bucket=${{ inputs.s3Bucket || secrets.DEFAULT_BACKUP_S3_BUCKET }}" >> "$GITHUB_OUTPUT"
+          echo "kmskey=${{ inputs.kmsKeyId || secrets.DEFAULT_BACKUP_KMS_KEY_ID }}" >> "$GITHUB_OUTPUT"
+
+      - name: AWS login (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_BACKUP_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion || 'us-east-1' }}
+
+      - name: Validate required secrets are set
+        shell: bash
+        env:
+          TARGET: ${{ steps.defaults.outputs.target }}
+          BUCKET: ${{ steps.defaults.outputs.bucket }}
+          DB_HOST: ${{ secrets[format('{0}_DB_HOST', steps.defaults.outputs.target)] }}
+          DB_PORT: ${{ secrets[format('{0}_DB_PORT', steps.defaults.outputs.target)] }}
+          DB_NAME: ${{ secrets[format('{0}_DB_NAME', steps.defaults.outputs.target)] }}
+          DB_USER: ${{ secrets[format('{0}_DB_USER', steps.defaults.outputs.target)] }}
+          DB_PASSWORD: ${{ secrets[format('{0}_DB_PASSWORD', steps.defaults.outputs.target)] }}
+        run: |
+          set -euo pipefail
+          MISSING=0
+          [ -n "$BUCKET" ]      || { echo "::error::s3Bucket not provided and no DEFAULT_BACKUP_S3_BUCKET secret set."; MISSING=1; }
+          [ -n "$DB_HOST" ]     || { echo "::error::${TARGET}_DB_HOST is not set."; MISSING=1; }
+          [ -n "$DB_PORT" ]     || { echo "::error::${TARGET}_DB_PORT is not set."; MISSING=1; }
+          [ -n "$DB_NAME" ]     || { echo "::error::${TARGET}_DB_NAME is not set."; MISSING=1; }
+          [ -n "$DB_USER" ]     || { echo "::error::${TARGET}_DB_USER is not set."; MISSING=1; }
+          [ -n "$DB_PASSWORD" ] || { echo "::error::${TARGET}_DB_PASSWORD is not set."; MISSING=1; }
+          [ "$MISSING" -eq 0 ] || exit 1
+          echo "All required secrets present."
+
+      - name: Backup, checksum, and upload to S3 (encrypted at rest)
+        shell: bash
+        env:
+          TARGET: ${{ steps.defaults.outputs.target }}
+          BUCKET: ${{ steps.defaults.outputs.bucket }}
+          KMS_KEY_ID: ${{ steps.defaults.outputs.kmskey }}
+          DB_HOST: ${{ secrets[format('{0}_DB_HOST', steps.defaults.outputs.target)] }}
+          DB_PORT: ${{ secrets[format('{0}_DB_PORT', steps.defaults.outputs.target)] }}
+          DB_NAME: ${{ secrets[format('{0}_DB_NAME', steps.defaults.outputs.target)] }}
+          DB_USER: ${{ secrets[format('{0}_DB_USER', steps.defaults.outputs.target)] }}
+          DB_PASSWORD: ${{ secrets[format('{0}_DB_PASSWORD', steps.defaults.outputs.target)] }}
+        run: |
+          set -euo pipefail
+          TIMESTAMP="$(date -u +%Y%m%d-%H%M%S)"
+          BACKUP_FILE="${DB_NAME}-${TIMESTAMP}.dump"
+          S3_KEY="postgres-backups/${TARGET}/${BACKUP_FILE}"
+
+          docker run --rm -e PGPASSWORD="$DB_PASSWORD" -v "$PWD:/backup" postgres:16.4 \
+            pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -F c -f "/backup/$BACKUP_FILE"
+
+          SIZE="$(du -h "$BACKUP_FILE" | cut -f1)"
+          sha256sum "$BACKUP_FILE" > "${BACKUP_FILE}.sha256"
+
+          if [ -n "$KMS_KEY_ID" ]; then
+            SSE_ARGS=(--sse aws:kms --sse-kms-key-id "$KMS_KEY_ID")
+            echo "Using KMS encryption: $KMS_KEY_ID"
+          else
+            SSE_ARGS=(--sse AES256)
+            echo "Using SSE-S3 (AES256) encryption."
+          fi
+
+          aws s3 cp "$BACKUP_FILE" "s3://${BUCKET}/${S3_KEY}" "${SSE_ARGS[@]}"
+          aws s3 cp "${BACKUP_FILE}.sha256" "s3://${BUCKET}/${S3_KEY}.sha256" "${SSE_ARGS[@]}"
+
+          echo "Backup created: $BACKUP_FILE ($SIZE)"
+          echo "Uploaded (encrypted, checksummed) to s3://${BUCKET}/${S3_KEY}"
+
+          {
+            echo "## Database Backup Completed"
+            echo ""
+            echo "- Environment: \`$TARGET\`"
+            echo "- Database: \`$DB_NAME\`"
+            echo "- Size: \`$SIZE\`"
+            echo "- Encryption: \`$([ -n "$KMS_KEY_ID" ] && echo "KMS ($KMS_KEY_ID)" || echo "SSE-S3")\`"
+            echo "- S3 location: \`s3://${BUCKET}/${S3_KEY}\`"
+            echo "- Checksum: \`s3://${BUCKET}/${S3_KEY}.sha256\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# --- Setup notes ---
+# 1. Create the S3 bucket with versioning enabled and a lifecycle policy.
+#    Object Lock can ONLY be set at bucket CREATION time — decide before
+#    creating it if you need immutability for compliance.
+# 2. IAM policy for AWS_BACKUP_ROLE_ARN — write-only, deliberately narrow:
+#      s3:PutObject on arn:aws:s3:::<bucket>/postgres-backups/*
+#    If using KMS: also needs kms:GenerateDataKey and kms:Encrypt on the
+#    key (NOT kms:Decrypt — this role should never be able to read data
+#    back, encrypted or not).
+#    Do NOT grant s3:GetObject or s3:ListBucket to this role — that
+#    belongs to AWS_RESTORE_ROLE_ARN.
+#
+# --- Action version note ---
+# Pinned to aws-actions/configure-aws-credentials v4.3.1 (SHA verified
+# 2026-07-21). The action has since released v5.0.0 and v6.0.0 with
+# BREAKING CHANGES (v6 requires Node 24 runner support). Upgrading is a
+# deliberate decision to make across all your pipelines at once with
+# testing, not something to do silently here — see
+# https://github.com/aws-actions/configure-aws-credentials/releases

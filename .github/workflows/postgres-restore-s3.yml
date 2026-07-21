@@ -1,0 +1,264 @@
+name: PostgreSQL Restore from S3
+
+# Standalone restore pipeline — pulls a backup from S3, verifies its
+# checksum, and restores it onto ANY target database. Requires typed
+# confirmation since this OVERWRITES the target database.
+#
+# REQUIRED SECRETS:
+#   AWS_RESTORE_ROLE_ARN — OIDC role with s3:GetObject + s3:ListBucket +
+#     s3:PutObject on the backup bucket
+#   <ENV>_DB_HOST, <ENV>_DB_PORT, <ENV>_DB_NAME, <ENV>_DB_USER, <ENV>_DB_PASSWORD
+#
+# REQUIRED GITHUB ENVIRONMENTS: db-restore-approval-<TARGET> per
+# environment you want gated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      s3Bucket:
+        description: "S3 bucket where backups are stored"
+        required: true
+        type: string
+      kmsKeyId:
+        description: "KMS key ARN used for the pre-restore safety backup (blank = SSE-S3/AES256)"
+        required: false
+        default: ""
+        type: string
+      backupSourceEnvironment:
+        description: "Which environment's backup folder to pull from"
+        required: true
+        type: choice
+        options: [DEV, STAGING, PROD]
+      backupKey:
+        description: "Specific backup filename to restore (blank = most recent for backupSourceEnvironment)"
+        required: false
+        default: ""
+        type: string
+      targetEnvironment:
+        description: "Database to restore INTO — THIS WILL BE OVERWRITTEN"
+        required: true
+        type: choice
+        options: [DEV, STAGING, PROD]
+      confirmTargetName:
+        description: "Type the targetEnvironment value exactly (e.g. STAGING) to confirm you want to overwrite it"
+        required: true
+        type: string
+      postRestoreCheckQuery:
+        description: "Optional custom SQL to run after restore (e.g. 'SELECT count(*) FROM orders;'). Output is logged for manual review — see note in the verification step."
+        required: false
+        default: ""
+        type: string
+      awsRegion:
+        description: "AWS region"
+        required: false
+        default: "us-east-1"
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: db-restore-${{ inputs.targetEnvironment }}
+  cancel-in-progress: false
+
+jobs:
+  validate-confirmation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check typed confirmation matches target
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.confirmTargetName }}" != "${{ inputs.targetEnvironment }}" ]; then
+            echo "::error::confirmTargetName ('${{ inputs.confirmTargetName }}') does not match targetEnvironment ('${{ inputs.targetEnvironment }}'). Aborting before touching any database."
+            exit 1
+          fi
+          echo "Confirmation matches. Proceeding to approval gate."
+
+  restore:
+    name: Restore (approval required — overwrites target)
+    runs-on: ubuntu-latest
+    needs: validate-confirmation
+    timeout-minutes: 30
+    environment:
+      name: db-restore-approval-${{ inputs.targetEnvironment }}
+    steps:
+      - name: AWS login (OIDC)
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: ${{ secrets.AWS_RESTORE_ROLE_ARN }}
+          aws-region: ${{ inputs.awsRegion }}
+
+      - name: Validate required secrets are set
+        shell: bash
+        env:
+          DB_HOST: ${{ secrets[format('{0}_DB_HOST', inputs.targetEnvironment)] }}
+          DB_PORT: ${{ secrets[format('{0}_DB_PORT', inputs.targetEnvironment)] }}
+          DB_NAME: ${{ secrets[format('{0}_DB_NAME', inputs.targetEnvironment)] }}
+          DB_USER: ${{ secrets[format('{0}_DB_USER', inputs.targetEnvironment)] }}
+          DB_PASSWORD: ${{ secrets[format('{0}_DB_PASSWORD', inputs.targetEnvironment)] }}
+        run: |
+          set -euo pipefail
+          MISSING=0
+          [ -n "$DB_HOST" ]     || { echo "::error::${{ inputs.targetEnvironment }}_DB_HOST is not set."; MISSING=1; }
+          [ -n "$DB_PORT" ]     || { echo "::error::${{ inputs.targetEnvironment }}_DB_PORT is not set."; MISSING=1; }
+          [ -n "$DB_NAME" ]     || { echo "::error::${{ inputs.targetEnvironment }}_DB_NAME is not set."; MISSING=1; }
+          [ -n "$DB_USER" ]     || { echo "::error::${{ inputs.targetEnvironment }}_DB_USER is not set."; MISSING=1; }
+          [ -n "$DB_PASSWORD" ] || { echo "::error::${{ inputs.targetEnvironment }}_DB_PASSWORD is not set."; MISSING=1; }
+          [ "$MISSING" -eq 0 ] || exit 1
+          echo "All required secrets present."
+
+      - name: Resolve backup key (find latest if not specified)
+        id: resolve
+        shell: bash
+        env:
+          BUCKET: ${{ inputs.s3Bucket }}
+          SOURCE_ENV: ${{ inputs.backupSourceEnvironment }}
+          BACKUP_KEY_IN: ${{ inputs.backupKey }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BACKUP_KEY_IN" ]; then
+            KEY="postgres-backups/${SOURCE_ENV}/${BACKUP_KEY_IN}"
+          else
+            KEY="$(aws s3api list-objects-v2 --bucket "$BUCKET" --prefix "postgres-backups/${SOURCE_ENV}/" \
+              --query 'sort_by(Contents[?!ends_with(Key, `.sha256`)], &LastModified)[-1].Key' --output text)"
+            [ "$KEY" != "None" ] || { echo "::error::No backups found under postgres-backups/${SOURCE_ENV}/"; exit 1; }
+          fi
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          echo "Resolved backup: s3://${BUCKET}/${KEY}"
+
+      - name: Safety backup of TARGET before overwrite (always runs, no opt-out)
+        shell: bash
+        env:
+          TARGET: ${{ inputs.targetEnvironment }}
+          BUCKET: ${{ inputs.s3Bucket }}
+          KMS_KEY_ID: ${{ inputs.kmsKeyId }}
+          DB_HOST: ${{ secrets[format('{0}_DB_HOST', inputs.targetEnvironment)] }}
+          DB_PORT: ${{ secrets[format('{0}_DB_PORT', inputs.targetEnvironment)] }}
+          DB_NAME: ${{ secrets[format('{0}_DB_NAME', inputs.targetEnvironment)] }}
+          DB_USER: ${{ secrets[format('{0}_DB_USER', inputs.targetEnvironment)] }}
+          DB_PASSWORD: ${{ secrets[format('{0}_DB_PASSWORD', inputs.targetEnvironment)] }}
+        run: |
+          set -euo pipefail
+          TIMESTAMP="$(date -u +%Y%m%d-%H%M%S)"
+          SAFETY_FILE="${DB_NAME}-PRE-RESTORE-SAFETY-${TIMESTAMP}.dump"
+
+          docker run --rm -e PGPASSWORD="$DB_PASSWORD" -v "$PWD:/backup" postgres:16.4 \
+            pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -F c -f "/backup/$SAFETY_FILE"
+
+          sha256sum "$SAFETY_FILE" > "${SAFETY_FILE}.sha256"
+
+          if [ -n "$KMS_KEY_ID" ]; then
+            SSE_ARGS=(--sse aws:kms --sse-kms-key-id "$KMS_KEY_ID")
+          else
+            SSE_ARGS=(--sse AES256)
+          fi
+
+          aws s3 cp "$SAFETY_FILE" "s3://${BUCKET}/postgres-backups/${TARGET}/${SAFETY_FILE}" "${SSE_ARGS[@]}"
+          aws s3 cp "${SAFETY_FILE}.sha256" "s3://${BUCKET}/postgres-backups/${TARGET}/${SAFETY_FILE}.sha256" "${SSE_ARGS[@]}"
+
+          echo "Pre-restore safety backup of TARGET ($TARGET) saved: s3://${BUCKET}/postgres-backups/${TARGET}/${SAFETY_FILE}"
+          echo "If this restore goes wrong, this file is how you get $TARGET back."
+
+      - name: Download backup and verify checksum
+        shell: bash
+        env:
+          BUCKET: ${{ inputs.s3Bucket }}
+          KEY: ${{ steps.resolve.outputs.key }}
+        run: |
+          set -euo pipefail
+          aws s3 cp "s3://${BUCKET}/${KEY}" ./restore.dump
+          aws s3 cp "s3://${BUCKET}/${KEY}.sha256" ./restore.dump.sha256.remote
+
+          EXPECTED="$(awk '{print $1}' ./restore.dump.sha256.remote)"
+          ACTUAL="$(sha256sum ./restore.dump | awk '{print $1}')"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::Checksum mismatch on downloaded backup. Expected $EXPECTED, got $ACTUAL. Refusing to restore a possibly-corrupted file."
+            exit 1
+          fi
+          echo "Checksum verified: $ACTUAL"
+
+      - name: Restore onto target
+        shell: bash
+        env:
+          TARGET: ${{ inputs.targetEnvironment }}
+          DB_HOST: ${{ secrets[format('{0}_DB_HOST', inputs.targetEnvironment)] }}
+          DB_PORT: ${{ secrets[format('{0}_DB_PORT', inputs.targetEnvironment)] }}
+          DB_NAME: ${{ secrets[format('{0}_DB_NAME', inputs.targetEnvironment)] }}
+          DB_USER: ${{ secrets[format('{0}_DB_USER', inputs.targetEnvironment)] }}
+          DB_PASSWORD: ${{ secrets[format('{0}_DB_PASSWORD', inputs.targetEnvironment)] }}
+        run: |
+          set -euo pipefail
+          # --single-transaction: whole restore succeeds or rolls back
+          # atomically. NOTE: holds one long-running transaction for the
+          # entire restore — for very large databases this means a
+          # correspondingly long lock hold. Reconsider for multi-hundred-GB
+          # databases; may need a maintenance-window/segmented approach.
+          # --exit-on-error: stop at first failing statement rather than
+          # pg_restore's default of continuing past errors.
+          docker run --rm -e PGPASSWORD="$DB_PASSWORD" -v "$PWD:/restore" postgres:16.4 \
+            pg_restore -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
+            --clean --if-exists --no-owner --no-privileges \
+            --single-transaction --exit-on-error \
+            "/restore/restore.dump"
+
+          echo "Restore completed."
+
+      - name: Post-restore verification
+        shell: bash
+        env:
+          DB_HOST: ${{ secrets[format('{0}_DB_HOST', inputs.targetEnvironment)] }}
+          DB_PORT: ${{ secrets[format('{0}_DB_PORT', inputs.targetEnvironment)] }}
+          DB_NAME: ${{ secrets[format('{0}_DB_NAME', inputs.targetEnvironment)] }}
+          DB_USER: ${{ secrets[format('{0}_DB_USER', inputs.targetEnvironment)] }}
+          DB_PASSWORD: ${{ secrets[format('{0}_DB_PASSWORD', inputs.targetEnvironment)] }}
+          CUSTOM_QUERY: ${{ inputs.postRestoreCheckQuery }}
+        run: |
+          set -euo pipefail
+          # Automated pass/fail gate: table existence only. This is
+          # deliberately generic — it cannot verify business-data
+          # correctness because that requires knowing your actual schema.
+          TABLE_COUNT="$(docker run --rm -e PGPASSWORD="$DB_PASSWORD" postgres:16.4 \
+            psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';")"
+          TABLE_COUNT="$(echo "$TABLE_COUNT" | tr -d '[:space:]')"
+
+          if [ "$TABLE_COUNT" -eq 0 ]; then
+            echo "::error::Post-restore check failed: 0 tables found in public schema."
+            exit 1
+          fi
+          echo "Automated check passed: $TABLE_COUNT table(s) present."
+
+          # Optional custom query — informational only, NOT auto-evaluated
+          # for pass/fail, since an arbitrary query's "correct" result
+          # depends on business meaning only you know. Review its output
+          # in the summary below before considering this restore verified.
+          CUSTOM_OUTPUT=""
+          if [ -n "$CUSTOM_QUERY" ]; then
+            CUSTOM_OUTPUT="$(docker run --rm -e PGPASSWORD="$DB_PASSWORD" postgres:16.4 \
+              psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -c "$CUSTOM_QUERY" 2>&1 || echo "QUERY FAILED — see error above")"
+            echo "$CUSTOM_OUTPUT"
+          fi
+
+          {
+            echo "## Database Restore Completed"
+            echo ""
+            echo "- Restored INTO: \`${{ inputs.targetEnvironment }}\`"
+            echo "- Source backup: \`${{ steps.resolve.outputs.key }}\` (checksum verified)"
+            echo "- Pre-restore safety backup of target was created — see earlier step for its S3 location."
+            echo "- Automated check: $TABLE_COUNT table(s) found."
+            if [ -n "$CUSTOM_QUERY" ]; then
+              echo ""
+              echo "### Custom check output (review manually — not auto-evaluated)"
+              echo '```'
+              echo "$CUSTOM_OUTPUT"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# --- Action version note ---
+# Pinned to aws-actions/configure-aws-credentials v4.3.1 (SHA verified
+# 2026-07-21). v5 and v6 have since shipped with breaking changes — see
+# postgres-backup-s3.yml's footer for details before upgrading.
