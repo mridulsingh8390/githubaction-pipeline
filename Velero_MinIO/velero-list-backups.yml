@@ -1,4 +1,4 @@
-name: 10 - Velero List Backups (AKS / EKS / GKE)
+name: Velero List Backups (AKS / EKS / GKE)
 
 # Place this file at: .github/workflows/10-velero-list-backups.yml
 #
