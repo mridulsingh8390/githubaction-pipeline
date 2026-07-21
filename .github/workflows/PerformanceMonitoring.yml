@@ -1,0 +1,363 @@
+name: AKS Performance Monitoring
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: 'Target namespace (default: all)'
+        required: false
+        default: 'all'
+      duration:
+        description: 'Metrics collection duration in minutes (1-10)'
+        required: false
+        default: '1'
+      enable_issues:
+        description: 'Create GitHub issues for alerts'
+        required: false
+        default: 'true'
+      enable_slack:
+        description: 'Send Slack notifications for alerts'
+        required: false
+        default: 'false'
+
+env:
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
+  CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
+  ALERT_CPU_THRESHOLD: 80
+  ALERT_MEMORY_THRESHOLD: 85
+  KUBE_CAPACITY_VERSION: 0.8.0
+
+concurrency:
+  group: aks-monitor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  monitor-aks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Azure Login
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302 # v2.2.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Set AKS Context
+        uses: azure/aks-set-context@5c33da734abc0bfe82b89c1221c9b5c5d985f810 # v3
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ env.CLUSTER_NAME }}
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@3e0aecbd2ecf0c20f8a8720b94e3912fba3d491b # v4
+
+      - name: Install kube-capacity
+        run: |
+          curl -fsSL "https://github.com/robscott/kube-capacity/releases/download/v${KUBE_CAPACITY_VERSION}/kube-capacity-linux-amd64" -o kube-capacity
+          chmod +x kube-capacity
+          sudo mv kube-capacity /usr/local/bin/
+
+      - name: Resolve Namespace & Duration
+        id: cfg
+        run: |
+          NS="${{ github.event.inputs.namespace || 'all' }}"
+          if [ "$NS" = "all" ]; then
+            echo "flag=--all-namespaces" >> $GITHUB_OUTPUT
+            echo "label=all" >> $GITHUB_OUTPUT
+          else
+            echo "flag=-n $NS" >> $GITHUB_OUTPUT
+            echo "label=$NS" >> $GITHUB_OUTPUT
+          fi
+
+          # Validate and cap duration
+          DUR="${{ github.event.inputs.duration || '1' }}"
+          if ! [[ "$DUR" =~ ^[0-9]+$ ]] || [ "$DUR" -lt 1 ]; then
+            DUR=1
+          elif [ "$DUR" -gt 10 ]; then
+            DUR=10
+          fi
+          echo "duration=$DUR" >> $GITHUB_OUTPUT
+
+          # Resolve toggles: schedule defaults to true; dispatch respects input
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "issues=true" >> $GITHUB_OUTPUT
+            echo "slack=false" >> $GITHUB_OUTPUT
+          else
+            echo "issues=${{ github.event.inputs.enable_issues }}" >> $GITHUB_OUTPUT
+            echo "slack=${{ github.event.inputs.enable_slack }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Collect Cluster Overview
+        run: |
+          {
+            echo "# AKS Performance Report"
+            echo "**Cluster:** ${{ env.CLUSTER_NAME }}"
+            echo "**Resource Group:** ${{ env.RESOURCE_GROUP }}"
+            echo "**Namespace:** ${{ steps.cfg.outputs.label }}"
+            echo "**Timestamp:** $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "## Node Status"
+            kubectl get nodes -o wide
+            echo ""
+            echo "## Node Ready Conditions"
+            kubectl get nodes -o json | jq -r '
+              .items[] 
+              | .metadata.name as $n 
+              | (.status.conditions[] | select(.type=="Ready")) as $r 
+              | "\($n): Ready=\($r.status) (\($r.reason // "N/A"))"'
+            echo ""
+          } > report.md
+
+      - name: Collect Resource Utilization (Sampled)
+        run: |
+          DUR=${{ steps.cfg.outputs.duration }}
+          echo "## Node Resource Usage (${DUR}m sample)" >> report.md
+          for i in $(seq 1 "$DUR"); do
+            echo "### Sample $i ($(date -u +%H:%M:%SZ))" >> report.md
+            kubectl top nodes 2>/dev/null >> report.md || echo "_Metrics server unavailable_" >> report.md
+            echo "" >> report.md
+            [ "$i" -lt "$DUR" ] && sleep 60
+          done
+
+          echo "## Pod Resource Usage" >> report.md
+          kubectl top pods ${{ steps.cfg.outputs.flag }} 2>/dev/null >> report.md || echo "_Metrics server unavailable_" >> report.md
+          echo "" >> report.md
+
+          echo "## Capacity vs Requests vs Limits" >> report.md
+          kube-capacity --pods --util 2>/dev/null >> report.md || echo "_kube-capacity failed_" >> report.md
+          echo "" >> report.md
+
+      - name: Collect Pod Health
+        run: |
+          {
+            echo "## Non-Running / Non-Succeeded Pods"
+            kubectl get pods ${{ steps.cfg.outputs.flag }} --field-selector=status.phase!=Running,status.phase!=Succeeded 2>/dev/null || echo "_None or error_"
+            echo ""
+            echo "## Recent Warning Events"
+            kubectl get events ${{ steps.cfg.outputs.flag }} --field-selector=type=Warning --sort-by='.lastTimestamp' 2>/dev/null | tail -20 || echo "_No events or error_"
+            echo ""
+            echo "## High Restart Count Pods (>5)"
+            kubectl get pods ${{ steps.cfg.outputs.flag }} -o json 2>/dev/null | \
+              jq -r '.items[] 
+                | select((.status.containerStatuses? // []) | map(.restartCount // 0) | add > 5) 
+                | "\(.metadata.namespace)/\(.metadata.name): \([.status.containerStatuses[]? // [] | .restartCount // 0] | add) restarts"' \
+              || echo "_Error parsing restarts_"
+            echo ""
+          } >> report.md
+
+      - name: Collect HPA & Storage
+        run: |
+          {
+            echo "## HPA Status"
+            kubectl get hpa ${{ steps.cfg.outputs.flag }} 2>/dev/null || echo "_No HPA found_"
+            echo ""
+            echo "## Persistent Volume Claims"
+            kubectl get pvc ${{ steps.cfg.outputs.flag }} 2>/dev/null || echo "_No PVCs found_"
+            echo ""
+          } >> report.md
+
+      - name: Azure Monitor Metrics
+        run: |
+          {
+            echo "## Azure Monitor - Node CPU % (1h avg)"
+            az monitor metrics list \
+              --resource "$(az aks show -g ${{ env.RESOURCE_GROUP }} -n ${{ env.CLUSTER_NAME }} --query id -o tsv)" \
+              --metric "node_cpu_usage_percentage" \
+              --interval PT1H \
+              --aggregation Average Maximum \
+              --output table 2>/dev/null || echo "_Azure Monitor metrics unavailable_"
+            echo ""
+          } >> report.md
+
+      - name: Check Thresholds
+        id: threshold-check
+        run: |
+          ALERTS=""
+          ALERT_COUNT=0
+          TOP_NODES=$(kubectl top nodes --no-headers 2>/dev/null || true)
+
+          if [ -n "$TOP_NODES" ]; then
+            NODE_CPU=$(echo "$TOP_NODES" | awk '{print $3}' | sed 's/%//' | sort -nr | head -1)
+            if [ -n "$NODE_CPU" ] && [ "$NODE_CPU" -gt "${{ env.ALERT_CPU_THRESHOLD }}" ] 2>/dev/null; then
+              ALERTS="${ALERTS}🚨 **HIGH CPU**: Node CPU at ${NODE_CPU}% (threshold: ${{ env.ALERT_CPU_THRESHOLD }}%)\\n"
+              ALERT_COUNT=$((ALERT_COUNT + 1))
+            fi
+
+            NODE_MEM=$(echo "$TOP_NODES" | awk '{print $5}' | sed 's/%//' | sort -nr | head -1)
+            if [ -n "$NODE_MEM" ] && [ "$NODE_MEM" -gt "${{ env.ALERT_MEMORY_THRESHOLD }}" ] 2>/dev/null; then
+              ALERTS="${ALERTS}🚨 **HIGH MEMORY**: Node memory at ${NODE_MEM}% (threshold: ${{ env.ALERT_MEMORY_THRESHOLD }}%)\\n"
+              ALERT_COUNT=$((ALERT_COUNT + 1))
+            fi
+          fi
+
+          RESTART_PODS=$(kubectl get pods ${{ steps.cfg.outputs.flag }} -o json 2>/dev/null | \
+            jq '[.items[] | select((.status.containerStatuses? // []) | map(.restartCount // 0) | add > 10)] | length' || echo "0")
+
+          if [ "$RESTART_PODS" -gt 0 ] 2>/dev/null; then
+            ALERTS="${ALERTS}⚠️ **POD RESTARTS**: ${RESTART_PODS} pods with >10 restarts\\n"
+            ALERT_COUNT=$((ALERT_COUNT + 1))
+          fi
+
+          PENDING_PODS=$(kubectl get pods ${{ steps.cfg.outputs.flag }} --field-selector=status.phase=Pending --no-headers 2>/dev/null | wc -l)
+          if [ "$PENDING_PODS" -gt 5 ] 2>/dev/null; then
+            ALERTS="${ALERTS}⚠️ **PENDING PODS**: ${PENDING_PODS} pods stuck in Pending\\n"
+            ALERT_COUNT=$((ALERT_COUNT + 1))
+          fi
+
+          echo "alert_count=$ALERT_COUNT" >> $GITHUB_OUTPUT
+
+          if [ -n "$ALERTS" ]; then
+            echo "alerts=true" >> $GITHUB_OUTPUT
+            {
+              echo ""
+              echo "## ⚠️ ALERTS DETECTED (${ALERT_COUNT})"
+              echo -e "$ALERTS"
+            } >> report.md
+
+            {
+              echo "## 🚨 AKS Alert Summary (${ALERT_COUNT})"
+              echo -e "$ALERTS"
+              echo ""
+              echo "[View Full Report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            } >> $GITHUB_STEP_SUMMARY
+          else
+            echo "alerts=false" >> $GITHUB_OUTPUT
+            echo "" >> report.md
+            echo "## ✅ All metrics within normal thresholds" >> report.md
+
+            {
+              echo "## ✅ AKS Health Check Passed"
+              echo "All metrics within normal thresholds."
+              echo ""
+              echo "[View Full Report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Report
+        if: always()
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: aks-report-${{ env.CLUSTER_NAME }}-${{ steps.cfg.outputs.label }}-${{ github.run_id }}
+          path: report.md
+          retention-days: 30
+
+      - name: Pass Alert State
+        id: pass-state
+        run: |
+          echo "alerts=${{ steps.threshold-check.outputs.alerts }}" >> $GITHUB_OUTPUT
+          echo "alert_count=${{ steps.threshold-check.outputs.alert_count }}" >> $GITHUB_OUTPUT
+          echo "label=${{ steps.cfg.outputs.label }}" >> $GITHUB_OUTPUT
+          echo "issues=${{ steps.cfg.outputs.issues }}" >> $GITHUB_OUTPUT
+          echo "slack=${{ steps.cfg.outputs.slack }}" >> $GITHUB_OUTPUT
+          echo "cluster=${{ env.CLUSTER_NAME }}" >> $GITHUB_OUTPUT
+
+    outputs:
+      alerts: ${{ steps.pass-state.outputs.alerts }}
+      alert_count: ${{ steps.pass-state.outputs.alert_count }}
+      label: ${{ steps.pass-state.outputs.label }}
+      issues: ${{ steps.pass-state.outputs.issues }}
+      slack: ${{ steps.pass-state.outputs.slack }}
+      cluster: ${{ steps.pass-state.outputs.cluster }}
+
+  alert-issues:
+    needs: monitor-aks
+    if: needs.monitor-aks.outputs.alerts == 'true' && needs.monitor-aks.outputs.issues == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Download Report
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: aks-report-${{ needs.monitor-aks.outputs.cluster }}-${{ needs.monitor-aks.outputs.label }}-${{ github.run_id }}
+          path: ./artifact
+
+      - name: Find Existing Alert Issue
+        id: find-issue
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const label = 'aks-monitoring';
+            const date = new Date().toISOString().split('T')[0];
+            const titlePrefix = `🚨 AKS Alert: Performance threshold exceeded - ${date}`;
+            
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: [label, 'alert'],
+              state: 'open',
+              per_page: 10
+            });
+            
+            const existing = issues.data.find(i => i.title.startsWith(titlePrefix));
+            if (existing) {
+              core.setOutput('issue_number', existing.number);
+              core.setOutput('exists', 'true');
+            } else {
+              core.setOutput('exists', 'false');
+            }
+
+      - name: Create or Update Alert Issue
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('./artifact/report.md', 'utf8');
+            const count = '${{ needs.monitor-aks.outputs.alert_count }}';
+            const body = `## 🚨 AKS Performance Alert (${count} alert${count === '1' ? '' : 's'})\n\n**Cluster:** ${{ needs.monitor-aks.outputs.cluster }}\n**Namespace:** ${{ needs.monitor-aks.outputs.label }}\n**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n---\n\n${report}`;
+            const title = `🚨 AKS Alert: ${count} threshold${count === '1' ? '' : 's'} exceeded - ${new Date().toISOString().split('T')[0]}`;
+            
+            if ('${{ steps.find-issue.outputs.exists }}' === 'true') {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: parseInt('${{ steps.find-issue.outputs.issue_number }}'),
+                body: `**Updated at ${new Date().toISOString()}** (${count} alert${count === '1' ? '' : 's'})\n\n${body}`
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['aks-monitoring', 'alert', 'performance']
+              });
+            }
+
+  alert-slack:
+    needs: monitor-aks
+    if: needs.monitor-aks.outputs.alerts == 'true' && needs.monitor-aks.outputs.slack == 'true' && secrets.SLACK_WEBHOOK_URL != ''
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Notify Slack
+        uses: slackapi/slack-github-action@37ebaef184d7626c5f204ab8d3baff4262dd30f0 # v1.27.0
+        with:
+          payload: |
+            {
+              "text": "🚨 AKS Performance Alert",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*AKS Cluster Alert*\n*Cluster:* ${{ needs.monitor-aks.outputs.cluster }}\n*Namespace:* ${{ needs.monitor-aks.outputs.label }}\n*Alerts:* ${{ needs.monitor-aks.outputs.alert_count }}\n*Status:* Thresholds exceeded\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
