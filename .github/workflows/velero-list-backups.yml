@@ -15,6 +15,11 @@ name: Velero List Backups (AKS / EKS / GKE)
 #   AKS: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
 #   EKS: AWS_ROLE_TO_ASSUME
 #   GKE: GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT
+#
+# See README.md section 12 for the recommended SHA-pinning hardening step
+# for the marketplace actions used below (azure/login,
+# aws-actions/configure-aws-credentials, google-github-actions/auth,
+# google-github-actions/setup-gcloud, actions/upload-artifact).
 
 on:
   workflow_dispatch:
@@ -85,7 +90,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: velero-list-backups-${{ inputs.platform }}-${{ inputs.aks_name || inputs.eks_cluster_name || inputs.gke_cluster_name }}
+  group: velero-list-backups-${{ inputs.platform }}-${{ github.run_id }}
   cancel-in-progress: true
 
 env:
@@ -188,13 +193,23 @@ jobs:
           tar -xzf velero.tar.gz
           sudo mv velero-${VERSION}-linux-amd64/velero /usr/local/bin/velero
 
+      - name: Verify CLI tools installed correctly
+        run: |
+          kubectl version --client
+          velero version --client-only
+          jq --version
+
       - name: Verify Velero is reachable
         run: |
           kubectl get pods -n "$VELERO_NS"
-          PHASE=$(velero backup-location get -n "$VELERO_NS" -o json | jq -r '.items[0].status.phase' 2>/dev/null || echo "Unknown")
+          # 2>/dev/null on the velero call + `// "Missing"` on the jq filter
+          # both guard against a missing/empty BackupStorageLocation list
+          # (e.g. Velero installed but BSL never created) instead of
+          # letting `.items[0]` resolve to null and print a bare empty phase.
+          PHASE=$(velero backup-location get -n "$VELERO_NS" -o json 2>/dev/null | jq -r '.items[0].status.phase // "Missing"')
           echo "BackupStorageLocation phase: $PHASE"
           if [ "$PHASE" != "Available" ]; then
-            echo "::warning::BackupStorageLocation phase is '$PHASE', not 'Available'. Backup list below may be incomplete or stale."
+            echo "::warning::BackupStorageLocation phase is '$PHASE', not 'Available'. Backup list below may be incomplete, stale, or empty."
           fi
 
       - name: List backups (table)
@@ -215,14 +230,13 @@ jobs:
             else
               echo "| Name | Status | Created (UTC) | Expires (UTC) | Namespaces |"
               echo "|---|---|---|---|---|"
-              jq -r '.items[] | [
-                  .metadata.name,
-                  (.status.phase // "Unknown"),
-                  (.metadata.creationTimestamp // "-"),
-                  (.status.expiration // "-"),
-                  ((.spec.includedNamespaces // ["*"]) | join(","))
-                ] | @tsv' backups.json | sort -t $'\t' -k3 -r | \
-                awk -F'\t' '{printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}'
+              jq -r '
+                .items
+                | sort_by(.metadata.creationTimestamp)
+                | reverse
+                | .[]
+                | "| \(.metadata.name) | \(.status.phase // "Unknown") | \(.metadata.creationTimestamp // "-") | \(.status.expiration // "-") | \((.spec.includedNamespaces // ["*"]) | join(",")) |"
+              ' backups.json
             fi
           } | tee backup-report.md
 
