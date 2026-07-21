@@ -65,22 +65,22 @@ jobs:
             echo "Current branch: ${{ github.ref_name }}"
             exit 1
           fi
-          echo "✅ Manual run from allowed branch: ${{ github.ref_name }}"
+          echo "Manual run from allowed branch: ${{ github.ref_name }}"
 
       - name: Checkout Repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: AWS Login (OIDC)
-        uses: aws-actions/configure-aws-credentials@4d281fbd4e61c15be56bb14b817fb5f5e6245a6f # v6.2.1
+        uses: aws-actions/configure-aws-credentials@4d281fbd4e61c15be56bb14b817fb5f5e6245a6f
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           role-session-name: github-actions-eks-monitor-${{ github.run_id }}
           aws-region: ${{ github.event.inputs.region || secrets.AWS_REGION || 'us-east-1' }}
 
-      - name: Resolve Cluster, Region & Thresholds
+      - name: Resolve Cluster Region and Thresholds
         id: cfg
         run: |
           REGION="${{ github.event.inputs.region || secrets.AWS_REGION || 'us-east-1' }}"
@@ -110,7 +110,7 @@ jobs:
               echo "Error: Multiple EKS clusters found in $REGION:"
               for c in $CLUSTERS; do echo "  - $c"; done
               echo ""
-              echo "Please specify a cluster explicitly via the 'cluster' input."
+              echo "Please specify a cluster explicitly via the cluster input."
               exit 1
             fi
           fi
@@ -161,7 +161,7 @@ jobs:
             --name ${{ steps.cfg.outputs.cluster }}
 
       - name: Setup kubectl
-        uses: azure/setup-kubectl@3e0aecbd2ecf0c20f8a8720b94e3912fba3d491b # v4
+        uses: azure/setup-kubectl@3e0aecbd2ecf0c20f8a8720b94e3912fba3d491b
 
       - name: Install kube-capacity
         run: |
@@ -198,13 +198,13 @@ jobs:
           echo "## Node Resource Usage (${DUR}m sample)" >> report.md
           for i in $(seq 1 "$DUR"); do
             echo "### Sample $i ($(date -u +%H:%M:%SZ))" >> report.md
-            kubectl top nodes 2>/dev/null >> report.md || echo "_Metrics server unavailable — ensure metrics-server is installed_" >> report.md
+            kubectl top nodes 2>/dev/null >> report.md || echo "_Metrics server unavailable - ensure metrics-server is installed_" >> report.md
             echo "" >> report.md
             [ "$i" -lt "$DUR" ] && sleep 60
           done
 
           echo "## Pod Resource Usage" >> report.md
-          kubectl top pods ${{ steps.cfg.outputs.flag }} 2>/dev/null >> report.md || echo "_Metrics server unavailable — ensure metrics-server is installed_" >> report.md
+          kubectl top pods ${{ steps.cfg.outputs.flag }} 2>/dev/null >> report.md || echo "_Metrics server unavailable - ensure metrics-server is installed_" >> report.md
           echo "" >> report.md
 
           echo "## Capacity vs Requests vs Limits" >> report.md
@@ -229,7 +229,7 @@ jobs:
             echo ""
           } >> report.md
 
-      - name: Collect HPA & Storage
+      - name: Collect HPA and Storage
         run: |
           {
             echo "## HPA Status"
@@ -269,13 +269,13 @@ jobs:
           if [ -n "$TOP_NODES" ]; then
             NODE_CPU=$(echo "$TOP_NODES" | awk '{print $3}' | sed 's/%//' | sort -nr | head -1)
             if [ -n "$NODE_CPU" ] && [ "$NODE_CPU" -gt "$CPU_THR" ] 2>/dev/null; then
-              ALERTS="${ALERTS}🚨 **HIGH CPU**: Node CPU at ${NODE_CPU}% (threshold: ${CPU_THR}%)\\n"
+              ALERTS="${ALERTS}**HIGH CPU**: Node CPU at ${NODE_CPU}% (threshold: ${CPU_THR}%)\\n"
               ALERT_COUNT=$((ALERT_COUNT + 1))
             fi
 
             NODE_MEM=$(echo "$TOP_NODES" | awk '{print $5}' | sed 's/%//' | sort -nr | head -1)
             if [ -n "$NODE_MEM" ] && [ "$NODE_MEM" -gt "$MEM_THR" ] 2>/dev/null; then
-              ALERTS="${ALERTS}🚨 **HIGH MEMORY**: Node memory at ${NODE_MEM}% (threshold: ${MEM_THR}%)\\n"
+              ALERTS="${ALERTS}**HIGH MEMORY**: Node memory at ${NODE_MEM}% (threshold: ${MEM_THR}%)\\n"
               ALERT_COUNT=$((ALERT_COUNT + 1))
             fi
           fi
@@ -284,13 +284,13 @@ jobs:
             jq '[.items[] | select((.status.containerStatuses? // []) | map(.restartCount // 0) | add > 10)] | length' || echo "0")
 
           if [ "$RESTART_PODS" -gt 0 ] 2>/dev/null; then
-            ALERTS="${ALERTS}⚠️ **POD RESTARTS**: ${RESTART_PODS} pods with >10 restarts\\n"
+            ALERTS="${ALERTS}**POD RESTARTS**: ${RESTART_PODS} pods with >10 restarts\\n"
             ALERT_COUNT=$((ALERT_COUNT + 1))
           fi
 
           PENDING_PODS=$(kubectl get pods ${{ steps.cfg.outputs.flag }} --field-selector=status.phase=Pending --no-headers 2>/dev/null | wc -l)
           if [ "$PENDING_PODS" -gt 5 ] 2>/dev/null; then
-            ALERTS="${ALERTS}⚠️ **PENDING PODS**: ${PENDING_PODS} pods stuck in Pending\\n"
+            ALERTS="${ALERTS}**PENDING PODS**: ${PENDING_PODS} pods stuck in Pending\\n"
             ALERT_COUNT=$((ALERT_COUNT + 1))
           fi
 
@@ -300,12 +300,12 @@ jobs:
             echo "alerts=true" >> $GITHUB_OUTPUT
             {
               echo ""
-              echo "## ⚠️ ALERTS DETECTED (${ALERT_COUNT})"
+              echo "## ALERTS DETECTED (${ALERT_COUNT})"
               echo -e "$ALERTS"
             } >> report.md
 
             {
-              echo "## 🚨 EKS Alert Summary (${ALERT_COUNT})"
+              echo "## EKS Alert Summary (${ALERT_COUNT})"
               echo -e "$ALERTS"
               echo ""
               echo "[View Full Report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
@@ -313,10 +313,10 @@ jobs:
           else
             echo "alerts=false" >> $GITHUB_OUTPUT
             echo "" >> report.md
-            echo "## ✅ All metrics within normal thresholds" >> report.md
+            echo "## All metrics within normal thresholds" >> report.md
 
             {
-              echo "## ✅ EKS Health Check Passed"
+              echo "## EKS Health Check Passed"
               echo "All metrics within normal thresholds."
               echo ""
               echo "[View Full Report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
@@ -325,7 +325,7 @@ jobs:
 
       - name: Upload Report
         if: always()
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
           name: eks-report-${{ steps.cfg.outputs.cluster }}-${{ steps.cfg.outputs.label }}-${{ github.run_id }}
           path: report.md
@@ -363,14 +363,14 @@ jobs:
       issues: write
     steps:
       - name: Download Report
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
         with:
           name: eks-report-${{ needs.monitor-eks.outputs.cluster }}-${{ needs.monitor-eks.outputs.label }}-${{ github.run_id }}
           path: ./artifact
 
       - name: Find Existing Alert Issue
         id: find-issue
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
         with:
           script: |
             const date = new Date().toISOString().split('T')[0];
@@ -382,7 +382,7 @@ jobs:
               per_page: 50
             });
             const existing = issues.data.find(i =>
-              i.title.startsWith('🚨 EKS Alert:') && i.title.endsWith(`- ${date}`)
+              i.title.startsWith('EKS Alert:') && i.title.endsWith(`- ${date}`)
             );
             if (existing) {
               core.setOutput('issue_number', existing.number);
@@ -392,7 +392,7 @@ jobs:
             }
 
       - name: Create or Update Alert Issue
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
         with:
           script: |
             const fs = require('fs');
@@ -400,8 +400,8 @@ jobs:
             const count = '${{ needs.monitor-eks.outputs.alert_count }}';
             const cpuThr = '${{ needs.monitor-eks.outputs.cpu_threshold }}';
             const memThr = '${{ needs.monitor-eks.outputs.memory_threshold }}';
-            const body = `## 🚨 EKS Performance Alert (${count} alert${count === '1' ? '' : 's'})\n\n**Cluster:** ${{ needs.monitor-eks.outputs.cluster }}\n**Region:** ${{ needs.monitor-eks.outputs.region }}\n**Namespace:** ${{ needs.monitor-eks.outputs.label }}\n**Thresholds:** CPU ${cpuThr}%, Memory ${memThr}%\n**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n---\n\n${report}`;
-            const title = `🚨 EKS Alert: ${count} threshold${count === '1' ? '' : 's'} exceeded - ${new Date().toISOString().split('T')[0]}`;
+            const body = `## EKS Performance Alert (${count} alert${count === '1' ? '' : 's'})\n\n**Cluster:** ${{ needs.monitor-eks.outputs.cluster }}\n**Region:** ${{ needs.monitor-eks.outputs.region }}\n**Namespace:** ${{ needs.monitor-eks.outputs.label }}\n**Thresholds:** CPU ${cpuThr}%, Memory ${memThr}%\n**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n---\n\n${report}`;
+            const title = `EKS Alert: ${count} threshold${count === '1' ? '' : 's'} exceeded - ${new Date().toISOString().split('T')[0]}`;
             
             if ('${{ steps.find-issue.outputs.exists }}' === 'true') {
               await github.rest.issues.createComment({
@@ -427,11 +427,11 @@ jobs:
     permissions: {}
     steps:
       - name: Notify Slack
-        uses: slackapi/slack-github-action@37ebaef184d7626c5f204ab8d3baff4262dd30f0 # v1.27.0
+        uses: slackapi/slack-github-action@37ebaef184d7626c5f204ab8d3baff4262dd30f0
         with:
           payload: |
             {
-              "text": "🚨 EKS Performance Alert",
+              "text": "EKS Performance Alert",
               "blocks": [
                 {
                   "type": "section",
