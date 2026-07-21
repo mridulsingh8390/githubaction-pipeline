@@ -6,11 +6,11 @@ on:
   workflow_dispatch:
     inputs:
       cluster:
-        description: 'AKS cluster name (e.g., aks-prod-eastus)'
-        required: true
-        default: 'aks-prod-eastus'
+        description: 'AKS cluster name (auto-detected if empty)'
+        required: false
+        default: ''
       resource_group:
-        description: 'Resource group (auto-detected if left empty)'
+        description: 'Azure resource group (auto-detected if empty)'
         required: false
         default: ''
       namespace:
@@ -21,6 +21,14 @@ on:
         description: 'Metrics collection duration in minutes (1-10)'
         required: false
         default: '1'
+      cpu_threshold:
+        description: 'CPU alert threshold % (default: 80)'
+        required: false
+        default: '80'
+      memory_threshold:
+        description: 'Memory alert threshold % (default: 85)'
+        required: false
+        default: '85'
       enable_issues:
         description: 'Create GitHub issues for alerts'
         required: false
@@ -31,10 +39,10 @@ on:
         default: 'false'
 
 env:
-  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-  ALERT_CPU_THRESHOLD: 80
-  ALERT_MEMORY_THRESHOLD: 85
+  DEFAULT_CPU_THRESHOLD: 80
+  DEFAULT_MEMORY_THRESHOLD: 85
   KUBE_CAPACITY_VERSION: 0.8.0
+  ALLOWED_MANUAL_BRANCH: main
 
 concurrency:
   group: aks-monitor-${{ github.ref }}
@@ -46,56 +54,84 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      id-token: write
 
     steps:
+      - name: Enforce Branch for Manual Runs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.ref_name }}" != "${{ env.ALLOWED_MANUAL_BRANCH }}" ]; then
+            echo "Error: Manual runs are only allowed from the '${{ env.ALLOWED_MANUAL_BRANCH }}' branch."
+            echo "Current branch: ${{ github.ref_name }}"
+            exit 1
+          fi
+          echo "Manual run from allowed branch: ${{ github.ref_name }}"
+
       - name: Checkout Repository
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
 
-      - name: Azure Login
-        uses: azure/login@a65d910e8af852a8061c627c456678983e180302 # v2.2.0
+      - name: Azure Login (OIDC)
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Resolve Cluster & Resource Group
+      - name: Resolve Cluster, Resource Group and Thresholds
         id: cfg
         run: |
-          # Resolve cluster name
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            CLUSTER="${{ secrets.AKS_CLUSTER_NAME }}"
-          else
-            CLUSTER="${{ github.event.inputs.cluster }}"
-          fi
+          CLUSTER_INPUT="${{ github.event.inputs.cluster }}"
+          CLUSTER_SECRET="${{ secrets.AKS_CLUSTER_NAME }}"
+          RG_INPUT="${{ github.event.inputs.resource_group }}"
+          RG_SECRET="${{ secrets.AKS_RESOURCE_GROUP }}"
 
-          if [ -z "$CLUSTER" ]; then
-            echo "Error: Cluster name is required"
-            exit 1
+          if [ -n "$CLUSTER_INPUT" ]; then
+            CLUSTER="$CLUSTER_INPUT"
+            echo "Using explicitly provided cluster: $CLUSTER"
+          elif [ -n "$CLUSTER_SECRET" ]; then
+            CLUSTER="$CLUSTER_SECRET"
+            echo "Using cluster from secrets: $CLUSTER"
+          else
+            echo "Auto-detecting AKS clusters..."
+            CLUSTERS=$(az aks list --query '[].name' -o tsv 2>/dev/null)
+            CLUSTER_COUNT=$(echo "$CLUSTERS" | grep -v '^$' | wc -l)
+            
+            if [ "$CLUSTER_COUNT" -eq 0 ] || [ -z "$CLUSTERS" ]; then
+              echo "Error: No AKS clusters found in subscription"
+              exit 1
+            elif [ "$CLUSTER_COUNT" -eq 1 ]; then
+              CLUSTER=$(echo "$CLUSTERS" | head -1)
+              echo "Auto-detected single cluster: $CLUSTER"
+            else
+              echo "Error: Multiple AKS clusters found:"
+              echo "$CLUSTERS" | while read c; do [ -n "$c" ] && echo "  - $c"; done
+              echo ""
+              echo "Please specify a cluster explicitly via the cluster input."
+              exit 1
+            fi
           fi
           echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
 
-          # Resolve resource group
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            RG="${{ secrets.AKS_RESOURCE_GROUP }}"
+          if [ -n "$RG_INPUT" ]; then
+            RG="$RG_INPUT"
+            echo "Using explicitly provided resource group: $RG"
+          elif [ -n "$RG_SECRET" ]; then
+            RG="$RG_SECRET"
+            echo "Using resource group from secrets: $RG"
           else
-            RG="${{ github.event.inputs.resource_group }}"
-          fi
-
-          if [ -z "$RG" ]; then
-            echo "Auto-detecting resource group for cluster: $CLUSTER"
+            echo "Auto-detecting resource group for cluster $CLUSTER..."
             RG=$(az aks list --query "[?name=='$CLUSTER'].resourceGroup" -o tsv 2>/dev/null)
             if [ -z "$RG" ]; then
-              echo "Error: Could not auto-detect resource group for cluster '$CLUSTER'. Please provide it explicitly."
+              echo "Error: Could not auto-detect resource group for cluster '$CLUSTER'"
               exit 1
             fi
-            echo "Detected resource group: $RG"
+            echo "Auto-detected resource group: $RG"
           fi
           echo "resource_group=$RG" >> $GITHUB_OUTPUT
 
-          # Resolve namespace
           NS="${{ github.event.inputs.namespace || 'all' }}"
           if [ "$NS" = "all" ]; then
             echo "flag=--all-namespaces" >> $GITHUB_OUTPUT
@@ -105,7 +141,6 @@ jobs:
             echo "label=$NS" >> $GITHUB_OUTPUT
           fi
 
-          # Validate and cap duration
           DUR="${{ github.event.inputs.duration || '1' }}"
           if ! [[ "$DUR" =~ ^[0-9]+$ ]] || [ "$DUR" -lt 1 ]; then
             DUR=1
@@ -114,7 +149,18 @@ jobs:
           fi
           echo "duration=$DUR" >> $GITHUB_OUTPUT
 
-          # Resolve toggles: schedule defaults to true; dispatch respects input
+          CPU="${{ github.event.inputs.cpu_threshold || env.DEFAULT_CPU_THRESHOLD }}"
+          if ! [[ "$CPU" =~ ^[0-9]+$ ]] || [ "$CPU" -lt 1 ] || [ "$CPU" -gt 100 ]; then
+            CPU=${{ env.DEFAULT_CPU_THRESHOLD }}
+          fi
+          echo "cpu_threshold=$CPU" >> $GITHUB_OUTPUT
+
+          MEM="${{ github.event.inputs.memory_threshold || env.DEFAULT_MEMORY_THRESHOLD }}"
+          if ! [[ "$MEM" =~ ^[0-9]+$ ]] || [ "$MEM" -lt 1 ] || [ "$MEM" -gt 100 ]; then
+            MEM=${{ env.DEFAULT_MEMORY_THRESHOLD }}
+          fi
+          echo "memory_threshold=$MEM" >> $GITHUB_OUTPUT
+
           if [ "${{ github.event_name }}" = "schedule" ]; then
             echo "issues=true" >> $GITHUB_OUTPUT
             echo "slack=false" >> $GITHUB_OUTPUT
@@ -124,13 +170,13 @@ jobs:
           fi
 
       - name: Set AKS Context
-        uses: azure/aks-set-context@5c33da734abc0bfe82b89c1221c9b5c5d985f810 # v3
+        uses: azure/aks-set-context@5c33da734abc0bfe82b89c1221c9b5c5d985f810
         with:
           resource-group: ${{ steps.cfg.outputs.resource_group }}
           cluster-name: ${{ steps.cfg.outputs.cluster }}
 
       - name: Setup kubectl
-        uses: azure/setup-kubectl@3e0aecbd2ecf0c20f8a8720b94e3912fba3d491b # v4
+        uses: azure/setup-kubectl@3e0aecbd2ecf0c20f8a8720b94e3912fba3d491b
 
       - name: Install kube-capacity
         run: |
@@ -145,6 +191,8 @@ jobs:
             echo "**Cluster:** ${{ steps.cfg.outputs.cluster }}"
             echo "**Resource Group:** ${{ steps.cfg.outputs.resource_group }}"
             echo "**Namespace:** ${{ steps.cfg.outputs.label }}"
+            echo "**CPU Threshold:** ${{ steps.cfg.outputs.cpu_threshold }}%"
+            echo "**Memory Threshold:** ${{ steps.cfg.outputs.memory_threshold }}%"
             echo "**Timestamp:** $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo ""
             echo "## Node Status"
@@ -165,13 +213,13 @@ jobs:
           echo "## Node Resource Usage (${DUR}m sample)" >> report.md
           for i in $(seq 1 "$DUR"); do
             echo "### Sample $i ($(date -u +%H:%M:%SZ))" >> report.md
-            kubectl top nodes 2>/dev/null >> report.md || echo "_Metrics server unavailable_" >> report.md
+            kubectl top nodes 2>/dev/null >> report.md || echo "_Metrics server unavailable - ensure metrics-server is installed_" >> report.md
             echo "" >> report.md
             [ "$i" -lt "$DUR" ] && sleep 60
           done
 
           echo "## Pod Resource Usage" >> report.md
-          kubectl top pods ${{ steps.cfg.outputs.flag }} 2>/dev/null >> report.md || echo "_Metrics server unavailable_" >> report.md
+          kubectl top pods ${{ steps.cfg.outputs.flag }} 2>/dev/null >> report.md || echo "_Metrics server unavailable - ensure metrics-server is installed_" >> report.md
           echo "" >> report.md
 
           echo "## Capacity vs Requests vs Limits" >> report.md
@@ -196,7 +244,7 @@ jobs:
             echo ""
           } >> report.md
 
-      - name: Collect HPA & Storage
+      - name: Collect HPA and Storage
         run: |
           {
             echo "## HPA Status"
@@ -225,18 +273,20 @@ jobs:
         run: |
           ALERTS=""
           ALERT_COUNT=0
+          CPU_THR=${{ steps.cfg.outputs.cpu_threshold }}
+          MEM_THR=${{ steps.cfg.outputs.memory_threshold }}
           TOP_NODES=$(kubectl top nodes --no-headers 2>/dev/null || true)
 
           if [ -n "$TOP_NODES" ]; then
             NODE_CPU=$(echo "$TOP_NODES" | awk '{print $3}' | sed 's/%//' | sort -nr | head -1)
-            if [ -n "$NODE_CPU" ] && [ "$NODE_CPU" -gt "${{ env.ALERT_CPU_THRESHOLD }}" ] 2>/dev/null; then
-              ALERTS="${ALERTS}🚨 **HIGH CPU**: Node CPU at ${NODE_CPU}% (threshold: ${{ env.ALERT_CPU_THRESHOLD }}%)\\n"
+            if [ -n "$NODE_CPU" ] && [ "$NODE_CPU" -gt "$CPU_THR" ] 2>/dev/null; then
+              ALERTS="${ALERTS}**HIGH CPU**: Node CPU at ${NODE_CPU}% (threshold: ${CPU_THR}%)\\n"
               ALERT_COUNT=$((ALERT_COUNT + 1))
             fi
 
             NODE_MEM=$(echo "$TOP_NODES" | awk '{print $5}' | sed 's/%//' | sort -nr | head -1)
-            if [ -n "$NODE_MEM" ] && [ "$NODE_MEM" -gt "${{ env.ALERT_MEMORY_THRESHOLD }}" ] 2>/dev/null; then
-              ALERTS="${ALERTS}🚨 **HIGH MEMORY**: Node memory at ${NODE_MEM}% (threshold: ${{ env.ALERT_MEMORY_THRESHOLD }}%)\\n"
+            if [ -n "$NODE_MEM" ] && [ "$NODE_MEM" -gt "$MEM_THR" ] 2>/dev/null; then
+              ALERTS="${ALERTS}**HIGH MEMORY**: Node memory at ${NODE_MEM}% (threshold: ${MEM_THR}%)\\n"
               ALERT_COUNT=$((ALERT_COUNT + 1))
             fi
           fi
@@ -245,13 +295,13 @@ jobs:
             jq '[.items[] | select((.status.containerStatuses? // []) | map(.restartCount // 0) | add > 10)] | length' || echo "0")
 
           if [ "$RESTART_PODS" -gt 0 ] 2>/dev/null; then
-            ALERTS="${ALERTS}⚠️ **POD RESTARTS**: ${RESTART_PODS} pods with >10 restarts\\n"
+            ALERTS="${ALERTS}**POD RESTARTS**: ${RESTART_PODS} pods with >10 restarts\\n"
             ALERT_COUNT=$((ALERT_COUNT + 1))
           fi
 
           PENDING_PODS=$(kubectl get pods ${{ steps.cfg.outputs.flag }} --field-selector=status.phase=Pending --no-headers 2>/dev/null | wc -l)
           if [ "$PENDING_PODS" -gt 5 ] 2>/dev/null; then
-            ALERTS="${ALERTS}⚠️ **PENDING PODS**: ${PENDING_PODS} pods stuck in Pending\\n"
+            ALERTS="${ALERTS}**PENDING PODS**: ${PENDING_PODS} pods stuck in Pending\\n"
             ALERT_COUNT=$((ALERT_COUNT + 1))
           fi
 
@@ -261,12 +311,12 @@ jobs:
             echo "alerts=true" >> $GITHUB_OUTPUT
             {
               echo ""
-              echo "## ⚠️ ALERTS DETECTED (${ALERT_COUNT})"
+              echo "## ALERTS DETECTED (${ALERT_COUNT})"
               echo -e "$ALERTS"
             } >> report.md
 
             {
-              echo "## 🚨 AKS Alert Summary (${ALERT_COUNT})"
+              echo "## AKS Alert Summary (${ALERT_COUNT})"
               echo -e "$ALERTS"
               echo ""
               echo "[View Full Report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
@@ -274,10 +324,10 @@ jobs:
           else
             echo "alerts=false" >> $GITHUB_OUTPUT
             echo "" >> report.md
-            echo "## ✅ All metrics within normal thresholds" >> report.md
+            echo "## All metrics within normal thresholds" >> report.md
 
             {
-              echo "## ✅ AKS Health Check Passed"
+              echo "## AKS Health Check Passed"
               echo "All metrics within normal thresholds."
               echo ""
               echo "[View Full Report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
@@ -286,7 +336,7 @@ jobs:
 
       - name: Upload Report
         if: always()
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
           name: aks-report-${{ steps.cfg.outputs.cluster }}-${{ steps.cfg.outputs.label }}-${{ github.run_id }}
           path: report.md
@@ -302,6 +352,8 @@ jobs:
           echo "slack=${{ steps.cfg.outputs.slack }}" >> $GITHUB_OUTPUT
           echo "cluster=${{ steps.cfg.outputs.cluster }}" >> $GITHUB_OUTPUT
           echo "resource_group=${{ steps.cfg.outputs.resource_group }}" >> $GITHUB_OUTPUT
+          echo "cpu_threshold=${{ steps.cfg.outputs.cpu_threshold }}" >> $GITHUB_OUTPUT
+          echo "memory_threshold=${{ steps.cfg.outputs.memory_threshold }}" >> $GITHUB_OUTPUT
 
     outputs:
       alerts: ${{ steps.pass-state.outputs.alerts }}
@@ -311,6 +363,8 @@ jobs:
       slack: ${{ steps.pass-state.outputs.slack }}
       cluster: ${{ steps.pass-state.outputs.cluster }}
       resource_group: ${{ steps.pass-state.outputs.resource_group }}
+      cpu_threshold: ${{ steps.pass-state.outputs.cpu_threshold }}
+      memory_threshold: ${{ steps.pass-state.outputs.memory_threshold }}
 
   alert-issues:
     needs: monitor-aks
@@ -320,18 +374,17 @@ jobs:
       issues: write
     steps:
       - name: Download Report
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
         with:
           name: aks-report-${{ needs.monitor-aks.outputs.cluster }}-${{ needs.monitor-aks.outputs.label }}-${{ github.run_id }}
           path: ./artifact
 
       - name: Find Existing Alert Issue
         id: find-issue
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
         with:
           script: |
             const date = new Date().toISOString().split('T')[0];
-            
             const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -339,11 +392,9 @@ jobs:
               state: 'open',
               per_page: 50
             });
-            
             const existing = issues.data.find(i =>
-              i.title.startsWith('🚨 AKS Alert:') && i.title.endsWith(`- ${date}`)
+              i.title.startsWith('AKS Alert:') && i.title.endsWith(`- ${date}`)
             );
-            
             if (existing) {
               core.setOutput('issue_number', existing.number);
               core.setOutput('exists', 'true');
@@ -352,14 +403,16 @@ jobs:
             }
 
       - name: Create or Update Alert Issue
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea
         with:
           script: |
             const fs = require('fs');
             const report = fs.readFileSync('./artifact/report.md', 'utf8');
             const count = '${{ needs.monitor-aks.outputs.alert_count }}';
-            const body = `## 🚨 AKS Performance Alert (${count} alert${count === '1' ? '' : 's'})\n\n**Cluster:** ${{ needs.monitor-aks.outputs.cluster }}\n**Resource Group:** ${{ needs.monitor-aks.outputs.resource_group }}\n**Namespace:** ${{ needs.monitor-aks.outputs.label }}\n**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n---\n\n${report}`;
-            const title = `🚨 AKS Alert: ${count} threshold${count === '1' ? '' : 's'} exceeded - ${new Date().toISOString().split('T')[0]}`;
+            const cpuThr = '${{ needs.monitor-aks.outputs.cpu_threshold }}';
+            const memThr = '${{ needs.monitor-aks.outputs.memory_threshold }}';
+            const body = `## AKS Performance Alert (${count} alert${count === '1' ? '' : 's'})\n\n**Cluster:** ${{ needs.monitor-aks.outputs.cluster }}\n**Resource Group:** ${{ needs.monitor-aks.outputs.resource_group }}\n**Namespace:** ${{ needs.monitor-aks.outputs.label }}\n**Thresholds:** CPU ${cpuThr}%, Memory ${memThr}%\n**Run:** [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n---\n\n${report}`;
+            const title = `AKS Alert: ${count} threshold${count === '1' ? '' : 's'} exceeded - ${new Date().toISOString().split('T')[0]}`;
             
             if ('${{ steps.find-issue.outputs.exists }}' === 'true') {
               await github.rest.issues.createComment({
@@ -380,22 +433,33 @@ jobs:
 
   alert-slack:
     needs: monitor-aks
-    if: needs.monitor-aks.outputs.alerts == 'true' && needs.monitor-aks.outputs.slack == 'true' && secrets.SLACK_WEBHOOK_URL != ''
+    if: needs.monitor-aks.outputs.alerts == 'true' && needs.monitor-aks.outputs.slack == 'true'
     runs-on: ubuntu-latest
     permissions: {}
     steps:
+      - name: Check Slack Secret
+        id: slack-check
+        run: |
+          if [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "has_secret=false" >> $GITHUB_OUTPUT
+            echo "Warning: SLACK_WEBHOOK_URL secret is not set. Skipping Slack notification."
+          else
+            echo "has_secret=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Notify Slack
-        uses: slackapi/slack-github-action@37ebaef184d7626c5f204ab8d3baff4262dd30f0 # v1.27.0
+        if: steps.slack-check.outputs.has_secret == 'true'
+        uses: slackapi/slack-github-action@37ebaef184d7626c5f204ab8d3baff4262dd30f0
         with:
           payload: |
             {
-              "text": "🚨 AKS Performance Alert",
+              "text": "AKS Performance Alert",
               "blocks": [
                 {
                   "type": "section",
                   "text": {
                     "type": "mrkdwn",
-                    "text": "*AKS Cluster Alert*\n*Cluster:* ${{ needs.monitor-aks.outputs.cluster }}\n*Resource Group:* ${{ needs.monitor-aks.outputs.resource_group }}\n*Namespace:* ${{ needs.monitor-aks.outputs.label }}\n*Alerts:* ${{ needs.monitor-aks.outputs.alert_count }}\n*Status:* Thresholds exceeded\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
+                    "text": "*AKS Cluster Alert*\n*Cluster:* ${{ needs.monitor-aks.outputs.cluster }}\n*Resource Group:* ${{ needs.monitor-aks.outputs.resource_group }}\n*Namespace:* ${{ needs.monitor-aks.outputs.label }}\n*Thresholds:* CPU ${{ needs.monitor-aks.outputs.cpu_threshold }}%, Memory ${{ needs.monitor-aks.outputs.memory_threshold }}%\n*Alerts:* ${{ needs.monitor-aks.outputs.alert_count }}\n*Status:* Thresholds exceeded\n*Run:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>"
                   }
                 }
               ]
