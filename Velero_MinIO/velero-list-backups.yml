@@ -1,0 +1,239 @@
+name: 10 - Velero List Backups (AKS / EKS / GKE)
+
+# Place this file at: .github/workflows/10-velero-list-backups.yml
+#
+# Purpose: Read-only convenience pipeline. Pick a platform, point it at a
+# cluster, and get back every backup available to restore from -- name,
+# status, creation date, expiry, and included namespaces -- both in the
+# job summary (Actions UI) and as a downloadable artifact. No backup or
+# restore is ever created by this workflow.
+#
+# Fill in only the input group for the platform you select; the other
+# groups' inputs are ignored.
+#
+# Required GitHub Secrets (only the ones for the platform you use):
+#   AKS: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+#   EKS: AWS_ROLE_TO_ASSUME
+#   GKE: GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Which cloud/cluster to check"
+        required: true
+        type: choice
+        options:
+          - aks
+          - eks
+          - gke
+      velero_namespace:
+        description: "Namespace where Velero is installed (all platforms)"
+        required: true
+        default: "velero"
+        type: string
+      velero_version:
+        description: "Velero CLI version -- keep in sync with the matching prerequisites pipeline"
+        required: true
+        default: "v1.14.1"
+        type: string
+
+      # --- AKS-only inputs ---
+      aks_resource_group:
+        description: "[AKS] Resource Group of the AKS cluster"
+        required: false
+        type: string
+      aks_name:
+        description: "[AKS] AKS cluster name"
+        required: false
+        type: string
+
+      # --- EKS-only inputs ---
+      eks_aws_region:
+        description: "[EKS] AWS region of the EKS cluster"
+        required: false
+        type: string
+      eks_cluster_name:
+        description: "[EKS] EKS cluster name"
+        required: false
+        type: string
+
+      # --- GKE-only inputs ---
+      gke_project_id:
+        description: "[GKE] GCP project ID"
+        required: false
+        type: string
+      gke_cluster_name:
+        description: "[GKE] GKE cluster name"
+        required: false
+        type: string
+      gke_location:
+        description: "[GKE] Cluster location (zone or region)"
+        required: false
+        type: string
+      gke_location_type:
+        description: "[GKE] Whether gke_location is a zone or a region"
+        required: false
+        type: choice
+        options:
+          - zone
+          - region
+        default: zone
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: velero-list-backups-${{ inputs.platform }}-${{ inputs.aks_name || inputs.eks_cluster_name || inputs.gke_cluster_name }}
+  cancel-in-progress: true
+
+env:
+  VELERO_NS: ${{ inputs.velero_namespace }}
+
+jobs:
+  list-backups:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # ---------------------------------------------------------------
+      # Auth + cluster credentials (only the matching platform's steps run)
+      # ---------------------------------------------------------------
+      - name: "[AKS] Azure login (OIDC)"
+        if: inputs.platform == 'aks'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: "[AKS] Get AKS credentials"
+        if: inputs.platform == 'aks'
+        run: |
+          if [ -z "${{ inputs.aks_resource_group }}" ] || [ -z "${{ inputs.aks_name }}" ]; then
+            echo "::error::aks_resource_group and aks_name are required when platform=aks"
+            exit 1
+          fi
+          az aks get-credentials -g "${{ inputs.aks_resource_group }}" -n "${{ inputs.aks_name }}" --overwrite-existing
+          echo "CLUSTER_LABEL=AKS/${{ inputs.aks_resource_group }}/${{ inputs.aks_name }}" >> "$GITHUB_ENV"
+
+      - name: "[EKS] Configure AWS credentials (OIDC)"
+        if: inputs.platform == 'eks'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ inputs.eks_aws_region }}
+
+      - name: "[EKS] Get EKS credentials"
+        if: inputs.platform == 'eks'
+        run: |
+          if [ -z "${{ inputs.eks_aws_region }}" ] || [ -z "${{ inputs.eks_cluster_name }}" ]; then
+            echo "::error::eks_aws_region and eks_cluster_name are required when platform=eks"
+            exit 1
+          fi
+          aws eks update-kubeconfig --region "${{ inputs.eks_aws_region }}" --name "${{ inputs.eks_cluster_name }}"
+          echo "CLUSTER_LABEL=EKS/${{ inputs.eks_aws_region }}/${{ inputs.eks_cluster_name }}" >> "$GITHUB_ENV"
+
+      - name: "[GKE] Authenticate to GCP (Workload Identity Federation)"
+        if: inputs.platform == 'gke'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: "[GKE] Set up gcloud SDK"
+        if: inputs.platform == 'gke'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ inputs.gke_project_id }}
+
+      - name: "[GKE] Install gke-gcloud-auth-plugin"
+        if: inputs.platform == 'gke'
+        run: gcloud components install gke-gcloud-auth-plugin --quiet
+
+      - name: "[GKE] Get GKE credentials"
+        if: inputs.platform == 'gke'
+        run: |
+          if [ -z "${{ inputs.gke_project_id }}" ] || [ -z "${{ inputs.gke_cluster_name }}" ] || [ -z "${{ inputs.gke_location }}" ]; then
+            echo "::error::gke_project_id, gke_cluster_name and gke_location are required when platform=gke"
+            exit 1
+          fi
+          if [ "${{ inputs.gke_location_type }}" = "region" ]; then
+            gcloud container clusters get-credentials "${{ inputs.gke_cluster_name }}" --region "${{ inputs.gke_location }}" --project "${{ inputs.gke_project_id }}"
+          else
+            gcloud container clusters get-credentials "${{ inputs.gke_cluster_name }}" --zone "${{ inputs.gke_location }}" --project "${{ inputs.gke_project_id }}"
+          fi
+          echo "CLUSTER_LABEL=GKE/${{ inputs.gke_project_id }}/${{ inputs.gke_cluster_name }}" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------------
+      # Common: kubectl / jq / velero CLI, then list backups
+      # ---------------------------------------------------------------
+      - name: Install kubectl
+        run: |
+          set -euo pipefail
+          KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Install Velero CLI
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.velero_version }}"
+          curl -fsSL -o velero.tar.gz \
+            "https://github.com/vmware-tanzu/velero/releases/download/${VERSION}/velero-${VERSION}-linux-amd64.tar.gz"
+          tar -xzf velero.tar.gz
+          sudo mv velero-${VERSION}-linux-amd64/velero /usr/local/bin/velero
+
+      - name: Verify Velero is reachable
+        run: |
+          kubectl get pods -n "$VELERO_NS"
+          PHASE=$(velero backup-location get -n "$VELERO_NS" -o json | jq -r '.items[0].status.phase' 2>/dev/null || echo "Unknown")
+          echo "BackupStorageLocation phase: $PHASE"
+          if [ "$PHASE" != "Available" ]; then
+            echo "::warning::BackupStorageLocation phase is '$PHASE', not 'Available'. Backup list below may be incomplete or stale."
+          fi
+
+      - name: List backups (table)
+        run: velero backup get -n "$VELERO_NS"
+
+      - name: Build detailed report
+        run: |
+          velero backup get -n "$VELERO_NS" -o json > backups.json
+
+          {
+            echo "# Velero Backups -- ${CLUSTER_LABEL}"
+            echo ""
+            echo "Generated: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            COUNT=$(jq '.items | length' backups.json)
+            if [ "$COUNT" = "0" ]; then
+              echo "No backups found in namespace \`$VELERO_NS\`."
+            else
+              echo "| Name | Status | Created (UTC) | Expires (UTC) | Namespaces |"
+              echo "|---|---|---|---|---|"
+              jq -r '.items[] | [
+                  .metadata.name,
+                  (.status.phase // "Unknown"),
+                  (.metadata.creationTimestamp // "-"),
+                  (.status.expiration // "-"),
+                  ((.spec.includedNamespaces // ["*"]) | join(","))
+                ] | @tsv' backups.json | sort -t $'\t' -k3 -r | \
+                awk -F'\t' '{printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}'
+            fi
+          } | tee backup-report.md
+
+          cat backup-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload backup list artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: velero-backup-list-${{ inputs.platform }}-${{ github.run_number }}
+          path: |
+            backups.json
+            backup-report.md
+          retention-days: 14
