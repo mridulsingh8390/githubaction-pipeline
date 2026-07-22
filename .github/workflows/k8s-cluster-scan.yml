@@ -1,0 +1,821 @@
+name: K8s Cluster Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      cluster_type:
+        description: 'Cluster type (eks, aks, or all)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - 'eks'
+          - 'aks'
+          - 'all'
+      aws_cluster:
+        description: 'EKS cluster name (auto-detected if empty)'
+        required: false
+        default: ''
+      aws_region:
+        description: 'AWS region (for EKS)'
+        required: false
+        default: 'us-east-1'
+      azure_cluster:
+        description: 'AKS cluster name (auto-detected if empty)'
+        required: false
+        default: ''
+      azure_resource_group:
+        description: 'AKS resource group (auto-detected if empty)'
+        required: false
+        default: ''
+
+env:
+  ALLOWED_MANUAL_BRANCH: main
+
+concurrency:
+  group: k8s-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    outputs:
+      run_eks: ${{ steps.set.outputs.run_eks }}
+      run_aks: ${{ steps.set.outputs.run_aks }}
+    steps:
+      - name: Enforce Allowed Branch
+        if: github.ref != format('refs/heads/{0}', env.ALLOWED_MANUAL_BRANCH)
+        run: |
+          set -euo pipefail
+          echo "::error::Manual dispatch only allowed from branch '${{ env.ALLOWED_MANUAL_BRANCH }}'. Current ref: ${{ github.ref }}"
+          exit 1
+
+      - name: Determine Cluster Types
+        id: set
+        run: |
+          set -euo pipefail
+          INPUT="${{ github.event.inputs.cluster_type || 'all' }}"
+          if [ "$INPUT" = "all" ]; then
+            echo "run_eks=true" >> $GITHUB_OUTPUT
+            echo "run_aks=true" >> $GITHUB_OUTPUT
+          elif [ "$INPUT" = "eks" ]; then
+            echo "run_eks=true" >> $GITHUB_OUTPUT
+            echo "run_aks=false" >> $GITHUB_OUTPUT
+          elif [ "$INPUT" = "aks" ]; then
+            echo "run_eks=false" >> $GITHUB_OUTPUT
+            echo "run_aks=true" >> $GITHUB_OUTPUT
+          fi
+
+  scan-eks:
+    needs: dispatch
+    if: needs.dispatch.outputs.run_eks == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ github.event.inputs.aws_region || 'us-east-1' }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@3e0aecbd2ecf0c20f8a8720b94e3912fba3d491b
+
+      - name: AWS Login (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-k8s-scan
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Auto-detect EKS Cluster
+        id: detect
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.aws_cluster }}" ]; then
+            echo "cluster=${{ github.event.inputs.aws_cluster }}" >> $GITHUB_OUTPUT
+            echo "Using provided EKS cluster: ${{ github.event.inputs.aws_cluster }}"
+          else
+            CLUSTERS=$(aws eks list-clusters --region ${{ env.AWS_REGION }} --query 'clusters' --output text)
+            COUNT=$(echo "$CLUSTERS" | wc -w)
+            if [ "$COUNT" -eq 0 ]; then
+              echo "::error::No EKS clusters found in region ${{ env.AWS_REGION }}. Provide aws_cluster input."
+              exit 1
+            elif [ "$COUNT" -gt 1 ]; then
+              echo "::error::Multiple EKS clusters found: $CLUSTERS. Provide aws_cluster input to select one."
+              exit 1
+            else
+              echo "cluster=$CLUSTERS" >> $GITHUB_OUTPUT
+              echo "Auto-detected single EKS cluster: $CLUSTERS"
+            fi
+          fi
+
+      - name: Configure EKS kubeconfig
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ steps.detect.outputs.cluster }}
+
+      - name: Verify EKS Access
+        run: |
+          set -euo pipefail
+          kubectl version --short
+          echo "Current context: $(kubectl config current-context)"
+
+      - name: Generate EKS Inventory
+        run: |
+          set -euo pipefail
+          cat << 'PYEOF' > k8s_inventory.py
+          import subprocess
+          import json
+          from datetime import datetime, timezone
+
+          def kubectl(cmd):
+              result = subprocess.run(['kubectl'] + cmd, capture_output=True, text=True)
+              if result.returncode != 0:
+                  return []
+              try:
+                  return json.loads(result.stdout) if result.stdout.strip() else []
+              except:
+                  return []
+
+          def write_table(f, title, headers, rows):
+              if not rows:
+                  f.write(f"\n## {title}\n\nNo resources found.\n")
+                  return
+              f.write(f"\n## {title}\n\n")
+              f.write("| " + " | ".join(headers) + " |\n")
+              f.write("|" + "|".join(["---" for _ in headers]) + "|\n")
+              for row in rows:
+                  f.write("| " + " | ".join(str(c) for c in row) + " |\n")
+              f.write(f"\n**Total: {len(rows)} resources**\n")
+
+          report = open('eks-inventory.md', 'w')
+          report.write("# EKS Cluster Inventory\n\n")
+          context = subprocess.run(['kubectl', 'config', 'current-context'], capture_output=True, text=True).stdout.strip()
+          report.write(f"**Context:** {context}\n")
+          report.write(f"**Generated:** {datetime.now(timezone.utc).isoformat()}\n")
+
+          data = kubectl(['get', 'nodes', '-o', 'json'])
+          nodes = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for n in nodes:
+              status = 'Unknown'
+              for cond in n.get('status', {}).get('conditions', []):
+                  if cond['type'] == 'Ready':
+                      status = 'Ready' if cond['status'] == 'True' else 'NotReady'
+              rows.append([
+                  n['metadata']['name'],
+                  n['metadata'].get('labels', {}).get('kubernetes.io/hostname', '-'),
+                  n['status'].get('nodeInfo', {}).get('kubeletVersion', '-'),
+                  status,
+                  n['status'].get('allocatable', {}).get('cpu', '-'),
+                  n['status'].get('allocatable', {}).get('memory', '-')
+              ])
+          write_table(report, 'Nodes', ['Node Name','Hostname','Kubelet Version','Status','CPU','Memory'], rows)
+
+          data = kubectl(['get', 'namespaces', '-o', 'json'])
+          namespaces = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[ns['metadata']['name'], ns.get('status', {}).get('phase', '-'),
+                   ns['metadata'].get('creationTimestamp', '-'),
+                   len(ns.get('metadata', {}).get('labels', {})))] for ns in namespaces]
+          write_table(report, 'Namespaces', ['Name','Status','Created','Labels'], rows)
+
+          data = kubectl(['get', 'pods', '--all-namespaces', '-o', 'json'])
+          pods = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for p in pods:
+              restarts = sum(c.get('restartCount', 0) for c in p.get('status', {}).get('containerStatuses', []))
+              rows.append([
+                  p['metadata']['name'], p['metadata']['namespace'],
+                  p.get('status', {}).get('phase', '-'),
+                  p.get('spec', {}).get('nodeName', '-'),
+                  len(p.get('spec', {}).get('containers', [])), restarts
+              ])
+          write_table(report, 'Pods (All Namespaces)', ['Pod Name','Namespace','Status','Node','Containers','Restarts'], rows)
+
+          data = kubectl(['get', 'services', '--all-namespaces', '-o', 'json'])
+          services = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for svc in services:
+              spec = svc.get('spec', {})
+              selector = ', '.join([f"{k}={v}" for k, v in spec.get('selector', {}).items()]) or '-'
+              endpoints = kubectl(['get', 'endpoints', svc['metadata']['name'], '-n', svc['metadata']['namespace'], '-o', 'json'])
+              has_endpoints = isinstance(endpoints, dict) and len(endpoints.get('subsets', [])) > 0
+              rows.append([
+                  svc['metadata']['name'], svc['metadata']['namespace'],
+                  spec.get('type', '-'), spec.get('clusterIP', '-'),
+                  ', '.join(spec.get('externalIPs', [])) or '-',
+                  len(spec.get('ports', [])), selector,
+                  'Has Endpoints' if has_endpoints else 'No Endpoints'
+              ])
+          write_table(report, 'Services', ['Service Name','Namespace','Type','Cluster IP','External IP','Ports','Selector','Endpoint Status'], rows)
+
+          orphaned = [r for r in rows if r[7] == 'No Endpoints' and r[2] != 'ExternalName']
+          if orphaned:
+              report.write("\n### Services Without Endpoints (Potential Orphans)\n\n")
+              report.write("| Service Name | Namespace | Type | Selector | Issue |\n")
+              report.write("|-------------|-----------|------|----------|-------|\n")
+              for s in orphaned:
+                  report.write(f"| {s[0]} | {s[1]} | {s[2]} | {s[6]} | No pods match selector |\n")
+
+          data = kubectl(['get', 'deployments', '--all-namespaces', '-o', 'json'])
+          deployments = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for d in deployments:
+              spec, status = d.get('spec', {}), d.get('status', {})
+              replicas, ready = spec.get('replicas', 0), status.get('readyReplicas', 0)
+              rows.append([d['metadata']['name'], d['metadata']['namespace'], replicas, ready,
+                  status.get('availableReplicas', 0), 'Healthy' if ready == replicas else 'Degraded'])
+          write_table(report, 'Deployments', ['Deployment Name','Namespace','Desired','Ready','Available','Status'], rows)
+
+          data = kubectl(['get', 'statefulsets', '--all-namespaces', '-o', 'json'])
+          sts = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for s in sts:
+              spec, status = s.get('spec', {}), s.get('status', {})
+              replicas, ready = spec.get('replicas', 0), status.get('readyReplicas', 0)
+              rows.append([s['metadata']['name'], s['metadata']['namespace'], replicas, ready,
+                  'Healthy' if ready == replicas else 'Degraded'])
+          write_table(report, 'StatefulSets', ['StatefulSet Name','Namespace','Desired','Ready','Status'], rows)
+
+          data = kubectl(['get', 'daemonsets', '--all-namespaces', '-o', 'json'])
+          ds = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for d in ds:
+              status = d.get('status', {})
+              desired, ready = status.get('desiredNumberScheduled', 0), status.get('numberReady', 0)
+              rows.append([d['metadata']['name'], d['metadata']['namespace'], desired, ready,
+                  'Healthy' if ready == desired else 'Degraded'])
+          write_table(report, 'DaemonSets', ['DaemonSet Name','Namespace','Desired','Ready','Status'], rows)
+
+          data = kubectl(['get', 'pv', '-o', 'json'])
+          pvs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for pv in pvs:
+              spec = pv.get('spec', {})
+              claim = spec.get('claimRef', {})
+              claim_name = f"{claim.get('namespace', '-')}/{claim.get('name', '-')}" if claim else '-'
+              rows.append([pv['metadata']['name'], pv.get('status', {}).get('phase', '-'),
+                  spec.get('capacity', {}).get('storage', '-'), spec.get('storageClassName', '-'),
+                  spec.get('persistentVolumeReclaimPolicy', '-'), claim_name])
+          write_table(report, 'Persistent Volumes (PV)', ['PV Name','Status','Capacity','Storage Class','Reclaim Policy','Bound To'], rows)
+
+          unbound = [r for r in rows if r[1] == 'Available']
+          if unbound:
+              report.write("\n### Unbound Persistent Volumes\n\n")
+              report.write("| PV Name | Capacity | Storage Class | Reclaim Policy |\n")
+              report.write("|---------|----------|---------------|----------------|\n")
+              for p in unbound:
+                  report.write(f"| {p[0]} | {p[2]} | {p[3]} | {p[4]} |\n")
+
+          data = kubectl(['get', 'pvc', '--all-namespaces', '-o', 'json'])
+          pvcs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for pvc in pvcs:
+              spec = pvc.get('spec', {})
+              rows.append([pvc['metadata']['name'], pvc['metadata']['namespace'],
+                  pvc.get('status', {}).get('phase', '-'),
+                  spec.get('resources', {}).get('requests', {}).get('storage', '-'),
+                  spec.get('storageClassName', '-'),
+                  ', '.join(spec.get('accessModes', [])),
+                  spec.get('volumeName', '-')])
+          write_table(report, 'Persistent Volume Claims (PVC)',
+              ['PVC Name','Namespace','Status','Requested','Storage Class','Access Modes','Bound PV'], rows)
+
+          pending = [r for r in rows if r[2] != 'Bound']
+          if pending:
+              report.write("\n### Pending/Unbound PVCs\n\n")
+              report.write("| PVC Name | Namespace | Status | Storage Class | Issue |\n")
+              report.write("|----------|-----------|--------|---------------|-------|\n")
+              for p in pending:
+                  issue = 'No matching PV' if p[2] == 'Pending' else 'Lost binding'
+                  report.write(f"| {p[0]} | {p[1]} | {p[2]} | {p[4]} | {issue} |\n")
+
+          data = kubectl(['get', 'configmaps', '--all-namespaces', '-o', 'json'])
+          cms = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[cm['metadata']['name'], cm['metadata']['namespace'],
+                   len(cm.get('data', {})), len(cm.get('binaryData', {})),
+                   cm['metadata'].get('creationTimestamp', '-')]
+                  for cm in cms]
+          write_table(report, 'ConfigMaps', ['ConfigMap Name','Namespace','Data Keys','Binary Keys','Created'], rows)
+
+          data = kubectl(['get', 'secrets', '--all-namespaces', '-o', 'json'])
+          secrets = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[s['metadata']['name'], s['metadata']['namespace'], s.get('type', '-'),
+                   len(s.get('data', {})), s['metadata'].get('creationTimestamp', '-')]
+                  for s in secrets]
+          write_table(report, 'Secrets', ['Secret Name','Namespace','Type','Data Keys','Created'], rows)
+
+          data = kubectl(['get', 'ingress', '--all-namespaces', '-o', 'json'])
+          ingresses = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for ing in ingresses:
+              spec = ing.get('spec', {})
+              rows.append([ing['metadata']['name'], ing['metadata']['namespace'],
+                  spec.get('ingressClassName', '-'), len(spec.get('rules', [])), len(spec.get('tls', []))])
+          write_table(report, 'Ingresses', ['Ingress Name','Namespace','Class','Rules','TLS'], rows)
+
+          data = kubectl(['get', 'jobs', '--all-namespaces', '-o', 'json'])
+          jobs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for j in jobs:
+              status = j.get('status', {})
+              succ, failed, active = status.get('succeeded', 0), status.get('failed', 0), status.get('active', 0)
+              state = 'Complete' if succ > 0 else 'Running' if active > 0 else 'Failed' if failed > 0 else 'Unknown'
+              rows.append([j['metadata']['name'], j['metadata']['namespace'], succ, failed, active, state])
+          write_table(report, 'Jobs', ['Job Name','Namespace','Succeeded','Failed','Active','Status'], rows)
+
+          data = kubectl(['get', 'cronjobs', '--all-namespaces', '-o', 'json'])
+          cjs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for cj in cjs:
+              spec = cj.get('spec', {})
+              rows.append([cj['metadata']['name'], cj['metadata']['namespace'],
+                  spec.get('schedule', '-'), 'Suspended' if spec.get('suspend', False) else 'Active',
+                  cj.get('status', {}).get('lastScheduleTime', '-')])
+          write_table(report, 'CronJobs', ['CronJob Name','Namespace','Schedule','State','Last Scheduled'], rows)
+
+          data = kubectl(['get', 'hpa', '--all-namespaces', '-o', 'json'])
+          hpas = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for hpa in hpas:
+              spec, status = hpa.get('spec', {}), hpa.get('status', {})
+              target = spec.get('scaleTargetRef', {})
+              rows.append([hpa['metadata']['name'], hpa['metadata']['namespace'],
+                  f"{target.get('kind', '-')}/{target.get('name', '-')}",
+                  spec.get('minReplicas', '-'), spec.get('maxReplicas', '-'),
+                  status.get('currentReplicas', '-'), status.get('desiredReplicas', '-')])
+          write_table(report, 'Horizontal Pod Autoscalers',
+              ['HPA Name','Namespace','Target','Min','Max','Current','Desired'], rows)
+
+          data = kubectl(['get', 'resourcequota', '--all-namespaces', '-o', 'json'])
+          quotas = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for q in quotas:
+              hard = q.get('status', {}).get('hard', {})
+              used = q.get('status', {}).get('used', {})
+              rows.append([q['metadata']['name'], q['metadata']['namespace'],
+                  ', '.join([f"{k}={v}" for k, v in hard.items()])[:50] or '-',
+                  ', '.join([f"{k}={v}" for k, v in used.items()])[:50] or '-'])
+          write_table(report, 'Resource Quotas', ['Quota Name','Namespace','Hard Limits','Used'], rows)
+
+          data = kubectl(['get', 'serviceaccounts', '--all-namespaces', '-o', 'json'])
+          sas = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[sa['metadata']['name'], sa['metadata']['namespace'],
+                   len(sa.get('secrets', [])), sa['metadata'].get('creationTimestamp', '-')]
+                  for sa in sas]
+          write_table(report, 'Service Accounts', ['Service Account','Namespace','Secrets','Created'], rows)
+
+          data = kubectl(['get', 'roles', '--all-namespaces', '-o', 'json'])
+          roles = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[r['metadata']['name'], r['metadata']['namespace'], len(r.get('rules', []))]
+                  for r in roles]
+          write_table(report, 'Roles', ['Role Name','Namespace','Rules'], rows)
+
+          data = kubectl(['get', 'rolebindings', '--all-namespaces', '-o', 'json'])
+          rbs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for rb in rbs:
+              role = rb.get('roleRef', {})
+              rows.append([rb['metadata']['name'], rb['metadata']['namespace'],
+                  f"{role.get('kind', '-')}/{role.get('name', '-')}", len(rb.get('subjects', []))])
+          write_table(report, 'Role Bindings', ['Binding Name','Namespace','Role','Subjects'], rows)
+
+          data = kubectl(['get', 'clusterroles', '-o', 'json'])
+          crs = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[cr['metadata']['name'], len(cr.get('rules', []))] for cr in crs]
+          write_table(report, 'ClusterRoles', ['ClusterRole Name','Rules'], rows)
+
+          data = kubectl(['get', 'clusterrolebindings', '-o', 'json'])
+          crbs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for crb in crbs:
+              role = crb.get('roleRef', {})
+              rows.append([crb['metadata']['name'],
+                  f"{role.get('kind', '-')}/{role.get('name', '-')}", len(crb.get('subjects', []))])
+          write_table(report, 'ClusterRoleBindings', ['Binding Name','ClusterRole','Subjects'], rows)
+
+          report.close()
+          print("EKS inventory generated: eks-inventory.md")
+          PYEOF
+          python3 k8s_inventory.py
+
+      - name: Upload EKS Inventory
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: eks-inventory-${{ github.run_id }}
+          path: eks-inventory.md
+          retention-days: 30
+
+  scan-aks:
+    needs: dispatch
+    if: needs.dispatch.outputs.run_aks == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@3e0aecbd2ecf0c20f8a8720b94e3912fba3d491b
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Auto-detect AKS Cluster
+        id: detect
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.inputs.azure_cluster }}" ]; then
+            CLUSTER="${{ github.event.inputs.azure_cluster }}"
+            if [ -n "${{ github.event.inputs.azure_resource_group }}" ]; then
+              RG="${{ github.event.inputs.azure_resource_group }}"
+              echo "Using provided AKS cluster: $CLUSTER in resource group: $RG"
+            else
+              RG=$(az aks list --query "[?name=='$CLUSTER'].resourceGroup" -o tsv)
+              if [ -z "$RG" ]; then
+                echo "::error::AKS cluster '$CLUSTER' not found in subscription. Provide azure_resource_group input."
+                exit 1
+              fi
+              echo "Resolved resource group for '$CLUSTER': $RG"
+            fi
+            echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+            echo "rg=$RG" >> $GITHUB_OUTPUT
+          else
+            CLUSTERS_JSON=$(az aks list --query '[].{name:name, resourceGroup:resourceGroup}' -o json)
+            COUNT=$(echo "$CLUSTERS_JSON" | jq 'length')
+            if [ "$COUNT" -eq 0 ]; then
+              echo "::error::No AKS clusters found in subscription. Provide azure_cluster and azure_resource_group inputs."
+              exit 1
+            elif [ "$COUNT" -gt 1 ]; then
+              echo "::error::Multiple AKS clusters found. Provide azure_cluster and azure_resource_group inputs to select one."
+              exit 1
+            else
+              CLUSTER=$(echo "$CLUSTERS_JSON" | jq -r '.[0].name')
+              RG=$(echo "$CLUSTERS_JSON" | jq -r '.[0].resourceGroup')
+              echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+              echo "rg=$RG" >> $GITHUB_OUTPUT
+              echo "Auto-detected single AKS cluster: $CLUSTER in resource group: $RG"
+            fi
+          fi
+
+      - name: Set AKS Context
+        uses: azure/aks-set-context@5c33da734abc0bfe82b89c1221c9b5c5d985f810
+        with:
+          resource-group: ${{ steps.detect.outputs.rg }}
+          cluster-name: ${{ steps.detect.outputs.cluster }}
+
+      - name: Verify AKS Access
+        run: |
+          set -euo pipefail
+          kubectl version --short
+          echo "Current context: $(kubectl config current-context)"
+
+      - name: Generate AKS Inventory
+        run: |
+          set -euo pipefail
+          cat << 'PYEOF' > k8s_inventory.py
+          import subprocess
+          import json
+          from datetime import datetime, timezone
+
+          def kubectl(cmd):
+              result = subprocess.run(['kubectl'] + cmd, capture_output=True, text=True)
+              if result.returncode != 0:
+                  return []
+              try:
+                  return json.loads(result.stdout) if result.stdout.strip() else []
+              except:
+                  return []
+
+          def write_table(f, title, headers, rows):
+              if not rows:
+                  f.write(f"\n## {title}\n\nNo resources found.\n")
+                  return
+              f.write(f"\n## {title}\n\n")
+              f.write("| " + " | ".join(headers) + " |\n")
+              f.write("|" + "|".join(["---" for _ in headers]) + "|\n")
+              for row in rows:
+                  f.write("| " + " | ".join(str(c) for c in row) + " |\n")
+              f.write(f"\n**Total: {len(rows)} resources**\n")
+
+          report = open('aks-inventory.md', 'w')
+          report.write("# AKS Cluster Inventory\n\n")
+          context = subprocess.run(['kubectl', 'config', 'current-context'], capture_output=True, text=True).stdout.strip()
+          report.write(f"**Context:** {context}\n")
+          report.write(f"**Generated:** {datetime.now(timezone.utc).isoformat()}\n")
+
+          data = kubectl(['get', 'nodes', '-o', 'json'])
+          nodes = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for n in nodes:
+              status = 'Unknown'
+              for cond in n.get('status', {}).get('conditions', []):
+                  if cond['type'] == 'Ready':
+                      status = 'Ready' if cond['status'] == 'True' else 'NotReady'
+              rows.append([
+                  n['metadata']['name'],
+                  n['metadata'].get('labels', {}).get('kubernetes.io/hostname', '-'),
+                  n['status'].get('nodeInfo', {}).get('kubeletVersion', '-'),
+                  status,
+                  n['status'].get('allocatable', {}).get('cpu', '-'),
+                  n['status'].get('allocatable', {}).get('memory', '-')
+              ])
+          write_table(report, 'Nodes', ['Node Name','Hostname','Kubelet Version','Status','CPU','Memory'], rows)
+
+          data = kubectl(['get', 'namespaces', '-o', 'json'])
+          namespaces = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[ns['metadata']['name'], ns.get('status', {}).get('phase', '-'),
+                   ns['metadata'].get('creationTimestamp', '-'),
+                   len(ns.get('metadata', {}).get('labels', {})))] for ns in namespaces]
+          write_table(report, 'Namespaces', ['Name','Status','Created','Labels'], rows)
+
+          data = kubectl(['get', 'pods', '--all-namespaces', '-o', 'json'])
+          pods = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for p in pods:
+              restarts = sum(c.get('restartCount', 0) for c in p.get('status', {}).get('containerStatuses', []))
+              rows.append([
+                  p['metadata']['name'], p['metadata']['namespace'],
+                  p.get('status', {}).get('phase', '-'),
+                  p.get('spec', {}).get('nodeName', '-'),
+                  len(p.get('spec', {}).get('containers', [])), restarts
+              ])
+          write_table(report, 'Pods (All Namespaces)', ['Pod Name','Namespace','Status','Node','Containers','Restarts'], rows)
+
+          data = kubectl(['get', 'services', '--all-namespaces', '-o', 'json'])
+          services = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for svc in services:
+              spec = svc.get('spec', {})
+              selector = ', '.join([f"{k}={v}" for k, v in spec.get('selector', {}).items()]) or '-'
+              endpoints = kubectl(['get', 'endpoints', svc['metadata']['name'], '-n', svc['metadata']['namespace'], '-o', 'json'])
+              has_endpoints = isinstance(endpoints, dict) and len(endpoints.get('subsets', [])) > 0
+              rows.append([
+                  svc['metadata']['name'], svc['metadata']['namespace'],
+                  spec.get('type', '-'), spec.get('clusterIP', '-'),
+                  ', '.join(spec.get('externalIPs', [])) or '-',
+                  len(spec.get('ports', [])), selector,
+                  'Has Endpoints' if has_endpoints else 'No Endpoints'
+              ])
+          write_table(report, 'Services', ['Service Name','Namespace','Type','Cluster IP','External IP','Ports','Selector','Endpoint Status'], rows)
+
+          orphaned = [r for r in rows if r[7] == 'No Endpoints' and r[2] != 'ExternalName']
+          if orphaned:
+              report.write("\n### Services Without Endpoints (Potential Orphans)\n\n")
+              report.write("| Service Name | Namespace | Type | Selector | Issue |\n")
+              report.write("|-------------|-----------|------|----------|-------|\n")
+              for s in orphaned:
+                  report.write(f"| {s[0]} | {s[1]} | {s[2]} | {s[6]} | No pods match selector |\n")
+
+          data = kubectl(['get', 'deployments', '--all-namespaces', '-o', 'json'])
+          deployments = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for d in deployments:
+              spec, status = d.get('spec', {}), d.get('status', {})
+              replicas, ready = spec.get('replicas', 0), status.get('readyReplicas', 0)
+              rows.append([d['metadata']['name'], d['metadata']['namespace'], replicas, ready,
+                  status.get('availableReplicas', 0), 'Healthy' if ready == replicas else 'Degraded'])
+          write_table(report, 'Deployments', ['Deployment Name','Namespace','Desired','Ready','Available','Status'], rows)
+
+          data = kubectl(['get', 'statefulsets', '--all-namespaces', '-o', 'json'])
+          sts = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for s in sts:
+              spec, status = s.get('spec', {}), s.get('status', {})
+              replicas, ready = spec.get('replicas', 0), status.get('readyReplicas', 0)
+              rows.append([s['metadata']['name'], s['metadata']['namespace'], replicas, ready,
+                  'Healthy' if ready == replicas else 'Degraded'])
+          write_table(report, 'StatefulSets', ['StatefulSet Name','Namespace','Desired','Ready','Status'], rows)
+
+          data = kubectl(['get', 'daemonsets', '--all-namespaces', '-o', 'json'])
+          ds = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for d in ds:
+              status = d.get('status', {})
+              desired, ready = status.get('desiredNumberScheduled', 0), status.get('numberReady', 0)
+              rows.append([d['metadata']['name'], d['metadata']['namespace'], desired, ready,
+                  'Healthy' if ready == desired else 'Degraded'])
+          write_table(report, 'DaemonSets', ['DaemonSet Name','Namespace','Desired','Ready','Status'], rows)
+
+          data = kubectl(['get', 'pv', '-o', 'json'])
+          pvs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for pv in pvs:
+              spec = pv.get('spec', {})
+              claim = spec.get('claimRef', {})
+              claim_name = f"{claim.get('namespace', '-')}/{claim.get('name', '-')}" if claim else '-'
+              rows.append([pv['metadata']['name'], pv.get('status', {}).get('phase', '-'),
+                  spec.get('capacity', {}).get('storage', '-'), spec.get('storageClassName', '-'),
+                  spec.get('persistentVolumeReclaimPolicy', '-'), claim_name])
+          write_table(report, 'Persistent Volumes (PV)', ['PV Name','Status','Capacity','Storage Class','Reclaim Policy','Bound To'], rows)
+
+          unbound = [r for r in rows if r[1] == 'Available']
+          if unbound:
+              report.write("\n### Unbound Persistent Volumes\n\n")
+              report.write("| PV Name | Capacity | Storage Class | Reclaim Policy |\n")
+              report.write("|---------|----------|---------------|----------------|\n")
+              for p in unbound:
+                  report.write(f"| {p[0]} | {p[2]} | {p[3]} | {p[4]} |\n")
+
+          data = kubectl(['get', 'pvc', '--all-namespaces', '-o', 'json'])
+          pvcs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for pvc in pvcs:
+              spec = pvc.get('spec', {})
+              rows.append([pvc['metadata']['name'], pvc['metadata']['namespace'],
+                  pvc.get('status', {}).get('phase', '-'),
+                  spec.get('resources', {}).get('requests', {}).get('storage', '-'),
+                  spec.get('storageClassName', '-'),
+                  ', '.join(spec.get('accessModes', [])),
+                  spec.get('volumeName', '-')])
+          write_table(report, 'Persistent Volume Claims (PVC)',
+              ['PVC Name','Namespace','Status','Requested','Storage Class','Access Modes','Bound PV'], rows)
+
+          pending = [r for r in rows if r[2] != 'Bound']
+          if pending:
+              report.write("\n### Pending/Unbound PVCs\n\n")
+              report.write("| PVC Name | Namespace | Status | Storage Class | Issue |\n")
+              report.write("|----------|-----------|--------|---------------|-------|\n")
+              for p in pending:
+                  issue = 'No matching PV' if p[2] == 'Pending' else 'Lost binding'
+                  report.write(f"| {p[0]} | {p[1]} | {p[2]} | {p[4]} | {issue} |\n")
+
+          data = kubectl(['get', 'configmaps', '--all-namespaces', '-o', 'json'])
+          cms = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[cm['metadata']['name'], cm['metadata']['namespace'],
+                   len(cm.get('data', {})), len(cm.get('binaryData', {})),
+                   cm['metadata'].get('creationTimestamp', '-')]
+                  for cm in cms]
+          write_table(report, 'ConfigMaps', ['ConfigMap Name','Namespace','Data Keys','Binary Keys','Created'], rows)
+
+          data = kubectl(['get', 'secrets', '--all-namespaces', '-o', 'json'])
+          secrets = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[s['metadata']['name'], s['metadata']['namespace'], s.get('type', '-'),
+                   len(s.get('data', {})), s['metadata'].get('creationTimestamp', '-')]
+                  for s in secrets]
+          write_table(report, 'Secrets', ['Secret Name','Namespace','Type','Data Keys','Created'], rows)
+
+          data = kubectl(['get', 'ingress', '--all-namespaces', '-o', 'json'])
+          ingresses = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for ing in ingresses:
+              spec = ing.get('spec', {})
+              rows.append([ing['metadata']['name'], ing['metadata']['namespace'],
+                  spec.get('ingressClassName', '-'), len(spec.get('rules', [])), len(spec.get('tls', []))])
+          write_table(report, 'Ingresses', ['Ingress Name','Namespace','Class','Rules','TLS'], rows)
+
+          data = kubectl(['get', 'jobs', '--all-namespaces', '-o', 'json'])
+          jobs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for j in jobs:
+              status = j.get('status', {})
+              succ, failed, active = status.get('succeeded', 0), status.get('failed', 0), status.get('active', 0)
+              state = 'Complete' if succ > 0 else 'Running' if active > 0 else 'Failed' if failed > 0 else 'Unknown'
+              rows.append([j['metadata']['name'], j['metadata']['namespace'], succ, failed, active, state])
+          write_table(report, 'Jobs', ['Job Name','Namespace','Succeeded','Failed','Active','Status'], rows)
+
+          data = kubectl(['get', 'cronjobs', '--all-namespaces', '-o', 'json'])
+          cjs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for cj in cjs:
+              spec = cj.get('spec', {})
+              rows.append([cj['metadata']['name'], cj['metadata']['namespace'],
+                  spec.get('schedule', '-'), 'Suspended' if spec.get('suspend', False) else 'Active',
+                  cj.get('status', {}).get('lastScheduleTime', '-')])
+          write_table(report, 'CronJobs', ['CronJob Name','Namespace','Schedule','State','Last Scheduled'], rows)
+
+          data = kubectl(['get', 'hpa', '--all-namespaces', '-o', 'json'])
+          hpas = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for hpa in hpas:
+              spec, status = hpa.get('spec', {}), hpa.get('status', {})
+              target = spec.get('scaleTargetRef', {})
+              rows.append([hpa['metadata']['name'], hpa['metadata']['namespace'],
+                  f"{target.get('kind', '-')}/{target.get('name', '-')}",
+                  spec.get('minReplicas', '-'), spec.get('maxReplicas', '-'),
+                  status.get('currentReplicas', '-'), status.get('desiredReplicas', '-')])
+          write_table(report, 'Horizontal Pod Autoscalers',
+              ['HPA Name','Namespace','Target','Min','Max','Current','Desired'], rows)
+
+          data = kubectl(['get', 'resourcequota', '--all-namespaces', '-o', 'json'])
+          quotas = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for q in quotas:
+              hard = q.get('status', {}).get('hard', {})
+              used = q.get('status', {}).get('used', {})
+              rows.append([q['metadata']['name'], q['metadata']['namespace'],
+                  ', '.join([f"{k}={v}" for k, v in hard.items()])[:50] or '-',
+                  ', '.join([f"{k}={v}" for k, v in used.items()])[:50] or '-'])
+          write_table(report, 'Resource Quotas', ['Quota Name','Namespace','Hard Limits','Used'], rows)
+
+          data = kubectl(['get', 'serviceaccounts', '--all-namespaces', '-o', 'json'])
+          sas = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[sa['metadata']['name'], sa['metadata']['namespace'],
+                   len(sa.get('secrets', [])), sa['metadata'].get('creationTimestamp', '-')]
+                  for sa in sas]
+          write_table(report, 'Service Accounts', ['Service Account','Namespace','Secrets','Created'], rows)
+
+          data = kubectl(['get', 'roles', '--all-namespaces', '-o', 'json'])
+          roles = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[r['metadata']['name'], r['metadata']['namespace'], len(r.get('rules', []))]
+                  for r in roles]
+          write_table(report, 'Roles', ['Role Name','Namespace','Rules'], rows)
+
+          data = kubectl(['get', 'rolebindings', '--all-namespaces', '-o', 'json'])
+          rbs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for rb in rbs:
+              role = rb.get('roleRef', {})
+              rows.append([rb['metadata']['name'], rb['metadata']['namespace'],
+                  f"{role.get('kind', '-')}/{role.get('name', '-')}", len(rb.get('subjects', []))])
+          write_table(report, 'Role Bindings', ['Binding Name','Namespace','Role','Subjects'], rows)
+
+          data = kubectl(['get', 'clusterroles', '-o', 'json'])
+          crs = data.get('items', []) if isinstance(data, dict) else []
+          rows = [[cr['metadata']['name'], len(cr.get('rules', []))] for cr in crs]
+          write_table(report, 'ClusterRoles', ['ClusterRole Name','Rules'], rows)
+
+          data = kubectl(['get', 'clusterrolebindings', '-o', 'json'])
+          crbs = data.get('items', []) if isinstance(data, dict) else []
+          rows = []
+          for crb in crbs:
+              role = crb.get('roleRef', {})
+              rows.append([crb['metadata']['name'],
+                  f"{role.get('kind', '-')}/{role.get('name', '-')}", len(crb.get('subjects', []))])
+          write_table(report, 'ClusterRoleBindings', ['Binding Name','ClusterRole','Subjects'], rows)
+
+          report.close()
+          print("AKS inventory generated: aks-inventory.md")
+          PYEOF
+          python3 k8s_inventory.py
+
+      - name: Upload AKS Inventory
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: aks-inventory-${{ github.run_id }}
+          path: aks-inventory.md
+          retention-days: 30
+
+  combine-k8s:
+    needs: [dispatch, scan-eks, scan-aks]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download Inventories
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          path: ./inventories
+          pattern: '*-inventory-${{ github.run_id }}'
+          merge-multiple: false
+
+      - name: Combine Reports
+        run: |
+          set -euo pipefail
+          echo "# K8s Cluster Inventory (EKS + AKS)" > combined-k8s.md
+          echo "**Generated:** $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> combined-k8s.md
+          echo "" >> combined-k8s.md
+          for f in ./inventories/*/eks-inventory.md ./inventories/*/aks-inventory.md; do
+            if [ -f "$f" ]; then cat "$f" >> combined-k8s.md; echo "" >> combined-k8s.md; fi
+          done
+
+      - name: Upload Combined Report
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: combined-k8s-${{ github.run_id }}
+          path: combined-k8s.md
+          retention-days: 30
+
+      - name: Job Summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## K8s Cluster Scan Complete"
+            echo ""
+            echo "Clusters scanned: ${{ needs.dispatch.outputs.run_eks == 'true' && 'EKS ' || '' }}${{ needs.dispatch.outputs.run_aks == 'true' && 'AKS' || '' }}"
+            echo ""
+            echo "[View Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          } >> $GITHUB_STEP_SUMMARY

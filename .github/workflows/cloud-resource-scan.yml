@@ -1,0 +1,558 @@
+name: Cloud Resource Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'Cloud provider (aws, azure, or all)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - 'aws'
+          - 'azure'
+          - 'all'
+
+env:
+  ALLOWED_MANUAL_BRANCH: main
+
+concurrency:
+  group: cloud-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    outputs:
+      run_aws: ${{ steps.set.outputs.run_aws }}
+      run_azure: ${{ steps.set.outputs.run_azure }}
+    steps:
+      - name: Enforce Allowed Branch
+        if: github.ref != format('refs/heads/{0}', env.ALLOWED_MANUAL_BRANCH)
+        run: |
+          set -euo pipefail
+          echo "::error::Manual dispatch only allowed from branch '${{ env.ALLOWED_MANUAL_BRANCH }}'. Current ref: ${{ github.ref }}"
+          exit 1
+
+      - name: Determine Providers
+        id: set
+        run: |
+          set -euo pipefail
+          INPUT="${{ github.event.inputs.provider || 'all' }}"
+          if [ "$INPUT" = "all" ]; then
+            echo "run_aws=true" >> $GITHUB_OUTPUT
+            echo "run_azure=true" >> $GITHUB_OUTPUT
+          elif [ "$INPUT" = "aws" ]; then
+            echo "run_aws=true" >> $GITHUB_OUTPUT
+            echo "run_azure=false" >> $GITHUB_OUTPUT
+          elif [ "$INPUT" = "azure" ]; then
+            echo "run_aws=false" >> $GITHUB_OUTPUT
+            echo "run_azure=true" >> $GITHUB_OUTPUT
+          fi
+
+  scan-aws:
+    needs: dispatch
+    if: needs.dispatch.outputs.run_aws == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install boto3
+        run: pip install --disable-pip-version-check boto3
+
+      - name: AWS Login (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502  # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: github-actions-cloud-scan
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Generate AWS Inventory
+        run: |
+          set -euo pipefail
+          cat << 'PYEOF' > aws_inventory.py
+          import boto3
+          from datetime import datetime, timezone
+
+          def write_table(f, title, headers, rows):
+              if not rows:
+                  f.write(f"\n## {title}\n\nNo resources found.\n")
+                  return
+              f.write(f"\n## {title}\n\n")
+              f.write("| " + " | ".join(headers) + " |\n")
+              f.write("|" + "|".join(["---" for _ in headers]) + "|\n")
+              for row in rows:
+                  f.write("| " + " | ".join(str(c) for c in row) + " |\n")
+              f.write(f"\n**Total: {len(rows)} resources**\n")
+
+          ec2 = boto3.client('ec2')
+          elbv2 = boto3.client('elbv2')
+          rds = boto3.client('rds')
+          lambda_client = boto3.client('lambda')
+          s3 = boto3.client('s3')
+          iam = boto3.client('iam')
+          tagging = boto3.client('resourcegroupstaggingapi')
+
+          report = open('aws-inventory.md', 'w')
+          report.write("# AWS Resource Inventory\n\n")
+          report.write(f"**Region:** {boto3.session.Session().region_name}\n")
+          report.write(f"**Generated:** {datetime.now(timezone.utc).isoformat()}\n")
+
+          all_resources = []
+          paginator = tagging.get_paginator('get_resources')
+          for page in paginator.paginate():
+              all_resources.extend(page['ResourceTagMappingList'])
+          by_service = {}
+          for r in all_resources:
+              parts = r['ResourceARN'].split(':')
+              svc = parts[2] if len(parts) > 2 else 'unknown'
+              by_service.setdefault(svc, []).append(r)
+
+          # EC2 Instances
+          rows = []
+          for res in ec2.describe_instances()['Reservations']:
+              for inst in res['Instances']:
+                  name = next((t['Value'] for t in inst.get('Tags', []) if t['Key'] == 'Name'), '-')
+                  rows.append([
+                      inst['InstanceId'], name, inst['InstanceType'],
+                      inst['State']['Name'], inst['Placement']['AvailabilityZone'],
+                      inst.get('VpcId', '-'), len(inst.get('NetworkInterfaces', []))
+                  ])
+          write_table(report, 'EC2 Instances',
+              ['Instance ID','Name','Type','State','AZ','VPC','NICs'], rows)
+
+          # EBS Volumes
+          rows = []
+          for v in ec2.describe_volumes()['Volumes']:
+              attached = len(v.get('Attachments', [])) > 0
+              instance = v['Attachments'][0]['InstanceId'] if attached else '-'
+              rows.append([v['VolumeId'], f"{v['Size']} GB", v['VolumeType'],
+                  v['AvailabilityZone'], 'Attached' if attached else 'Unattached', instance])
+          write_table(report, 'EBS Volumes',
+              ['Volume ID','Size','Type','AZ','Status','Attached To'], rows)
+
+          # Elastic IPs
+          rows = []
+          for a in ec2.describe_addresses()['Addresses']:
+              assoc = a.get('AssociationId', '-')
+              rows.append([a['PublicIp'], a['AllocationId'],
+                  'Associated' if assoc != '-' else 'Unassociated',
+                  a.get('InstanceId', '-')])
+          write_table(report, 'Elastic IPs',
+              ['Public IP','Allocation ID','Status','Associated To'], rows)
+
+          # VPCs
+          rows = []
+          for v in ec2.describe_vpcs()['Vpcs']:
+              name = next((t['Value'] for t in v.get('Tags', []) if t['Key'] == 'Name'), '-')
+              rows.append([v['VpcId'], name, v['CidrBlock'], v['State'], '-'])
+          write_table(report, 'VPCs',
+              ['VPC ID','Name','CIDR','State','Subnets'], rows)
+
+          # Subnets
+          rows = []
+          for s in ec2.describe_subnets()['Subnets']:
+              name = next((t['Value'] for t in s.get('Tags', []) if t['Key'] == 'Name'), '-')
+              rows.append([s['SubnetId'], name, s['CidrBlock'],
+                  s['AvailabilityZone'], s['VpcId'], s['AvailableIpAddressCount']])
+          write_table(report, 'Subnets',
+              ['Subnet ID','Name','CIDR','AZ','VPC','Available IPs'], rows)
+
+          # Security Groups
+          rows = []
+          for sg in ec2.describe_security_groups()['SecurityGroups']:
+              rows.append([sg['GroupId'], sg['GroupName'], sg['VpcId'],
+                  len(sg.get('IpPermissions', [])), len(sg.get('IpPermissionsEgress', []))])
+          write_table(report, 'Security Groups',
+              ['Group ID','Name','VPC','Inbound Rules','Outbound Rules'], rows)
+
+          # Network Interfaces
+          rows = []
+          for n in ec2.describe_network_interfaces()['NetworkInterfaces']:
+              att = n.get('Attachment', {})
+              rows.append([n['NetworkInterfaceId'], n['SubnetId'],
+                  'Attached' if att else 'Unattached',
+                  att.get('InstanceId', '-') if att else '-', len(n.get('Groups', []))])
+          write_table(report, 'Network Interfaces',
+              ['ENI ID','Subnet','Status','Attached To','Security Groups'], rows)
+
+          # ALB/NLB
+          rows = []
+          for lb in elbv2.describe_load_balancers()['LoadBalancers']:
+              tgs = elbv2.describe_target_groups(LoadBalancerArn=lb['LoadBalancerArn'])['TargetGroups']
+              healthy = 0
+              for tg in tgs:
+                  health = elbv2.describe_target_health(TargetGroupArn=tg['TargetGroupArn'])['TargetHealthDescriptions']
+                  healthy += sum(1 for h in health if h['TargetHealth']['State'] == 'healthy')
+              rows.append([lb['LoadBalancerName'], lb['Type'], lb['Scheme'], lb['VpcId'],
+                  len(tgs), healthy, 'Active' if healthy > 0 else 'No Healthy Targets'])
+          write_table(report, 'Load Balancers (ALB/NLB)',
+              ['Name','Type','Scheme','VPC','Target Groups','Healthy Targets','Status'], rows)
+
+          # Classic ELB
+          try:
+              elb = boto3.client('elb')
+              rows = []
+              for lb in elb.describe_load_balancers()['LoadBalancerDescriptions']:
+                  rows.append([lb['LoadBalancerName'], lb['Scheme'],
+                      lb.get('VPCId', '-'), len(lb.get('Instances', [])), lb['HealthCheck']['Target']])
+              write_table(report, 'Classic Load Balancers',
+                  ['Name','Scheme','VPC','Instances','Health Check'], rows)
+          except Exception:
+              pass
+
+          # RDS Instances
+          try:
+              rows = []
+              for db in rds.describe_db_instances()['DBInstances']:
+                  rows.append([db['DBInstanceIdentifier'], db['Engine'], db['DBInstanceClass'],
+                      db['DBInstanceStatus'], db.get('AvailabilityZone', '-'), db.get('AllocatedStorage', '-')])
+              write_table(report, 'RDS Instances',
+                  ['Identifier','Engine','Class','Status','AZ','Storage (GB)'], rows)
+          except Exception:
+              pass
+
+          # RDS Clusters
+          try:
+              rows = []
+              for c in rds.describe_db_clusters()['DBClusters']:
+                  rows.append([c['DBClusterIdentifier'], c['Engine'], c['Status'],
+                      len(c.get('DBClusterMembers', []))])
+              write_table(report, 'RDS Clusters',
+                  ['Identifier','Engine','Status','Members'], rows)
+          except Exception:
+              pass
+
+          # Lambda
+          try:
+              rows = []
+              for fn in lambda_client.list_functions()['Functions']:
+                  rows.append([fn['FunctionName'], fn['Runtime'], fn['Handler'],
+                      fn['LastModified'], fn['CodeSize']])
+              write_table(report, 'Lambda Functions',
+                  ['Name','Runtime','Handler','Last Modified','Code Size'], rows)
+          except Exception:
+              pass
+
+          # S3
+          try:
+              rows = []
+              for b in s3.list_buckets()['Buckets']:
+                  try:
+                      loc = s3.get_bucket_location(Bucket=b['Name'])['LocationConstraint'] or 'us-east-1'
+                  except:
+                      loc = '-'
+                  try:
+                      ver = s3.get_bucket_versioning(Bucket=b['Name'])['Status'] or 'Disabled'
+                  except:
+                      ver = '-'
+                  rows.append([b['Name'], b['CreationDate'].isoformat(), loc, ver])
+              write_table(report, 'S3 Buckets',
+                  ['Bucket Name','Created','Region','Versioning'], rows)
+          except Exception:
+              pass
+
+          # IAM Users
+          try:
+              rows = []
+              for u in iam.list_users()['Users']:
+                  mfa = iam.list_mfa_devices(UserName=u['UserName'])['MFADevices']
+                  keys = iam.list_access_keys(UserName=u['UserName'])['AccessKeyMetadata']
+                  rows.append([u['UserName'], u['CreateDate'].isoformat(),
+                      'Yes' if mfa else 'No', len(keys), u.get('PasswordLastUsed', '-')])
+              write_table(report, 'IAM Users',
+                  ['User Name','Created','MFA','Access Keys','Last Password Use'], rows)
+          except Exception:
+              pass
+
+          # IAM Roles
+          try:
+              rows = []
+              for r in iam.list_roles()['Roles']:
+                  attached = iam.list_attached_role_policies(RoleName=r['RoleName'])['AttachedPolicies']
+                  rows.append([r['RoleName'], r['CreateDate'].isoformat(),
+                      r.get('Description', '-'), len(attached)])
+              write_table(report, 'IAM Roles',
+                  ['Role Name','Created','Description','Attached Policies'], rows)
+          except Exception:
+              pass
+
+          # Tagged resources summary
+          report.write("\n---\n\n## All Discovered Resources (by Service)\n\n")
+          for svc in sorted(by_service.keys()):
+              resources = by_service[svc]
+              report.write(f"\n### {svc.upper()} ({len(resources)} resources)\n\n")
+              report.write("| Resource ARN | Tags |\n|-------------|------|\n")
+              for r in resources[:50]:
+                  tags = ', '.join([f"{t['Key']}={t['Value']}" for t in r.get('Tags', [])[:3]])
+                  report.write(f"| `{r['ResourceARN']}` | {tags or '-'} |\n")
+              if len(resources) > 50:
+                  report.write(f"\n*... and {len(resources) - 50} more resources*\n")
+
+          report.close()
+          print("AWS inventory generated: aws-inventory.md")
+          PYEOF
+          python3 aws_inventory.py
+
+      - name: Upload AWS Inventory
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: aws-inventory-${{ github.run_id }}
+          path: aws-inventory.md
+          retention-days: 30
+
+  scan-azure:
+    needs: dispatch
+    if: needs.dispatch.outputs.run_azure == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@a65d910e8af852a8061c627c456678983e180302
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Generate Azure Inventory
+        run: |
+          set -euo pipefail
+          cat << 'PYEOF' > azure_inventory.py
+          import subprocess
+          import json
+          from datetime import datetime, timezone
+
+          def az(cmd, output_format='json'):
+              result = subprocess.run(['az'] + cmd, capture_output=True, text=True)
+              if result.returncode != 0:
+                  return []
+              if output_format == 'tsv':
+                  return result.stdout.strip().splitlines()
+              try:
+                  return json.loads(result.stdout) if result.stdout.strip() else []
+              except:
+                  return []
+
+          def write_table(f, title, headers, rows):
+              if not rows:
+                  f.write(f"\n## {title}\n\nNo resources found.\n")
+                  return
+              f.write(f"\n## {title}\n\n")
+              f.write("| " + " | ".join(headers) + " |\n")
+              f.write("|" + "|".join(["---" for _ in headers]) + "|\n")
+              for row in rows:
+                  f.write("| " + " | ".join(str(c) for c in row) + " |\n")
+              f.write(f"\n**Total: {len(rows)} resources**\n")
+
+          report = open('azure-inventory.md', 'w')
+          report.write("# Azure Resource Inventory\n\n")
+          sub_name = az(['account', 'show', '--query', 'name', '-o', 'tsv'], output_format='tsv')
+          report.write(f"**Subscription:** {sub_name[0] if sub_name else 'N/A'}\n")
+          report.write(f"**Generated:** {datetime.now(timezone.utc).isoformat()}\n")
+
+          all_resources = az(['resource', 'list', '--query',
+              '[].{name:name, type:type, resourceGroup:resourceGroup, location:location, kind:kind, managedBy:managedBy, tags:tags}'])
+
+          # VMs
+          vms = az(['vm', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, type:hardwareProfile.vmSize, os:storageProfile.osDisk.osType, state:powerState, location:location, nicCount:length(networkProfile.networkInterfaces)}'])
+          rows = [[vm.get('name','-'), vm.get('resourceGroup','-'), vm.get('type','-'),
+                   vm.get('os','-'), vm.get('state','-'), vm.get('location','-'), vm.get('nicCount',0)] for vm in vms]
+          write_table(report, 'Virtual Machines',
+              ['Name','Resource Group','Size','OS','Power State','Location','NICs'], rows)
+
+          # Managed Disks
+          disks = az(['disk', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, size:diskSizeGb, sku:sku.name, state:diskState, managedBy:managedBy, location:location}'])
+          rows = []
+          for d in disks:
+              vm = d.get('managedBy', '-')
+              if vm and vm != '-': vm = vm.split('/')[-1]
+              rows.append([d.get('name','-'), d.get('resourceGroup','-'), f"{d.get('size','?')} GB",
+                  d.get('sku','?'), d.get('state','?'), vm, d.get('location','-')])
+          write_table(report, 'Managed Disks',
+              ['Disk Name','Resource Group','Size','SKU','State','Attached To','Location'], rows)
+
+          # NICs
+          nics = az(['network', 'nic', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, location:location, vm:virtualMachine.id, ipCount:length(ipConfigurations)}'])
+          rows = []
+          for n in nics:
+              vm = n.get('vm', '-')
+              if vm and vm != '-': vm = vm.split('/')[-1]
+              status = 'Attached' if vm and vm != '-' else 'Unattached'
+              rows.append([n.get('name','-'), n.get('resourceGroup','-'), n.get('location','-'),
+                  status, vm, n.get('ipCount',0)])
+          write_table(report, 'Network Interfaces',
+              ['NIC Name','Resource Group','Location','Status','Attached To','IP Configs'], rows)
+
+          # Public IPs
+          pips = az(['network', 'public-ip', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, ip:ipAddress, location:location, config:ipConfiguration.id, sku:sku.name}'])
+          rows = []
+          for p in pips:
+              config = p.get('config', '-')
+              assoc = config.split('/')[-2] if config and config != '-' else '-'
+              status = 'Associated' if config and config != '-' else 'Unassociated'
+              rows.append([p.get('name','-'), p.get('resourceGroup','-'), p.get('ip','-'),
+                  p.get('location','-'), p.get('sku','-'), status, assoc])
+          write_table(report, 'Public IP Addresses',
+              ['IP Name','Resource Group','IP Address','Location','SKU','Status','Associated To'], rows)
+
+          # VNets
+          vnets = az(['network', 'vnet', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, location:location, cidr:addressSpace.addressPrefixes[0], subnetCount:length(subnets)}'])
+          rows = [[v.get('name','-'), v.get('resourceGroup','-'), v.get('location','-'),
+                   v.get('cidr','-'), v.get('subnetCount',0)] for v in vnets]
+          write_table(report, 'Virtual Networks',
+              ['VNet Name','Resource Group','Location','CIDR','Subnets'], rows)
+
+          # NSGs
+          nsgs = az(['network', 'nsg', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, location:location, subnetCount:length(subnets), nicCount:length(networkInterfaces)}'])
+          rows = []
+          for n in nsgs:
+              subnets, nics = n.get('subnetCount',0), n.get('nicCount',0)
+              rows.append([n.get('name','-'), n.get('resourceGroup','-'), n.get('location','-'),
+                  subnets, nics, 'In Use' if (subnets + nics) > 0 else 'Unused'])
+          write_table(report, 'Network Security Groups',
+              ['NSG Name','Resource Group','Location','Subnets','NICs','Status'], rows)
+
+          # Storage Accounts
+          storage = az(['storage', 'account', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, location:location, sku:sku.name, tier:accessTier, kind:kind}'])
+          rows = [[s.get('name','-'), s.get('resourceGroup','-'), s.get('location','-'),
+                   s.get('sku','-'), s.get('tier','-'), s.get('kind','-')] for s in storage]
+          write_table(report, 'Storage Accounts',
+              ['Account Name','Resource Group','Location','SKU','Tier','Kind'], rows)
+
+          # App Service Plans
+          plans = az(['appservice', 'plan', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, location:location, sku:sku.name, sites:numberOfSites, size:sku.size}'])
+          rows = []
+          for p in plans:
+              sites = p.get('sites', 0)
+              rows.append([p.get('name','-'), p.get('resourceGroup','-'), p.get('location','-'),
+                  p.get('sku','-'), p.get('size','-'), sites, 'In Use' if sites > 0 else 'Unused'])
+          write_table(report, 'App Service Plans',
+              ['Plan Name','Resource Group','Location','SKU','Size','Sites','Status'], rows)
+
+          # Web Apps / Functions
+          webapps = az(['webapp', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, location:location, plan:appServicePlanId, state:state, type:kind}'])
+          rows = []
+          for w in webapps:
+              plan = w.get('plan', '-')
+              if plan and plan != '-': plan = plan.split('/')[-1]
+              rows.append([w.get('name','-'), w.get('resourceGroup','-'), w.get('location','-'),
+                  w.get('type','-'), w.get('state','-'), plan])
+          write_table(report, 'Web Apps / Functions',
+              ['Name','Resource Group','Location','Type','State','App Service Plan'], rows)
+
+          # AKS Clusters
+          aks = az(['aks', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, location:location, version:kubernetesVersion, nodes:agentPoolProfiles[0].count, vmSize:agentPoolProfiles[0].vmSize, power:powerState.code}'])
+          rows = [[c.get('name','-'), c.get('resourceGroup','-'), c.get('location','-'),
+                   c.get('version','-'), c.get('nodes','-'), c.get('vmSize','-'), c.get('power','-')] for c in aks]
+          write_table(report, 'AKS Clusters',
+              ['Cluster Name','Resource Group','Location','K8s Version','Nodes','VM Size','Power State'], rows)
+
+          # SQL Servers
+          sql = az(['sql', 'server', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, location:location, version:version, state:state}'])
+          rows = [[s.get('name','-'), s.get('resourceGroup','-'), s.get('location','-'),
+                   s.get('version','-'), s.get('state','-')] for s in sql]
+          write_table(report, 'SQL Servers',
+              ['Server Name','Resource Group','Location','Version','State'], rows)
+
+          # Key Vaults
+          vaults = az(['keyvault', 'list', '--query',
+              '[].{name:name, resourceGroup:resourceGroup, location:location, sku:properties.sku.name, softDelete:properties.enableSoftDelete}'])
+          rows = [[v.get('name','-'), v.get('resourceGroup','-'), v.get('location','-'),
+                   v.get('sku','-'), 'Enabled' if v.get('softDelete') else 'Disabled'] for v in vaults]
+          write_table(report, 'Key Vaults',
+              ['Vault Name','Resource Group','Location','SKU','Soft Delete'], rows)
+
+          # All Resources Summary
+          report.write("\n---\n\n## All Resources Summary\n\n")
+          if all_resources:
+              report.write(f"**Total resources discovered: {len(all_resources)}**\n\n")
+              report.write("| Resource Name | Resource Type | Resource Group | Location | Managed By |\n")
+              report.write("|-------------|-------------|----------------|----------|------------|\n")
+              for r in all_resources[:200]:
+                  report.write(f"| {r.get('name','-')} | {r.get('type','-')} | {r.get('resourceGroup','-')} | {r.get('location','-')} | {r.get('managedBy') or '-'} |\n")
+              if len(all_resources) > 200:
+                  report.write(f"\n*... and {len(all_resources) - 200} more resources*\n")
+          else:
+              report.write("No resources found via az resource list.\n")
+
+          report.close()
+          print("Azure inventory generated: azure-inventory.md")
+          PYEOF
+          python3 azure_inventory.py
+
+      - name: Upload Azure Inventory
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: azure-inventory-${{ github.run_id }}
+          path: azure-inventory.md
+          retention-days: 30
+
+  combine-cloud:
+    needs: [dispatch, scan-aws, scan-azure]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download Inventories
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          path: ./inventories
+          pattern: '*-inventory-${{ github.run_id }}'
+          merge-multiple: false
+
+      - name: Combine Reports
+        run: |
+          set -euo pipefail
+          echo "# Cloud Resource Inventory (AWS + Azure)" > combined-cloud.md
+          echo "**Generated:** $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> combined-cloud.md
+          echo "" >> combined-cloud.md
+          for f in ./inventories/*/aws-inventory.md ./inventories/*/azure-inventory.md; do
+            if [ -f "$f" ]; then cat "$f" >> combined-cloud.md; echo "" >> combined-cloud.md; fi
+          done
+
+      - name: Upload Combined Report
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: combined-cloud-${{ github.run_id }}
+          path: combined-cloud.md
+          retention-days: 30
+
+      - name: Job Summary
+        run: |
+          set -euo pipefail
+          {
+            echo "## Cloud Resource Scan Complete"
+            echo ""
+            echo "Providers scanned: ${{ needs.dispatch.outputs.run_aws == 'true' && 'AWS ' || '' }}${{ needs.dispatch.outputs.run_azure == 'true' && 'Azure' || '' }}"
+            echo ""
+            echo "[View Artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          } >> $GITHUB_STEP_SUMMARY
