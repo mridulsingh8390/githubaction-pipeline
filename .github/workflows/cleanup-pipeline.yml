@@ -3,8 +3,6 @@ name: Cloud Idle Resource Cleanup
 # Does NOT delete anything - purely informational/reporting
 
 on:
-  schedule:
-    - cron: '0 6 * * 1'
   workflow_dispatch:
     inputs:
       cloud_provider:
