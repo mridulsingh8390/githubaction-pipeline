@@ -2,8 +2,6 @@ name: Cloud Right-Sizing Recommendations
 # ONLY provides recommendations - NO changes made to any resources
 
 on:
-  schedule:
-    - cron: '0 8 * * 1'
   workflow_dispatch:
     inputs:
       cloud_provider:
