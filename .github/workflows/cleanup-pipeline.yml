@@ -1,0 +1,983 @@
+name: Cloud Idle Resource Cleanup
+# Lists all idle/orphaned resources that SHOULD be deleted
+# Does NOT delete anything - purely informational/reporting
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      cloud_provider:
+        description: 'Which cloud(s) to scan'
+        type: choice
+        options: [aws, azure, both]
+        default: 'aws'
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [all, development, staging]
+        default: 'development'
+      resource_types:
+        description: '[AWS] Resource types to scan (comma-separated)'
+        type: string
+        default: 'ec2,ebs,elb,eip,snapshot,rds'
+      min_age_days:
+        description: 'Minimum age in days to flag'
+        type: number
+        default: 30
+      min_monthly_cost:
+        description: 'Minimum monthly cost ($) to include'
+        type: number
+        default: 5
+      regions:
+        description: '[AWS] regions (comma-separated, or "all")'
+        type: string
+        default: 'us-east-1,us-west-2,eu-west-1'
+      azure_resource_types:
+        description: '[Azure] Resource types to scan (comma-separated)'
+        type: string
+        default: 'vm,disk,lb,publicip,snapshot,sqldb'
+      azure_regions:
+        description: '[Azure] regions (comma-separated, or "all")'
+        type: string
+        default: 'eastus,westus2,westeurope'
+
+env:
+  PYTHONUNBUFFERED: "1"
+  AWS_DEFAULT_REGION: us-east-1
+
+jobs:
+  decide-provider:
+    runs-on: ubuntu-latest
+    outputs:
+      run_aws: ${{ steps.decide.outputs.run_aws }}
+      run_azure: ${{ steps.decide.outputs.run_azure }}
+    steps:
+      - name: Decide which providers to run
+        id: decide
+        run: |
+          set -euo pipefail
+          # Schedule-safe default: 'both'. workflow_dispatch inputs are
+          # unavailable on schedule triggers, so this is what a cron run
+          # actually gets — deliberately covers both clouds unless someone
+          # explicitly picks aws/azure via manual dispatch.
+          PROVIDER="${{ inputs.cloud_provider || 'both' }}"
+          echo "Resolved provider selection: $PROVIDER"
+          if [ "$PROVIDER" = "aws" ] || [ "$PROVIDER" = "both" ]; then
+            echo "run_aws=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_aws=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$PROVIDER" = "azure" ] || [ "$PROVIDER" = "both" ]; then
+            echo "run_azure=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_azure=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  resolve-regions:
+    needs: decide-provider
+    if: needs.decide-provider.outputs.run_aws == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      regions: ${{ steps.regions.outputs.regions }}
+    steps:
+      - name: Resolve regions
+        id: regions
+        run: |
+          set -euo pipefail
+          DEFAULT_REGIONS='["us-east-1","us-west-2","eu-west-1"]'
+          INPUT_REGIONS="${{ inputs.regions }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$INPUT_REGIONS" ] && [ "$INPUT_REGIONS" != "all" ]; then
+            REGIONS=$(echo "$INPUT_REGIONS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | jq -R . | jq -s .)
+            echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
+          else
+            echo "regions=$DEFAULT_REGIONS" >> "$GITHUB_OUTPUT"
+          fi
+
+  resolve-azure-regions:
+    needs: decide-provider
+    if: needs.decide-provider.outputs.run_azure == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      regions: ${{ steps.regions.outputs.regions }}
+    steps:
+      - name: Resolve Azure regions
+        id: regions
+        run: |
+          set -euo pipefail
+          DEFAULT_REGIONS='["eastus","westus2","westeurope"]'
+          INPUT_REGIONS="${{ inputs.azure_regions }}"
+          if [ -n "$INPUT_REGIONS" ] && [ "$INPUT_REGIONS" != "all" ]; then
+            REGIONS=$(echo "$INPUT_REGIONS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | jq -R . | jq -s .)
+            echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
+          else
+            echo "regions=$DEFAULT_REGIONS" >> "$GITHUB_OUTPUT"
+          fi
+
+  scan-idle-resources:
+    needs: [decide-provider, resolve-regions]
+    if: needs.decide-provider.outputs.run_aws == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        region: ${{ fromJson(needs.resolve-regions.outputs.regions) }}
+      fail-fast: false
+    name: Scan ${{ matrix.region }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ secrets.AWS_COST_OPTIMIZATION_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Setup Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Dependencies
+        run: |
+          set -euo pipefail
+          pip install --disable-pip-version-check boto3==1.34.0 tabulate==0.9.0
+
+      - name: Scan Idle Resources
+        id: scan
+        env:
+          SCAN_REGION: ${{ matrix.region }}
+          ENV_FILTER: ${{ github.event.inputs.environment || 'development' }}
+          RESOURCE_TYPES: ${{ github.event.inputs.resource_types || 'ec2,ebs,elb,eip,snapshot,rds' }}
+          MIN_AGE: ${{ github.event.inputs.min_age_days || '30' }}
+          MIN_COST: ${{ github.event.inputs.min_monthly_cost || '5' }}
+        run: |
+          set -euo pipefail
+          python << 'PYEOF'
+          import boto3
+          import json
+          import os
+          import sys
+          from datetime import datetime, timedelta
+          from collections import defaultdict
+          from tabulate import tabulate
+
+          region = os.environ['SCAN_REGION']
+          env_filter = os.environ['ENV_FILTER']
+          resource_types = [t.strip() for t in os.environ['RESOURCE_TYPES'].split(',')]
+          min_age = int(os.environ['MIN_AGE'])
+          min_cost = float(os.environ['MIN_COST'])
+
+          ec2 = boto3.client('ec2', region_name=region)
+          elbv2 = boto3.client('elbv2', region_name=region)
+          rds = boto3.client('rds', region_name=region)
+          cloudwatch = boto3.client('cloudwatch', region_name=region)
+
+          findings = []
+          total_monthly_savings = 0
+
+          def get_tags(resource_tags):
+              return {t['Key']: t['Value'] for t in (resource_tags or [])}
+
+          def should_include(tags):
+              if env_filter == 'all':
+                  return True
+              env = tags.get('Environment', tags.get('env', '')).lower()
+              return env_filter in env or env in env_filter
+
+          def is_protected(tags):
+              for pt in ['DoNotDelete', 'DoNotTerminate', 'Protected', 'Critical']:
+                  if tags.get(pt, '').lower() in ['true', 'yes', '1']:
+                      return True
+              if tags.get('Environment', '').lower() == 'production':
+                  return True
+              return False
+
+          if 'ec2' in resource_types:
+              try:
+                  paginator = ec2.get_paginator('describe_instances')
+                  for page in paginator.paginate(Filters=[{'Name': 'instance-state-name', 'Values': ['stopped']}]):
+                      for reservation in page['Reservations']:
+                          for inst in reservation['Instances']:
+                              tags = get_tags(inst.get('Tags', []))
+                              if not should_include(tags):
+                                  continue
+                              launch_time = inst['LaunchTime'].replace(tzinfo=None)
+                              age_days = (datetime.utcnow() - launch_time).days
+                              if age_days < min_age:
+                                  continue
+                              attached_vols = len(inst.get('BlockDeviceMappings', []))
+                              vol_cost = attached_vols * 0.10 * 10
+                              monthly_cost = vol_cost
+                              if monthly_cost >= min_cost:
+                                  findings.append({
+                                      'region': region, 'service': 'EC2',
+                                      'resource_id': inst['InstanceId'],
+                                      'resource_type': 'stopped-instance',
+                                      'name': tags.get('Name', 'N/A'),
+                                      'reason': f"Stopped for {age_days} days, {attached_vols} EBS vols attached",
+                                      'monthly_cost': monthly_cost, 'age_days': age_days,
+                                      'environment': tags.get('Environment', 'unknown'),
+                                      'protected': 'YES' if is_protected(tags) else 'NO',
+                                      'recommended_action': 'TERMINATE (EBS vols will be deleted)',
+                                      'risk': 'MEDIUM' if not is_protected(tags) else 'BLOCKED'
+                                  })
+                                  total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"EC2 scan error in {region}: {e}", file=sys.stderr)
+
+          if 'ebs' in resource_types:
+              try:
+                  paginator = ec2.get_paginator('describe_volumes')
+                  for page in paginator.paginate(Filters=[{'Name': 'status', 'Values': ['available']}]):
+                      for vol in page['Volumes']:
+                          tags = get_tags(vol.get('Tags', []))
+                          if not should_include(tags):
+                              continue
+                          create_time = vol['CreateTime'].replace(tzinfo=None)
+                          age_days = (datetime.utcnow() - create_time).days
+                          if age_days < min_age:
+                              continue
+                          vol_type = vol['VolumeType']
+                          size = vol['Size']
+                          price_per_gb = {'gp3': 0.08, 'gp2': 0.10, 'io1': 0.125, 'io2': 0.125, 'st1': 0.045, 'sc1': 0.025}.get(vol_type, 0.10)
+                          monthly_cost = size * price_per_gb
+                          if monthly_cost >= min_cost:
+                              findings.append({
+                                  'region': region, 'service': 'EBS',
+                                  'resource_id': vol['VolumeId'],
+                                  'resource_type': 'unattached-volume',
+                                  'name': tags.get('Name', 'N/A'),
+                                  'reason': f"Unattached {size}GB {vol_type} for {age_days} days",
+                                  'monthly_cost': monthly_cost, 'age_days': age_days,
+                                  'environment': tags.get('Environment', 'unknown'),
+                                  'protected': 'YES' if is_protected(tags) else 'NO',
+                                  'recommended_action': 'DELETE (create snapshot first)',
+                                  'risk': 'LOW' if not is_protected(tags) else 'BLOCKED'
+                              })
+                              total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"EBS scan error in {region}: {e}", file=sys.stderr)
+
+          if 'elb' in resource_types:
+              try:
+                  paginator = elbv2.get_paginator('describe_load_balancers')
+                  for page in paginator.paginate():
+                      for lb in page['LoadBalancers']:
+                          lb_arn = lb['LoadBalancerArn']
+                          tg_resp = elbv2.describe_target_groups(LoadBalancerArn=lb_arn)
+                          total_targets = 0
+                          for tg in tg_resp['TargetGroups']:
+                              health = elbv2.describe_target_health(TargetGroupArn=tg['TargetGroupArn'])
+                              total_targets += len(health['TargetHealthDescriptions'])
+                          lb_dimension = '/'.join(lb_arn.split('/')[-3:])
+                          try:
+                              end = datetime.utcnow()
+                              start = end - timedelta(days=14)
+                              metric_resp = cloudwatch.get_metric_statistics(
+                                  Namespace='AWS/ApplicationELB', MetricName='RequestCount',
+                                  Dimensions=[{'Name': 'LoadBalancer', 'Value': lb_dimension}],
+                                  StartTime=start, EndTime=end, Period=86400, Statistics=['Sum']
+                              )
+                              total_requests = sum(dp['Sum'] for dp in metric_resp.get('Datapoints', []))
+                          except Exception:
+                              total_requests = 0
+                          if total_targets == 0 or total_requests == 0:
+                              tags_resp = elbv2.describe_tags(ResourceArns=[lb_arn])
+                              tags = get_tags(tags_resp['TagDescriptions'][0].get('Tags', [])) if tags_resp['TagDescriptions'] else {}
+                              if not should_include(tags):
+                                  continue
+                              lb_type = lb['Type']
+                              monthly_cost = 16.43
+                              if monthly_cost >= min_cost:
+                                  findings.append({
+                                      'region': region, 'service': 'ELB',
+                                      'resource_id': lb['LoadBalancerName'],
+                                      'resource_type': f"idle-{lb_type.lower()}",
+                                      'name': tags.get('Name', 'N/A'),
+                                      'reason': f"{lb_type} with {total_targets} targets, {int(total_requests)} requests (14d)",
+                                      'monthly_cost': monthly_cost, 'age_days': 'N/A',
+                                      'environment': tags.get('Environment', 'unknown'),
+                                      'protected': 'YES' if is_protected(tags) else 'NO',
+                                      'recommended_action': 'DELETE',
+                                      'risk': 'LOW' if not is_protected(tags) else 'BLOCKED'
+                                  })
+                                  total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"ELB scan error in {region}: {e}", file=sys.stderr)
+
+          if 'eip' in resource_types:
+              try:
+                  addresses = ec2.describe_addresses()['Addresses']
+                  for addr in addresses:
+                      if 'AssociationId' not in addr:
+                          monthly_cost = 3.60
+                          tags = get_tags(addr.get('Tags', []))
+                          if not should_include(tags):
+                              continue
+                          if monthly_cost >= min_cost:
+                              findings.append({
+                                  'region': region, 'service': 'EC2',
+                                  'resource_id': addr['AllocationId'],
+                                  'resource_type': 'unassociated-eip',
+                                  'name': tags.get('Name', addr.get('PublicIp', 'N/A')),
+                                  'reason': f"Unassociated Elastic IP ({addr.get('PublicIp', 'N/A')})",
+                                  'monthly_cost': monthly_cost, 'age_days': 'N/A',
+                                  'environment': tags.get('Environment', 'unknown'),
+                                  'protected': 'YES' if is_protected(tags) else 'NO',
+                                  'recommended_action': 'RELEASE',
+                                  'risk': 'LOW' if not is_protected(tags) else 'BLOCKED'
+                              })
+                              total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"EIP scan error in {region}: {e}", file=sys.stderr)
+
+          if 'snapshot' in resource_types:
+              try:
+                  paginator = ec2.get_paginator('describe_snapshots')
+                  for page in paginator.paginate(OwnerIds=['self']):
+                      for snap in page['Snapshots']:
+                          tags = get_tags(snap.get('Tags', []))
+                          if not should_include(tags):
+                              continue
+                          start_time = snap['StartTime'].replace(tzinfo=None)
+                          age_days = (datetime.utcnow() - start_time).days
+                          if age_days < min_age:
+                              continue
+                          vol_id = snap.get('VolumeId', '')
+                          try:
+                              ec2.describe_volumes(VolumeIds=[vol_id])
+                              volume_exists = True
+                          except:
+                              volume_exists = False
+                          if volume_exists and tags.get('Retention') != 'orphaned':
+                              continue
+                          size = snap['VolumeSize']
+                          monthly_cost = size * 0.05
+                          if monthly_cost >= min_cost:
+                              findings.append({
+                                  'region': region, 'service': 'EBS',
+                                  'resource_id': snap['SnapshotId'],
+                                  'resource_type': 'orphaned-snapshot',
+                                  'name': tags.get('Name', 'N/A'),
+                                  'reason': f"{size}GB snapshot, age {age_days}d, source vol {'EXISTS' if volume_exists else 'DELETED'}",
+                                  'monthly_cost': monthly_cost, 'age_days': age_days,
+                                  'environment': tags.get('Environment', 'unknown'),
+                                  'protected': 'YES' if is_protected(tags) else 'NO',
+                                  'recommended_action': 'DELETE' if not volume_exists else 'REVIEW',
+                                  'risk': 'LOW' if not is_protected(tags) else 'BLOCKED'
+                              })
+                              total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"Snapshot scan error in {region}: {e}", file=sys.stderr)
+
+          if 'rds' in resource_types:
+              try:
+                  paginator = rds.get_paginator('describe_db_instances')
+                  for page in paginator.paginate():
+                      for db in page['DBInstances']:
+                          db_id = db['DBInstanceIdentifier']
+                          try:
+                              end = datetime.utcnow()
+                              start = end - timedelta(days=14)
+                              cpu_resp = cloudwatch.get_metric_statistics(
+                                  Namespace='AWS/RDS', MetricName='CPUUtilization',
+                                  Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': db_id}],
+                                  StartTime=start, EndTime=end, Period=86400, Statistics=['Average']
+                              )
+                              avg_cpu = sum(dp['Average'] for dp in cpu_resp.get('Datapoints', [])) / max(len(cpu_resp.get('Datapoints', [])), 1)
+                              conn_resp = cloudwatch.get_metric_statistics(
+                                  Namespace='AWS/RDS', MetricName='DatabaseConnections',
+                                  Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': db_id}],
+                                  StartTime=start, EndTime=end, Period=86400, Statistics=['Average']
+                              )
+                              avg_conn = sum(dp['Average'] for dp in conn_resp.get('Datapoints', [])) / max(len(conn_resp.get('Datapoints', [])), 1)
+                          except:
+                              avg_cpu = 0
+                              avg_conn = 0
+                          if avg_cpu < 5 and avg_conn < 1:
+                              tags_resp = rds.list_tags_for_resource(ResourceName=db['DBInstanceArn'])
+                              tags = get_tags(tags_resp.get('TagList', []))
+                              if not should_include(tags):
+                                  continue
+                              instance_class = db['DBInstanceClass']
+                              cost_map = {
+                                  'db.t3.micro': 15, 'db.t3.small': 30, 'db.t3.medium': 60,
+                                  'db.m5.large': 140, 'db.m5.xlarge': 280, 'db.m5.2xlarge': 560,
+                                  'db.r5.large': 180, 'db.r5.xlarge': 360, 'db.r5.2xlarge': 720
+                              }
+                              monthly_cost = cost_map.get(instance_class, 100)
+                              if monthly_cost >= min_cost:
+                                  findings.append({
+                                      'region': region, 'service': 'RDS',
+                                      'resource_id': db_id,
+                                      'resource_type': 'idle-database',
+                                      'name': db.get('DBName', 'N/A'),
+                                      'reason': f"{instance_class}, CPU {avg_cpu:.1f}%, Conn {avg_conn:.1f} (14d avg) [COST ESTIMATE]",
+                                      'monthly_cost': monthly_cost, 'age_days': 'N/A',
+                                      'environment': tags.get('Environment', 'unknown'),
+                                      'protected': 'YES' if is_protected(tags) else 'NO',
+                                      'recommended_action': 'CREATE_SNAPSHOT_THEN_DELETE',
+                                      'risk': 'HIGH' if not is_protected(tags) else 'BLOCKED'
+                                  })
+                                  total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"RDS scan error in {region}: {e}", file=sys.stderr)
+
+          output_file = f'findings_{region}.json'
+          with open(output_file, 'w') as f:
+              json.dump(findings, f, indent=2, default=str)
+
+          print(f"\n{'='*80}")
+          print(f"IDLE RESOURCE CLEANUP REPORT - Region: {region}")
+          print(f"{'='*80}")
+          if not findings:
+              print(f"\nNo idle resources found in {region} matching criteria.")
+              print(f"   Filters: env={env_filter}, min_age={min_age}d, min_cost=${min_cost}")
+          else:
+              by_service = defaultdict(list)
+              for f in findings:
+                  by_service[f['service']].append(f)
+              for service, items in sorted(by_service.items()):
+                  print(f"\n{service} - {len(items)} resource(s) to clean up:")
+                  print("-" * 80)
+                  table_data = []
+                  for item in items:
+                      table_data.append([
+                          item['resource_id'], item['resource_type'], item['name'][:20],
+                          f"${item['monthly_cost']:.2f}",
+                          f"{item['age_days']}d" if isinstance(item['age_days'], int) else item['age_days'],
+                          item['protected'], item['recommended_action'][:30], item['risk']
+                      ])
+                  print(tabulate(table_data, headers=['ID', 'Type', 'Name', 'Monthly $', 'Age', 'Protected', 'Action', 'Risk'], tablefmt='grid'))
+                  service_cost = sum(i['monthly_cost'] for i in items)
+                  print(f"   Service savings: ${service_cost:.2f}/month")
+              print(f"\n{'='*80}")
+              print("SUMMARY")
+              print(f"{'='*80}")
+              summary_data = []
+              for service, items in sorted(by_service.items()):
+                  deletable = [i for i in items if i['protected'] == 'NO']
+                  blocked = [i for i in items if i['protected'] == 'YES']
+                  summary_data.append([service, len(items), len(deletable), len(blocked),
+                      f"${sum(i['monthly_cost'] for i in deletable):.2f}"])
+              print(tabulate(summary_data, headers=['Service', 'Total', 'Deletable', 'Protected', 'Deletable Savings'], tablefmt='grid'))
+              deletable_total = sum(f['monthly_cost'] for f in findings if f['protected'] == 'NO')
+              print(f"\nTOTAL POTENTIAL SAVINGS: ${total_monthly_savings:.2f}/month")
+              print(f"DELETABLE (unprotected):  ${deletable_total:.2f}/month")
+              print(f"PROTECTED (manual review): ${total_monthly_savings - deletable_total:.2f}/month")
+          print(f"\n{'='*80}\n")
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as gh_out:
+              gh_out.write(f"findings_count_{region}={len(findings)}\n")
+              gh_out.write(f"savings_{region}={total_monthly_savings:.2f}\n")
+          PYEOF
+
+      - name: Upload Findings
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: idle-resources-${{ matrix.region }}
+          path: findings_*.json
+
+  scan-idle-resources-azure:
+    needs: [decide-provider, resolve-azure-regions]
+    if: needs.decide-provider.outputs.run_azure == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        region: ${{ fromJson(needs.resolve-azure-regions.outputs.regions) }}
+      fail-fast: false
+    name: Scan Azure ${{ matrix.region }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Dependencies
+        run: |
+          set -euo pipefail
+          pip install --disable-pip-version-check \
+            azure-identity==1.17.1 azure-mgmt-compute==31.0.0 azure-mgmt-network==27.0.0 \
+            azure-mgmt-monitor==6.0.2 azure-mgmt-resource==23.1.1 azure-mgmt-sql==4.0.0b21 \
+            tabulate==0.9.0
+
+      - name: Scan Idle Azure Resources
+        id: scan
+        env:
+          SCAN_REGION: ${{ matrix.region }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ENV_FILTER: ${{ github.event.inputs.environment || 'development' }}
+          RESOURCE_TYPES: ${{ github.event.inputs.azure_resource_types || 'vm,disk,lb,publicip,snapshot,sqldb' }}
+          MIN_AGE: ${{ github.event.inputs.min_age_days || '30' }}
+          MIN_COST: ${{ github.event.inputs.min_monthly_cost || '5' }}
+        run: |
+          set -euo pipefail
+          python << 'PYEOF'
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone, timedelta
+          from collections import defaultdict
+          from tabulate import tabulate
+          from azure.identity import AzureCliCredential
+          from azure.mgmt.compute import ComputeManagementClient
+          from azure.mgmt.network import NetworkManagementClient
+          from azure.mgmt.monitor import MonitorManagementClient
+          from azure.mgmt.resource import ResourceManagementClient
+          try:
+              from azure.mgmt.sql import SqlManagementClient
+          except ImportError:
+              SqlManagementClient = None
+
+          region = os.environ['SCAN_REGION']
+          subscription_id = os.environ['AZURE_SUBSCRIPTION_ID']
+          env_filter = os.environ['ENV_FILTER']
+          resource_types = [t.strip() for t in os.environ['RESOURCE_TYPES'].split(',')]
+          min_age = int(os.environ['MIN_AGE'])
+          min_cost = float(os.environ['MIN_COST'])
+
+          # Reuses the azure/login OIDC session already established by the
+          # workflow step above — no separate service principal secret needed
+          # for this script itself.
+          credential = AzureCliCredential()
+          compute_client = ComputeManagementClient(credential, subscription_id)
+          network_client = NetworkManagementClient(credential, subscription_id)
+          monitor_client = MonitorManagementClient(credential, subscription_id)
+          resource_client = ResourceManagementClient(credential, subscription_id)
+          sql_client = SqlManagementClient(credential, subscription_id) if SqlManagementClient else None
+
+          findings = []
+          total_monthly_savings = 0
+
+          def get_tags(tags_dict):
+              return tags_dict or {}
+
+          def should_include(tags):
+              if env_filter == 'all':
+                  return True
+              env = tags.get('Environment', tags.get('environment', tags.get('env', ''))).lower()
+              return env_filter in env or env in env_filter
+
+          def is_protected(tags):
+              for pt in ['DoNotDelete', 'DoNotTerminate', 'Protected', 'Critical']:
+                  if tags.get(pt, '').lower() in ['true', 'yes', '1']:
+                      return True
+              if tags.get('Environment', '').lower() == 'production':
+                  return True
+              return False
+
+          def resource_group_from_id(resource_id):
+              # Azure resource IDs embed the resource group:
+              # /subscriptions/<sub>/resourceGroups/<rg>/providers/...
+              parts = resource_id.split('/')
+              try:
+                  return parts[parts.index('resourceGroups') + 1]
+              except (ValueError, IndexError):
+                  return None
+
+          def get_avg_metric(resource_uri, metric_name, namespace=None, days=14):
+              try:
+                  end = datetime.now(timezone.utc)
+                  start = end - timedelta(days=days)
+                  kwargs = dict(
+                      timespan=f"{start.isoformat()}/{end.isoformat()}",
+                      interval='P1D',
+                      metricnames=metric_name,
+                      aggregation='Average',
+                  )
+                  if namespace:
+                      kwargs['metricnamespace'] = namespace
+                  result = monitor_client.metrics.list(resource_uri, **kwargs)
+                  values = [
+                      dp.average for m in result.value for ts in m.timeseries
+                      for dp in ts.data if dp.average is not None
+                  ]
+                  return sum(values) / len(values) if values else None
+              except Exception:
+                  return None
+
+          # --- Virtual Machines (deallocated/stopped) ---
+          if 'vm' in resource_types:
+              try:
+                  for vm in compute_client.virtual_machines.list_all():
+                      if vm.location != region:
+                          continue
+                      rg = resource_group_from_id(vm.id)
+                      instance_view = compute_client.virtual_machines.instance_view(rg, vm.name)
+                      power_state = next((s.code for s in instance_view.statuses if s.code.startswith('PowerState/')), '')
+                      if power_state not in ('PowerState/deallocated', 'PowerState/stopped'):
+                          continue
+                      tags = get_tags(vm.tags)
+                      if not should_include(tags):
+                          continue
+                      # time_created is only populated on newer API versions;
+                      # fall back to "unknown age, don't filter by age" if absent
+                      # rather than silently skipping a real finding.
+                      created = getattr(vm, 'time_created', None)
+                      if created:
+                          age_days = (datetime.now(timezone.utc) - created).days
+                          if age_days < min_age:
+                              continue
+                      else:
+                          age_days = 'unknown'
+                      disk_count = 1 + len(vm.storage_profile.data_disks or [])
+                      monthly_cost = disk_count * 0.10 * 10  # rough disk-only estimate, matches AWS script's approach
+                      if monthly_cost >= min_cost:
+                          findings.append({
+                              'region': region, 'service': 'Azure-VM',
+                              'resource_id': vm.name,
+                              'resource_type': f"{power_state.split('/')[-1]}-vm",
+                              'name': tags.get('Name', vm.name),
+                              'reason': f"{power_state.split('/')[-1].capitalize()} VM, {disk_count} disk(s) attached" + (f", age {age_days}d" if age_days != 'unknown' else ""),
+                              'monthly_cost': monthly_cost, 'age_days': age_days,
+                              'environment': tags.get('Environment', 'unknown'),
+                              'protected': 'YES' if is_protected(tags) else 'NO',
+                              'recommended_action': 'DEALLOCATE/DELETE (disks will remain — review separately)',
+                              'risk': 'MEDIUM' if not is_protected(tags) else 'BLOCKED'
+                          })
+                          total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"VM scan error in {region}: {e}", file=sys.stderr)
+
+          # --- Managed Disks (unattached) ---
+          if 'disk' in resource_types:
+              try:
+                  for disk in compute_client.disks.list():
+                      if disk.location != region or disk.disk_state != 'Unattached':
+                          continue
+                      tags = get_tags(disk.tags)
+                      if not should_include(tags):
+                          continue
+                      created = disk.time_created
+                      age_days = (datetime.now(timezone.utc) - created).days if created else 'unknown'
+                      if isinstance(age_days, int) and age_days < min_age:
+                          continue
+                      size_gb = disk.disk_size_gb or 0
+                      sku = (disk.sku.name if disk.sku else 'Standard_LRS')
+                      price_per_gb = {
+                          'Premium_LRS': 0.135, 'StandardSSD_LRS': 0.075,
+                          'Standard_LRS': 0.045, 'UltraSSD_LRS': 0.20,
+                      }.get(sku, 0.075)
+                      monthly_cost = size_gb * price_per_gb
+                      if monthly_cost >= min_cost:
+                          findings.append({
+                              'region': region, 'service': 'Azure-Disk',
+                              'resource_id': disk.name,
+                              'resource_type': 'unattached-disk',
+                              'name': tags.get('Name', disk.name),
+                              'reason': f"Unattached {size_gb}GB {sku}" + (f" for {age_days}d" if age_days != 'unknown' else ""),
+                              'monthly_cost': monthly_cost, 'age_days': age_days,
+                              'environment': tags.get('Environment', 'unknown'),
+                              'protected': 'YES' if is_protected(tags) else 'NO',
+                              'recommended_action': 'DELETE (create snapshot first)',
+                              'risk': 'LOW' if not is_protected(tags) else 'BLOCKED'
+                          })
+                          total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"Disk scan error in {region}: {e}", file=sys.stderr)
+
+          # --- Load Balancers (no backend pool members) ---
+          if 'lb' in resource_types:
+              try:
+                  for lb in network_client.load_balancers.list_all():
+                      if lb.location != region:
+                          continue
+                      backend_count = sum(len(p.load_balancer_backend_addresses or getattr(p, 'backend_ip_configurations', []) or [])
+                                           for p in (lb.backend_address_pools or []))
+                      if backend_count > 0:
+                          continue
+                      tags = get_tags(lb.tags)
+                      if not should_include(tags):
+                          continue
+                      is_basic_sku = lb.sku and lb.sku.name == 'Basic'
+                      monthly_cost = 0 if is_basic_sku else 18.25  # Standard LB has an hourly charge; Basic is free but still worth flagging as clutter
+                      if monthly_cost >= min_cost or is_basic_sku:
+                          findings.append({
+                              'region': region, 'service': 'Azure-LB',
+                              'resource_id': lb.name,
+                              'resource_type': 'idle-load-balancer',
+                              'name': tags.get('Name', lb.name),
+                              'reason': f"{lb.sku.name if lb.sku else 'Unknown'} LB with 0 backend pool members",
+                              'monthly_cost': monthly_cost, 'age_days': 'N/A',
+                              'environment': tags.get('Environment', 'unknown'),
+                              'protected': 'YES' if is_protected(tags) else 'NO',
+                              'recommended_action': 'DELETE',
+                              'risk': 'LOW' if not is_protected(tags) else 'BLOCKED'
+                          })
+                          total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"Load Balancer scan error in {region}: {e}", file=sys.stderr)
+
+          # --- Public IPs (unassociated) ---
+          if 'publicip' in resource_types:
+              try:
+                  for pip in network_client.public_ip_addresses.list_all():
+                      if pip.location != region or pip.ip_configuration is not None:
+                          continue
+                      tags = get_tags(pip.tags)
+                      if not should_include(tags):
+                          continue
+                      is_static = pip.public_ip_allocation_method == 'Static'
+                      monthly_cost = 3.65 if is_static else 0
+                      if monthly_cost >= min_cost:
+                          findings.append({
+                              'region': region, 'service': 'Azure-PublicIP',
+                              'resource_id': pip.name,
+                              'resource_type': 'unassociated-public-ip',
+                              'name': tags.get('Name', pip.ip_address or pip.name),
+                              'reason': f"Unassociated {'static' if is_static else 'dynamic'} public IP ({pip.ip_address or 'unallocated'})",
+                              'monthly_cost': monthly_cost, 'age_days': 'N/A',
+                              'environment': tags.get('Environment', 'unknown'),
+                              'protected': 'YES' if is_protected(tags) else 'NO',
+                              'recommended_action': 'DELETE',
+                              'risk': 'LOW' if not is_protected(tags) else 'BLOCKED'
+                          })
+                          total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"Public IP scan error in {region}: {e}", file=sys.stderr)
+
+          # --- Disk Snapshots (orphaned — source disk deleted) ---
+          if 'snapshot' in resource_types:
+              try:
+                  existing_disk_ids = {d.id for d in compute_client.disks.list()}
+                  for snap in compute_client.snapshots.list():
+                      if snap.location != region:
+                          continue
+                      tags = get_tags(snap.tags)
+                      if not should_include(tags):
+                          continue
+                      created = snap.time_created
+                      age_days = (datetime.now(timezone.utc) - created).days if created else 'unknown'
+                      if isinstance(age_days, int) and age_days < min_age:
+                          continue
+                      source_id = getattr(snap.creation_data, 'source_resource_id', None)
+                      source_exists = source_id in existing_disk_ids if source_id else False
+                      if source_exists and tags.get('Retention') != 'orphaned':
+                          continue
+                      size_gb = snap.disk_size_gb or 0
+                      monthly_cost = size_gb * 0.05
+                      if monthly_cost >= min_cost:
+                          findings.append({
+                              'region': region, 'service': 'Azure-Snapshot',
+                              'resource_id': snap.name,
+                              'resource_type': 'orphaned-snapshot',
+                              'name': tags.get('Name', snap.name),
+                              'reason': f"{size_gb}GB snapshot" + (f", age {age_days}d" if age_days != 'unknown' else "") + f", source disk {'EXISTS' if source_exists else 'DELETED'}",
+                              'monthly_cost': monthly_cost, 'age_days': age_days,
+                              'environment': tags.get('Environment', 'unknown'),
+                              'protected': 'YES' if is_protected(tags) else 'NO',
+                              'recommended_action': 'DELETE' if not source_exists else 'REVIEW',
+                              'risk': 'LOW' if not is_protected(tags) else 'BLOCKED'
+                          })
+                          total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"Snapshot scan error in {region}: {e}", file=sys.stderr)
+
+          # --- Azure SQL Database (idle) ---
+          if 'sqldb' in resource_types and sql_client:
+              try:
+                  for server in sql_client.servers.list():
+                      if server.location != region:
+                          continue
+                      rg = resource_group_from_id(server.id)
+                      for db in sql_client.databases.list_by_server(rg, server.name):
+                          if db.name == 'master':
+                              continue
+                          dtu_avg = get_avg_metric(db.id, 'dtu_consumption_percent', days=14)
+                          conn_avg = get_avg_metric(db.id, 'connection_successful', days=14)
+                          if dtu_avg is not None and dtu_avg < 5 and (conn_avg is None or conn_avg < 1):
+                              tags = get_tags(db.tags)
+                              if not should_include(tags):
+                                  continue
+                              sku_name = db.sku.name if db.sku else 'unknown'
+                              cost_map = {
+                                  'Basic': 5, 'S0': 15, 'S1': 30, 'S2': 75, 'S3': 150,
+                                  'P1': 465, 'P2': 930, 'P4': 1862,
+                              }
+                              monthly_cost = cost_map.get(sku_name, 100)
+                              if monthly_cost >= min_cost:
+                                  findings.append({
+                                      'region': region, 'service': 'Azure-SQLDB',
+                                      'resource_id': f"{server.name}/{db.name}",
+                                      'resource_type': 'idle-database',
+                                      'name': db.name,
+                                      'reason': f"{sku_name}, DTU {dtu_avg:.1f}% avg (14d) [COST ESTIMATE]",
+                                      'monthly_cost': monthly_cost, 'age_days': 'N/A',
+                                      'environment': tags.get('Environment', 'unknown'),
+                                      'protected': 'YES' if is_protected(tags) else 'NO',
+                                      'recommended_action': 'EXPORT_BACPAC_THEN_DELETE',
+                                      'risk': 'HIGH' if not is_protected(tags) else 'BLOCKED'
+                                  })
+                                  total_monthly_savings += monthly_cost
+              except Exception as e:
+                  print(f"Azure SQL scan error in {region}: {e}", file=sys.stderr)
+
+          output_file = f'findings_azure_{region}.json'
+          with open(output_file, 'w') as f:
+              json.dump(findings, f, indent=2, default=str)
+
+          print(f"\n{'='*80}")
+          print(f"AZURE IDLE RESOURCE CLEANUP REPORT - Region: {region}")
+          print(f"{'='*80}")
+          if not findings:
+              print(f"\nNo idle resources found in {region} matching criteria.")
+              print(f"   Filters: env={env_filter}, min_age={min_age}d, min_cost=${min_cost}")
+          else:
+              by_service = defaultdict(list)
+              for f in findings:
+                  by_service[f['service']].append(f)
+              for service, items in sorted(by_service.items()):
+                  print(f"\n{service} - {len(items)} resource(s) to clean up:")
+                  print("-" * 80)
+                  table_data = []
+                  for item in items:
+                      table_data.append([
+                          item['resource_id'], item['resource_type'], str(item['name'])[:20],
+                          f"${item['monthly_cost']:.2f}",
+                          f"{item['age_days']}d" if isinstance(item['age_days'], int) else item['age_days'],
+                          item['protected'], item['recommended_action'][:30], item['risk']
+                      ])
+                  print(tabulate(table_data, headers=['ID', 'Type', 'Name', 'Monthly $', 'Age', 'Protected', 'Action', 'Risk'], tablefmt='grid'))
+                  service_cost = sum(i['monthly_cost'] for i in items)
+                  print(f"   Service savings: ${service_cost:.2f}/month")
+              print(f"\nTOTAL POTENTIAL SAVINGS: ${total_monthly_savings:.2f}/month")
+          print(f"\n{'='*80}\n")
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as gh_out:
+              gh_out.write(f"findings_count_{region}={len(findings)}\n")
+              gh_out.write(f"savings_{region}={total_monthly_savings:.2f}\n")
+          PYEOF
+
+      - name: Upload Findings
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: idle-resources-azure-${{ matrix.region }}
+          path: findings_azure_*.json
+
+  consolidate-report:
+    needs: [scan-idle-resources, scan-idle-resources-azure]
+    if: always() && (needs.scan-idle-resources.result == 'success' || needs.scan-idle-resources.result == 'skipped') && (needs.scan-idle-resources-azure.result == 'success' || needs.scan-idle-resources-azure.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@65a9edc5881444af0b9093a5e228f63cb0f8e1e2
+        with:
+          path: artifacts
+          pattern: idle-resources-*
+
+      - name: Consolidate & Report
+        run: |
+          set -euo pipefail
+          python << 'PYEOF'
+          import json
+          import glob
+          import os
+          from datetime import datetime
+          from tabulate import tabulate
+          from collections import defaultdict
+
+          all_findings = []
+          for file in glob.glob('artifacts/**/findings_*.json', recursive=True):
+              with open(file) as f:
+                  findings = json.load(f)
+                  all_findings.extend(findings)
+
+          if not all_findings:
+              print("\nNo idle resources found across all regions!")
+              with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/null'), 'a') as summary:
+                  summary.write("## :white_check_mark: Idle Resource Cleanup Report\n\n")
+                  summary.write("No idle resources found across all regions.\n")
+              exit(0)
+
+          print(f"\n{'='*90}")
+          print(f"GLOBAL IDLE RESOURCE CLEANUP REPORT")
+          print(f"{'='*90}")
+          print(f"Total resources flagged: {len(all_findings)}")
+
+          by_region = defaultdict(list)
+          for f in all_findings:
+              by_region[f['region']].append(f)
+          region_summary = []
+          for region, items in sorted(by_region.items()):
+              deletable = [i for i in items if i['protected'] == 'NO']
+              region_summary.append([region, len(items), len(deletable), f"${sum(i['monthly_cost'] for i in deletable):.2f}"])
+          print("\nBy Region:")
+          print(tabulate(region_summary, headers=['Region', 'Total', 'Deletable', 'Savings'], tablefmt='grid'))
+
+          by_service = defaultdict(list)
+          for f in all_findings:
+              by_service[f['service']].append(f)
+          service_summary = []
+          for service, items in sorted(by_service.items()):
+              deletable = [i for i in items if i['protected'] == 'NO']
+              service_summary.append([service, len(items), len(deletable), f"${sum(i['monthly_cost'] for i in deletable):.2f}"])
+          print("\nBy Service:")
+          print(tabulate(service_summary, headers=['Service', 'Total', 'Deletable', 'Savings'], tablefmt='grid'))
+
+          print("\nTop 20 Resources by Monthly Cost:")
+          top20 = sorted([f for f in all_findings if f['protected'] == 'NO'], key=lambda x: x['monthly_cost'], reverse=True)[:20]
+          top_data = [[i+1, f['resource_id'], f['service'], f['resource_type'], f"${f['monthly_cost']:.2f}", f['recommended_action'][:40]] for i, f in enumerate(top20)]
+          print(tabulate(top_data, headers=['#', 'ID', 'Service', 'Type', 'Monthly $', 'Action'], tablefmt='grid'))
+
+          total_all = sum(f['monthly_cost'] for f in all_findings)
+          total_deletable = sum(f['monthly_cost'] for f in all_findings if f['protected'] == 'NO')
+          print(f"\n{'='*90}")
+          print(f"TOTAL POTENTIAL MONTHLY SAVINGS: ${total_all:.2f}")
+          print(f"SAFE TO DELETE (unprotected):    ${total_deletable:.2f}")
+          print(f"REQUIRES MANUAL REVIEW:         ${total_all - total_deletable:.2f}")
+          print(f"{'='*90}\n")
+
+          # Write GitHub Step Summary for Actions UI
+          with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/null'), 'a') as summary:
+              summary.write("## :wastebasket: Idle Resource Cleanup Report\n\n")
+              summary.write(f"**Total resources flagged:** {len(all_findings)}\n\n")
+              summary.write("| Region | Total | Deletable | Savings |\n")
+              summary.write("|--------|-------|-----------|---------|\n")
+              for region, items in sorted(by_region.items()):
+                  deletable = [i for i in items if i['protected'] == 'NO']
+                  summary.write(f"| {region} | {len(items)} | {len(deletable)} | ${sum(i['monthly_cost'] for i in deletable):.2f} |\n")
+              summary.write("\n")
+              summary.write("| Service | Total | Deletable | Savings |\n")
+              summary.write("|---------|-------|-----------|---------|\n")
+              for service, items in sorted(by_service.items()):
+                  deletable = [i for i in items if i['protected'] == 'NO']
+                  summary.write(f"| {service} | {len(items)} | {len(deletable)} | ${sum(i['monthly_cost'] for i in deletable):.2f} |\n")
+              summary.write("\n")
+              summary.write(f"**Total potential monthly savings:** ${total_all:.2f}\n")
+              summary.write(f"**Safe to delete (unprotected):** ${total_deletable:.2f}\n")
+              summary.write(f"**Requires manual review:** ${total_all - total_deletable:.2f}\n")
+
+          with open('consolidated_cleanup_report.json', 'w') as f:
+              json.dump({
+                  'scan_date': datetime.utcnow().isoformat(),
+                  'total_resources': len(all_findings),
+                  'total_monthly_savings': total_all,
+                  'deletable_savings': total_deletable,
+                  'findings': all_findings
+              }, f, indent=2, default=str)
+          PYEOF
+
+      - name: Upload Consolidated Report
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: consolidated-cleanup-report
+          path: consolidated_cleanup_report.json

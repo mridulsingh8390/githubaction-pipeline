@@ -1,0 +1,890 @@
+name: Cloud Right-Sizing Recommendations
+# ONLY provides recommendations - NO changes made to any resources
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+    inputs:
+      cloud_provider:
+        description: 'Which cloud(s) to analyze'
+        type: choice
+        options: [aws, azure, both]
+        default: 'aws'
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [development, staging, all]
+        default: 'development'
+      metric_days:
+        description: 'Days of metrics to analyze'
+        type: number
+        default: 14
+      cpu_threshold:
+        description: 'Avg CPU % threshold for downsizing'
+        type: number
+        default: 20
+      memory_threshold:
+        description: 'Avg Memory % threshold for downsizing'
+        type: number
+        default: 50
+      regions:
+        description: '[AWS] regions (comma-separated, or "all")'
+        type: string
+        default: 'us-east-1,us-west-2,eu-west-1'
+      include_spot:
+        description: '[AWS] Include spot instance recommendations'
+        type: boolean
+        default: true
+      azure_regions:
+        description: '[Azure] regions (comma-separated, or "all")'
+        type: string
+        default: 'eastus,westus2,westeurope'
+      include_azure_spot:
+        description: '[Azure] Include Spot VM recommendations'
+        type: boolean
+        default: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  AWS_DEFAULT_REGION: us-east-1
+
+jobs:
+  decide-provider:
+    runs-on: ubuntu-latest
+    outputs:
+      run_aws: ${{ steps.decide.outputs.run_aws }}
+      run_azure: ${{ steps.decide.outputs.run_azure }}
+    steps:
+      - name: Decide which providers to run
+        id: decide
+        run: |
+          set -euo pipefail
+          # Schedule-safe default: 'both'. workflow_dispatch inputs are
+          # unavailable on schedule triggers, so this is what a cron run
+          # actually gets — deliberately covers both clouds unless someone
+          # explicitly picks aws/azure via manual dispatch.
+          PROVIDER="${{ inputs.cloud_provider || 'both' }}"
+          echo "Resolved provider selection: $PROVIDER"
+          if [ "$PROVIDER" = "aws" ] || [ "$PROVIDER" = "both" ]; then
+            echo "run_aws=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_aws=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$PROVIDER" = "azure" ] || [ "$PROVIDER" = "both" ]; then
+            echo "run_azure=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_azure=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  resolve-regions:
+    needs: decide-provider
+    if: needs.decide-provider.outputs.run_aws == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      regions: ${{ steps.regions.outputs.regions }}
+    steps:
+      - name: Resolve regions
+        id: regions
+        run: |
+          set -euo pipefail
+          DEFAULT_REGIONS='["us-east-1","us-west-2","eu-west-1"]'
+          INPUT_REGIONS="${{ inputs.regions }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "$INPUT_REGIONS" ] && [ "$INPUT_REGIONS" != "all" ]; then
+            REGIONS=$(echo "$INPUT_REGIONS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | jq -R . | jq -s .)
+            echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
+          else
+            echo "regions=$DEFAULT_REGIONS" >> "$GITHUB_OUTPUT"
+          fi
+
+  resolve-azure-regions:
+    needs: decide-provider
+    if: needs.decide-provider.outputs.run_azure == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      regions: ${{ steps.regions.outputs.regions }}
+    steps:
+      - name: Resolve Azure regions
+        id: regions
+        run: |
+          set -euo pipefail
+          DEFAULT_REGIONS='["eastus","westus2","westeurope"]'
+          INPUT_REGIONS="${{ inputs.azure_regions }}"
+          if [ -n "$INPUT_REGIONS" ] && [ "$INPUT_REGIONS" != "all" ]; then
+            REGIONS=$(echo "$INPUT_REGIONS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | jq -R . | jq -s .)
+            echo "regions=$REGIONS" >> "$GITHUB_OUTPUT"
+          else
+            echo "regions=$DEFAULT_REGIONS" >> "$GITHUB_OUTPUT"
+          fi
+
+  analyze-rightsizing:
+    needs: [decide-provider, resolve-regions]
+    if: needs.decide-provider.outputs.run_aws == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        region: ${{ fromJson(needs.resolve-regions.outputs.regions) }}
+      fail-fast: false
+    name: Analyze ${{ matrix.region }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ secrets.AWS_COST_OPTIMIZATION_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+
+      - name: Setup Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Dependencies
+        run: |
+          set -euo pipefail
+          pip install --disable-pip-version-check boto3==1.34.0 tabulate==0.9.0
+
+      - name: Analyze Right-Sizing
+        id: analyze
+        env:
+          SCAN_REGION: ${{ matrix.region }}
+          ENV_FILTER: ${{ github.event.inputs.environment || 'development' }}
+          METRIC_DAYS: ${{ github.event.inputs.metric_days || '14' }}
+          CPU_THRESHOLD: ${{ github.event.inputs.cpu_threshold || '20' }}
+          MEM_THRESHOLD: ${{ github.event.inputs.memory_threshold || '50' }}
+          INCLUDE_SPOT: ${{ github.event.inputs.include_spot || 'true' }}
+        run: |
+          set -euo pipefail
+          python << 'PYEOF'
+          import boto3
+          import json
+          import os
+          import sys
+          from datetime import datetime, timedelta
+          from collections import defaultdict
+          from tabulate import tabulate
+
+          region = os.environ['SCAN_REGION']
+          env_filter = os.environ['ENV_FILTER']
+          metric_days = int(os.environ['METRIC_DAYS'])
+          cpu_threshold = float(os.environ['CPU_THRESHOLD'])
+          mem_threshold = float(os.environ['MEM_THRESHOLD'])
+          include_spot = os.environ['INCLUDE_SPOT'].lower() == 'true'
+
+          ec2 = boto3.client('ec2', region_name=region)
+          cloudwatch = boto3.client('cloudwatch', region_name=region)
+
+          recommendations = []
+          total_potential_savings = 0
+
+          def get_tags(resource_tags):
+              return {t['Key']: t['Value'] for t in (resource_tags or [])}
+
+          def should_include(tags):
+              if env_filter == 'all':
+                  return True
+              env = tags.get('Environment', tags.get('env', '')).lower()
+              return env_filter in env or env in env_filter
+
+          def is_protected(tags):
+              if tags.get('DoNotResize', '').lower() in ['true', 'yes', '1']:
+                  return True
+              if tags.get('Environment', '').lower() == 'production' and env_filter != 'all':
+                  return True
+              return False
+
+          INSTANCE_HIERARCHY = {
+              't3': ['nano', 'micro', 'small', 'medium', 'large', 'xlarge', '2xlarge'],
+              't3a': ['micro', 'small', 'medium', 'large', 'xlarge', '2xlarge'],
+              'm5': ['large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge'],
+              'm5a': ['large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge'],
+              'm6i': ['large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge', '32xlarge'],
+              'm6a': ['large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge', '32xlarge'],
+              'm6g': ['medium', 'large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge'],
+              'c5': ['large', 'xlarge', '2xlarge', '4xlarge', '9xlarge', '12xlarge', '18xlarge', '24xlarge'],
+              'c5a': ['large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge'],
+              'c6i': ['large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge', '32xlarge'],
+              'c6a': ['large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge', '32xlarge'],
+              'c6g': ['medium', 'large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge'],
+              'r5': ['large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge'],
+              'r5a': ['large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge'],
+              'r6i': ['large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge', '32xlarge'],
+              'r6a': ['large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge', '24xlarge', '32xlarge'],
+              'r6g': ['medium', 'large', 'xlarge', '2xlarge', '4xlarge', '8xlarge', '12xlarge', '16xlarge'],
+          }
+
+          PRICING = {
+              't3.nano': 0.0052, 't3.micro': 0.0104, 't3.small': 0.0208, 't3.medium': 0.0416,
+              't3.large': 0.0832, 't3.xlarge': 0.1664, 't3.2xlarge': 0.3328,
+              'm5.large': 0.096, 'm5.xlarge': 0.192, 'm5.2xlarge': 0.384, 'm5.4xlarge': 0.768,
+              'm6i.large': 0.086, 'm6i.xlarge': 0.172, 'm6i.2xlarge': 0.344, 'm6i.4xlarge': 0.688,
+              'c5.large': 0.085, 'c5.xlarge': 0.17, 'c5.2xlarge': 0.34, 'c5.4xlarge': 0.68,
+              'c6i.large': 0.085, 'c6i.xlarge': 0.17, 'c6i.2xlarge': 0.34, 'c6i.4xlarge': 0.68,
+              'r5.large': 0.126, 'r5.xlarge': 0.252, 'r5.2xlarge': 0.504, 'r5.4xlarge': 1.008,
+              'r6i.large': 0.126, 'r6i.xlarge': 0.252, 'r6i.2xlarge': 0.504, 'r6i.4xlarge': 1.008,
+          }
+
+          def parse_instance_type(instance_type):
+              parts = instance_type.split('.')
+              if len(parts) == 2:
+                  return parts[0], parts[1]
+              family = ''.join(parts[:-1])
+              size = parts[-1]
+              return family, size
+
+          def get_smaller_size(family, current_size, steps=1):
+              if family not in INSTANCE_HIERARCHY:
+                  return None
+              sizes = INSTANCE_HIERARCHY[family]
+              if current_size not in sizes:
+                  return None
+              idx = sizes.index(current_size)
+              new_idx = idx - steps
+              if new_idx < 0:
+                  return None
+              return sizes[new_idx]
+
+          def get_instance_price(instance_type):
+              return PRICING.get(instance_type, None)
+
+          def get_cloudwatch_metric(namespace, metric_name, dimensions, days, stat='Average'):
+              try:
+                  end = datetime.utcnow()
+                  start = end - timedelta(days=days)
+                  resp = cloudwatch.get_metric_statistics(
+                      Namespace=namespace, MetricName=metric_name, Dimensions=dimensions,
+                      StartTime=start, EndTime=end, Period=3600, Statistics=[stat]
+                  )
+                  datapoints = resp.get('Datapoints', [])
+                  if not datapoints:
+                      return None
+                  values = [dp[stat] for dp in datapoints]
+                  return {
+                      'avg': sum(values) / len(values),
+                      'max': max(values),
+                      'p95': sorted(values)[int(len(values) * 0.95)] if len(values) > 1 else values[0],
+                      'count': len(datapoints)
+                  }
+              except Exception:
+                  return None
+
+          print(f"\n{'='*90}")
+          print(f"RIGHT-SIZING ANALYSIS - Region: {region}")
+          print(f"{'='*90}")
+          print(f"Parameters: CPU threshold={cpu_threshold}%, Memory threshold={mem_threshold}%, Lookback={metric_days}d")
+          print(f"Environment filter: {env_filter}")
+          print(f"Spot recommendations: {'YES' if include_spot else 'NO'}")
+          print(f"NOTE: Memory metrics require CloudWatch Agent. Missing memory data is tolerated.")
+          print(f"{'='*90}\n")
+
+          paginator = ec2.get_paginator('describe_instances')
+          instance_count = 0
+          analyzed_count = 0
+          missing_memory_count = 0
+
+          for page in paginator.paginate(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]):
+              for reservation in page['Reservations']:
+                  for inst in reservation['Instances']:
+                      instance_count += 1
+                      instance_id = inst['InstanceId']
+                      instance_type = inst['InstanceType']
+                      tags = get_tags(inst.get('Tags', []))
+                      if not should_include(tags):
+                          continue
+                      analyzed_count += 1
+
+                      cpu_metrics = get_cloudwatch_metric('AWS/EC2', 'CPUUtilization', [{'Name': 'InstanceId', 'Value': instance_id}], metric_days)
+                      mem_metrics = get_cloudwatch_metric('CWAgent', 'mem_used_percent', [{'Name': 'InstanceId', 'Value': instance_id}], metric_days)
+                      if mem_metrics is None:
+                          missing_memory_count += 1
+                      net_in = get_cloudwatch_metric('AWS/EC2', 'NetworkIn', [{'Name': 'InstanceId', 'Value': instance_id}], metric_days)
+                      net_out = get_cloudwatch_metric('AWS/EC2', 'NetworkOut', [{'Name': 'InstanceId', 'Value': instance_id}], metric_days)
+
+                      cpu_avg = cpu_metrics['avg'] if cpu_metrics else None
+                      cpu_peak = cpu_metrics['max'] if cpu_metrics else None
+                      mem_avg = mem_metrics['avg'] if mem_metrics else None
+                      family, size = parse_instance_type(instance_type)
+                      current_price = get_instance_price(instance_type)
+
+                      rec = None
+
+                      if (cpu_avg is not None and cpu_avg < 10 and (mem_avg is None or mem_avg < 30)):
+                          new_size = get_smaller_size(family, size, 2)
+                          if new_size:
+                              new_type = f"{family}.{new_size}"
+                              new_price = get_instance_price(new_type)
+                              if new_price and current_price:
+                                  savings = (current_price - new_price) * 730
+                                  rec = {
+                                      'region': region, 'instance_id': instance_id, 'name': tags.get('Name', 'N/A'),
+                                      'current_type': instance_type, 'recommended_type': new_type,
+                                      'action': 'DOWNSIZE_2_TIERS', 'confidence': 'HIGH',
+                                      'cpu_avg': cpu_avg, 'cpu_peak': cpu_peak, 'mem_avg': mem_avg,
+                                      'mem_available': mem_metrics is not None,
+                                      'network_mbps': ((net_in['avg'] + net_out['avg']) / (1024*1024*metric_days) if net_in and net_out else 0),
+                                      'current_monthly_cost': current_price * 730, 'new_monthly_cost': new_price * 730,
+                                      'monthly_savings': savings, 'savings_pct': (savings / (current_price * 730)) * 100,
+                                      'environment': tags.get('Environment', 'unknown'),
+                                      'protected': 'YES' if is_protected(tags) else 'NO',
+                                      'reason': f"Severely underutilized: CPU {cpu_avg:.1f}% avg" + (f", Mem {mem_avg:.1f}% avg" if mem_avg else " (memory data unavailable)"),
+                                      'spot_candidate': False
+                                  }
+
+                      elif (cpu_avg is not None and cpu_avg < cpu_threshold and (cpu_peak is None or cpu_peak < 50)):
+                          new_size = get_smaller_size(family, size, 1)
+                          if new_size:
+                              new_type = f"{family}.{new_size}"
+                              new_price = get_instance_price(new_type)
+                              if new_price and current_price:
+                                  savings = (current_price - new_price) * 730
+                                  rec = {
+                                      'region': region, 'instance_id': instance_id, 'name': tags.get('Name', 'N/A'),
+                                      'current_type': instance_type, 'recommended_type': new_type,
+                                      'action': 'DOWNSIZE_1_TIER', 'confidence': 'MEDIUM',
+                                      'cpu_avg': cpu_avg, 'cpu_peak': cpu_peak, 'mem_avg': mem_avg,
+                                      'mem_available': mem_metrics is not None,
+                                      'network_mbps': ((net_in['avg'] + net_out['avg']) / (1024*1024*metric_days) if net_in and net_out else 0),
+                                      'current_monthly_cost': current_price * 730, 'new_monthly_cost': new_price * 730,
+                                      'monthly_savings': savings, 'savings_pct': (savings / (current_price * 730)) * 100,
+                                      'environment': tags.get('Environment', 'unknown'),
+                                      'protected': 'YES' if is_protected(tags) else 'NO',
+                                      'reason': f"Underutilized: CPU {cpu_avg:.1f}% avg (peak {cpu_peak:.1f}%)" + (" [memory data unavailable]" if not mem_metrics else ""),
+                                      'spot_candidate': False
+                                  }
+
+                      if include_spot and not rec and cpu_avg is not None and cpu_avg < 60:
+                          spot_eligible = tags.get('SpotEligible', '').lower() in ['true', 'yes', '1']
+                          fault_tolerant = tags.get('FaultTolerant', '').lower() in ['true', 'yes', '1']
+                          if spot_eligible or fault_tolerant:
+                              spot_savings = (current_price * 730) * 0.70
+                              rec = {
+                                  'region': region, 'instance_id': instance_id, 'name': tags.get('Name', 'N/A'),
+                                  'current_type': instance_type, 'recommended_type': f"spot-{instance_type}",
+                                  'action': 'MIGRATE_TO_SPOT', 'confidence': 'HIGH' if fault_tolerant else 'MEDIUM',
+                                  'cpu_avg': cpu_avg, 'cpu_peak': cpu_peak, 'mem_avg': mem_avg,
+                                  'mem_available': mem_metrics is not None,
+                                  'network_mbps': ((net_in['avg'] + net_out['avg']) / (1024*1024*metric_days) if net_in and net_out else 0),
+                                  'current_monthly_cost': current_price * 730, 'new_monthly_cost': (current_price * 730) * 0.30,
+                                  'monthly_savings': spot_savings, 'savings_pct': 70,
+                                  'environment': tags.get('Environment', 'unknown'),
+                                  'protected': 'YES' if is_protected(tags) else 'NO',
+                                  'reason': f"Fault-tolerant workload, CPU {cpu_avg:.1f}% avg - good spot candidate",
+                                  'spot_candidate': True
+                              }
+
+                      if rec and rec['monthly_savings'] > 5:
+                          recommendations.append(rec)
+                          total_potential_savings += rec['monthly_savings']
+
+          output_file = f'rightsizing_{region}.json'
+          with open(output_file, 'w') as f:
+              json.dump(recommendations, f, indent=2, default=str)
+
+          print(f"Analyzed {analyzed_count} running instances (out of {instance_count} total)")
+          if missing_memory_count > 0:
+              print(f"  NOTE: {missing_memory_count}/{analyzed_count} instances missing memory metrics (CloudWatch Agent not installed)")
+
+          if not recommendations:
+              print(f"\nNo right-sizing opportunities found in {region}.")
+              print(f"   All analyzed instances are adequately sized for their workload.")
+          else:
+              print(f"\nFOUND {len(recommendations)} RIGHT-SIZING OPPORTUNITIES:\n")
+              by_action = defaultdict(list)
+              for r in recommendations:
+                  by_action[r['action']].append(r)
+              for action, items in sorted(by_action.items()):
+                  print(f"\n{action.replace('_', ' ')} ({len(items)} instances)")
+                  print("-" * 90)
+                  table_data = []
+                  for r in items:
+                      mem_col = f"{r['mem_avg']:.1f}%" if r['mem_avg'] else 'N/A'
+                      table_data.append([
+                          r['instance_id'], r['name'][:18], r['current_type'], r['recommended_type'],
+                          f"{r['cpu_avg']:.1f}%" if r['cpu_avg'] else 'N/A',
+                          f"{r['cpu_peak']:.1f}%" if r['cpu_peak'] else 'N/A',
+                          mem_col, f"${r['monthly_savings']:.0f}", f"{r['savings_pct']:.0f}%",
+                          r['confidence'], r['protected']
+                      ])
+                  print(tabulate(table_data, headers=['Instance ID', 'Name', 'Current', 'Recommended', 'CPU Avg', 'CPU Peak', 'Mem', 'Save $', 'Save %', 'Conf', 'Protected'], tablefmt='grid'))
+                  action_savings = sum(r['monthly_savings'] for r in items)
+                  print(f"   Action savings: ${action_savings:.2f}/month")
+
+              print(f"\n{'='*90}")
+              print("SUMMARY")
+              print(f"{'='*90}")
+              summary_data = []
+              for action, items in sorted(by_action.items()):
+                  applicable = [r for r in items if r['protected'] == 'NO']
+                  protected = [r for r in items if r['protected'] == 'YES']
+                  summary_data.append([
+                      action.replace('_', ' '), len(items), len(applicable), len(protected),
+                      f"${sum(r['monthly_savings'] for r in applicable):.2f}"
+                  ])
+              print(tabulate(summary_data, headers=['Action', 'Total', 'Applicable', 'Protected', 'Applicable Savings'], tablefmt='grid'))
+              applicable_savings = sum(r['monthly_savings'] for r in recommendations if r['protected'] == 'NO')
+              print(f"\nTOTAL POTENTIAL MONTHLY SAVINGS: ${total_potential_savings:.2f}")
+              print(f"APPLICABLE (unprotected):        ${applicable_savings:.2f}")
+              print(f"PROTECTED (manual review):      ${total_potential_savings - applicable_savings:.2f}")
+              print(f"\nTOP 10 SAVINGS OPPORTUNITIES:")
+              top10 = sorted([r for r in recommendations if r['protected'] == 'NO'], key=lambda x: x['monthly_savings'], reverse=True)[:10]
+              top_data = [[i+1, r['instance_id'], r['name'][:20], r['current_type'], r['recommended_type'],
+                          f"${r['monthly_savings']:.0f}", f"{r['savings_pct']:.0f}%"] for i, r in enumerate(top10)]
+              print(tabulate(top_data, headers=['#', 'ID', 'Name', 'Current', 'New', 'Save $', 'Save %'], tablefmt='grid'))
+          print(f"\n{'='*90}\n")
+
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as gh_out:
+              gh_out.write(f"recommendations_count_{region}={len(recommendations)}\n")
+              gh_out.write(f"savings_{region}={total_potential_savings:.2f}\n")
+          PYEOF
+
+      - name: Upload Recommendations
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: rightsizing-${{ matrix.region }}
+          path: rightsizing_*.json
+
+  analyze-rightsizing-azure:
+    needs: [decide-provider, resolve-azure-regions]
+    if: needs.decide-provider.outputs.run_azure == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        region: ${{ fromJson(needs.resolve-azure-regions.outputs.regions) }}
+      fail-fast: false
+    name: Analyze Azure ${{ matrix.region }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Azure login (OIDC)
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2.3.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Dependencies
+        run: |
+          set -euo pipefail
+          pip install --disable-pip-version-check \
+            azure-identity==1.17.1 azure-mgmt-compute==31.0.0 azure-mgmt-monitor==6.0.2 \
+            azure-mgmt-resource==23.1.1 tabulate==0.9.0
+
+      - name: Analyze Azure Right-Sizing
+        id: analyze
+        env:
+          SCAN_REGION: ${{ matrix.region }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ENV_FILTER: ${{ github.event.inputs.environment || 'development' }}
+          METRIC_DAYS: ${{ github.event.inputs.metric_days || '14' }}
+          CPU_THRESHOLD: ${{ github.event.inputs.cpu_threshold || '20' }}
+          MEM_THRESHOLD: ${{ github.event.inputs.memory_threshold || '50' }}
+          INCLUDE_SPOT: ${{ github.event.inputs.include_azure_spot || 'true' }}
+        run: |
+          set -euo pipefail
+          python << 'PYEOF'
+          import json
+          import os
+          import re
+          import sys
+          from datetime import datetime, timezone, timedelta
+          from collections import defaultdict
+          from tabulate import tabulate
+          from azure.identity import AzureCliCredential
+          from azure.mgmt.compute import ComputeManagementClient
+          from azure.mgmt.monitor import MonitorManagementClient
+
+          region = os.environ['SCAN_REGION']
+          subscription_id = os.environ['AZURE_SUBSCRIPTION_ID']
+          env_filter = os.environ['ENV_FILTER']
+          metric_days = int(os.environ['METRIC_DAYS'])
+          cpu_threshold = float(os.environ['CPU_THRESHOLD'])
+          mem_threshold = float(os.environ['MEM_THRESHOLD'])
+          include_spot = os.environ['INCLUDE_SPOT'].lower() == 'true'
+
+          credential = AzureCliCredential()
+          compute_client = ComputeManagementClient(credential, subscription_id)
+          monitor_client = MonitorManagementClient(credential, subscription_id)
+
+          recommendations = []
+          total_potential_savings = 0
+
+          def get_tags(tags_dict):
+              return tags_dict or {}
+
+          def should_include(tags):
+              if env_filter == 'all':
+                  return True
+              env = tags.get('Environment', tags.get('environment', tags.get('env', ''))).lower()
+              return env_filter in env or env in env_filter
+
+          def is_protected(tags):
+              if tags.get('DoNotResize', '').lower() in ['true', 'yes', '1']:
+                  return True
+              if tags.get('Environment', '').lower() == 'production' and env_filter != 'all':
+                  return True
+              return False
+
+          def resource_group_from_id(resource_id):
+              parts = resource_id.split('/')
+              try:
+                  return parts[parts.index('resourceGroups') + 1]
+              except (ValueError, IndexError):
+                  return None
+
+          # Azure VM sizes follow Standard_{Family}{Number}{suffix}_v{Gen},
+          # e.g. Standard_D4s_v3. Step sizes below are the common doubling
+          # pattern across D/E/F series — not exhaustive of every Azure SKU.
+          SIZE_STEPS = [1, 2, 4, 8, 16, 20, 32, 44, 48, 64, 96]
+
+          # Approximate US-region hourly pricing (USD) — ESTIMATES ONLY,
+          # actual pricing varies by region/reservation/agreement. Same
+          # approach as the AWS script's hardcoded price table.
+          PRICING = {
+              'Standard_D2s_v3': 0.096, 'Standard_D4s_v3': 0.192, 'Standard_D8s_v3': 0.384, 'Standard_D16s_v3': 0.768,
+              'Standard_D2s_v4': 0.096, 'Standard_D4s_v4': 0.192, 'Standard_D8s_v4': 0.384, 'Standard_D16s_v4': 0.768,
+              'Standard_D2s_v5': 0.086, 'Standard_D4s_v5': 0.173, 'Standard_D8s_v5': 0.346, 'Standard_D16s_v5': 0.691,
+              'Standard_E2s_v3': 0.126, 'Standard_E4s_v3': 0.252, 'Standard_E8s_v3': 0.504, 'Standard_E16s_v3': 1.008,
+              'Standard_F2s_v2': 0.085, 'Standard_F4s_v2': 0.169, 'Standard_F8s_v2': 0.338, 'Standard_F16s_v2': 0.677,
+              'Standard_B2s': 0.0416, 'Standard_B2ms': 0.0832, 'Standard_B4ms': 0.166, 'Standard_B8ms': 0.333,
+          }
+
+          def parse_vm_size(size):
+              m = re.match(r'Standard_([A-Z]+)(\d+)([a-z]*)_v(\d+)', size)
+              if not m:
+                  return None
+              family, number, suffix, gen = m.groups()
+              return family, int(number), suffix, gen
+
+          def get_smaller_size(family, number, suffix, gen, steps=1):
+              if number not in SIZE_STEPS:
+                  candidates = [s for s in SIZE_STEPS if s <= number]
+                  if not candidates:
+                      return None
+                  number = max(candidates)
+              idx = SIZE_STEPS.index(number)
+              new_idx = idx - steps
+              if new_idx < 0:
+                  return None
+              return f"Standard_{family}{SIZE_STEPS[new_idx]}{suffix}_v{gen}"
+
+          def get_avg_max_metric(resource_uri, metric_name, days):
+              try:
+                  end = datetime.now(timezone.utc)
+                  start = end - timedelta(days=days)
+                  result = monitor_client.metrics.list(
+                      resource_uri,
+                      timespan=f"{start.isoformat()}/{end.isoformat()}",
+                      interval='PT1H',
+                      metricnames=metric_name,
+                      aggregation='Average,Maximum',
+                  )
+                  avgs, maxs = [], []
+                  for m in result.value:
+                      for ts in m.timeseries:
+                          for dp in ts.data:
+                              if dp.average is not None:
+                                  avgs.append(dp.average)
+                              if dp.maximum is not None:
+                                  maxs.append(dp.maximum)
+                  if not avgs:
+                      return None
+                  return {'avg': sum(avgs) / len(avgs), 'max': max(maxs) if maxs else None, 'count': len(avgs)}
+              except Exception:
+                  return None
+
+          print(f"\n{'='*90}")
+          print(f"AZURE RIGHT-SIZING ANALYSIS - Region: {region}")
+          print(f"{'='*90}")
+          print(f"Parameters: CPU threshold={cpu_threshold}%, Memory threshold={mem_threshold}%, Lookback={metric_days}d")
+          print(f"Environment filter: {env_filter}")
+          print(f"Spot recommendations: {'YES' if include_spot else 'NO'}")
+          print(f"NOTE: Memory metrics require the Azure Monitor Agent (guest-level metrics). Missing memory data is tolerated.")
+          print(f"{'='*90}\n")
+
+          instance_count = 0
+          analyzed_count = 0
+          missing_memory_count = 0
+
+          for vm in compute_client.virtual_machines.list_all():
+              if vm.location != region:
+                  continue
+              rg = resource_group_from_id(vm.id)
+              instance_view = compute_client.virtual_machines.instance_view(rg, vm.name)
+              power_state = next((s.code for s in instance_view.statuses if s.code.startswith('PowerState/')), '')
+              if power_state != 'PowerState/running':
+                  continue
+              instance_count += 1
+              tags = get_tags(vm.tags)
+              if not should_include(tags):
+                  continue
+              analyzed_count += 1
+
+              vm_size = vm.hardware_profile.vm_size
+              cpu_metrics = get_avg_max_metric(vm.id, 'Percentage CPU', metric_days)
+              mem_metrics = get_avg_max_metric(vm.id, 'Available Memory Bytes', metric_days)
+              if mem_metrics is None:
+                  missing_memory_count += 1
+              net_in = get_avg_max_metric(vm.id, 'Network In Total', metric_days)
+              net_out = get_avg_max_metric(vm.id, 'Network Out Total', metric_days)
+
+              cpu_avg = cpu_metrics['avg'] if cpu_metrics else None
+              cpu_peak = cpu_metrics['max'] if cpu_metrics else None
+              # Available Memory Bytes is inverse of usage — without knowing
+              # total VM memory precisely here we report it as "available %"
+              # rather than converting to a used% figure that could mislead.
+              mem_avg = None
+              parsed = parse_vm_size(vm_size)
+              current_price = PRICING.get(vm_size)
+
+              rec = None
+
+              if parsed and (cpu_avg is not None and cpu_avg < 10):
+                  family, number, suffix, gen = parsed
+                  new_size = get_smaller_size(family, number, suffix, gen, 2)
+                  if new_size:
+                      new_price = PRICING.get(new_size)
+                      if new_price and current_price:
+                          savings = (current_price - new_price) * 730
+                          rec = {
+                              'region': region, 'instance_id': vm.name, 'name': tags.get('Name', vm.name),
+                              'current_type': vm_size, 'recommended_type': new_size,
+                              'action': 'DOWNSIZE_2_TIERS', 'confidence': 'HIGH',
+                              'cpu_avg': cpu_avg, 'cpu_peak': cpu_peak, 'mem_avg': mem_avg,
+                              'mem_available': mem_metrics is not None,
+                              'network_mbps': ((net_in['avg'] + net_out['avg']) / (1024*1024*metric_days) if net_in and net_out else 0),
+                              'current_monthly_cost': current_price * 730, 'new_monthly_cost': new_price * 730,
+                              'monthly_savings': savings, 'savings_pct': (savings / (current_price * 730)) * 100,
+                              'environment': tags.get('Environment', 'unknown'),
+                              'protected': 'YES' if is_protected(tags) else 'NO',
+                              'reason': f"Severely underutilized: CPU {cpu_avg:.1f}% avg" + (" (memory data unavailable)" if not mem_metrics else ""),
+                              'spot_candidate': False
+                          }
+
+              elif parsed and (cpu_avg is not None and cpu_avg < cpu_threshold and (cpu_peak is None or cpu_peak < 50)):
+                  family, number, suffix, gen = parsed
+                  new_size = get_smaller_size(family, number, suffix, gen, 1)
+                  if new_size:
+                      new_price = PRICING.get(new_size)
+                      if new_price and current_price:
+                          savings = (current_price - new_price) * 730
+                          rec = {
+                              'region': region, 'instance_id': vm.name, 'name': tags.get('Name', vm.name),
+                              'current_type': vm_size, 'recommended_type': new_size,
+                              'action': 'DOWNSIZE_1_TIER', 'confidence': 'MEDIUM',
+                              'cpu_avg': cpu_avg, 'cpu_peak': cpu_peak, 'mem_avg': mem_avg,
+                              'mem_available': mem_metrics is not None,
+                              'network_mbps': ((net_in['avg'] + net_out['avg']) / (1024*1024*metric_days) if net_in and net_out else 0),
+                              'current_monthly_cost': current_price * 730, 'new_monthly_cost': new_price * 730,
+                              'monthly_savings': savings, 'savings_pct': (savings / (current_price * 730)) * 100,
+                              'environment': tags.get('Environment', 'unknown'),
+                              'protected': 'YES' if is_protected(tags) else 'NO',
+                              'reason': f"Underutilized: CPU {cpu_avg:.1f}% avg" + (f" (peak {cpu_peak:.1f}%)" if cpu_peak else "") + (" [memory data unavailable]" if not mem_metrics else ""),
+                              'spot_candidate': False
+                          }
+
+              if include_spot and not rec and cpu_avg is not None and cpu_avg < 60 and current_price:
+                  spot_eligible = tags.get('SpotEligible', '').lower() in ['true', 'yes', '1']
+                  fault_tolerant = tags.get('FaultTolerant', '').lower() in ['true', 'yes', '1']
+                  if spot_eligible or fault_tolerant:
+                      # Azure Spot VM discounts vary (up to ~90%); using a
+                      # conservative ~70% estimate, matching the AWS script's
+                      # own conservative assumption for EC2 Spot.
+                      spot_savings = (current_price * 730) * 0.70
+                      rec = {
+                          'region': region, 'instance_id': vm.name, 'name': tags.get('Name', vm.name),
+                          'current_type': vm_size, 'recommended_type': f"spot-{vm_size}",
+                          'action': 'MIGRATE_TO_SPOT', 'confidence': 'HIGH' if fault_tolerant else 'MEDIUM',
+                          'cpu_avg': cpu_avg, 'cpu_peak': cpu_peak, 'mem_avg': mem_avg,
+                          'mem_available': mem_metrics is not None,
+                          'network_mbps': ((net_in['avg'] + net_out['avg']) / (1024*1024*metric_days) if net_in and net_out else 0),
+                          'current_monthly_cost': current_price * 730, 'new_monthly_cost': (current_price * 730) * 0.30,
+                          'monthly_savings': spot_savings, 'savings_pct': 70,
+                          'environment': tags.get('Environment', 'unknown'),
+                          'protected': 'YES' if is_protected(tags) else 'NO',
+                          'reason': f"Fault-tolerant workload, CPU {cpu_avg:.1f}% avg - good Spot VM candidate",
+                          'spot_candidate': True
+                      }
+
+              if rec and rec['monthly_savings'] > 5:
+                  recommendations.append(rec)
+                  total_potential_savings += rec['monthly_savings']
+
+          output_file = f'rightsizing_azure_{region}.json'
+          with open(output_file, 'w') as f:
+              json.dump(recommendations, f, indent=2, default=str)
+
+          print(f"Analyzed {analyzed_count} running VMs (out of {instance_count} total)")
+          if missing_memory_count > 0:
+              print(f"  NOTE: {missing_memory_count}/{analyzed_count} VMs missing memory metrics (Azure Monitor Agent not installed)")
+
+          if not recommendations:
+              print(f"\nNo right-sizing opportunities found in {region}.")
+          else:
+              print(f"\nFOUND {len(recommendations)} RIGHT-SIZING OPPORTUNITIES:\n")
+              by_action = defaultdict(list)
+              for r in recommendations:
+                  by_action[r['action']].append(r)
+              for action, items in sorted(by_action.items()):
+                  print(f"\n{action.replace('_', ' ')} ({len(items)} VMs)")
+                  print("-" * 90)
+                  table_data = []
+                  for r in items:
+                      table_data.append([
+                          r['instance_id'], str(r['name'])[:18], r['current_type'], r['recommended_type'],
+                          f"{r['cpu_avg']:.1f}%" if r['cpu_avg'] else 'N/A',
+                          f"{r['cpu_peak']:.1f}%" if r['cpu_peak'] else 'N/A',
+                          f"${r['monthly_savings']:.0f}", f"{r['savings_pct']:.0f}%",
+                          r['confidence'], r['protected']
+                      ])
+                  print(tabulate(table_data, headers=['VM ID', 'Name', 'Current', 'Recommended', 'CPU Avg', 'CPU Peak', 'Save $', 'Save %', 'Conf', 'Protected'], tablefmt='grid'))
+              print(f"\nTOTAL POTENTIAL MONTHLY SAVINGS: ${total_potential_savings:.2f}")
+          print(f"{'='*90}\n")
+
+          with open(os.environ.get('GITHUB_OUTPUT', '/dev/null'), 'a') as gh_out:
+              gh_out.write(f"recommendations_count_{region}={len(recommendations)}\n")
+              gh_out.write(f"savings_{region}={total_potential_savings:.2f}\n")
+          PYEOF
+
+      - name: Upload Recommendations
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: rightsizing-azure-${{ matrix.region }}
+          path: rightsizing_azure_*.json
+
+  consolidate-rightsizing:
+    needs: [analyze-rightsizing, analyze-rightsizing-azure]
+    if: always() && (needs.analyze-rightsizing.result == 'success' || needs.analyze-rightsizing.result == 'skipped') && (needs.analyze-rightsizing-azure.result == 'success' || needs.analyze-rightsizing-azure.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@65a9edc5881444af0b9093a5e228f63cb0f8e1e2
+        with:
+          path: artifacts
+          pattern: rightsizing-*
+
+      - name: Consolidate & Report
+        run: |
+          set -euo pipefail
+          python << 'PYEOF'
+          import json
+          import glob
+          import os
+          from datetime import datetime
+          from tabulate import tabulate
+          from collections import defaultdict
+
+          all_recs = []
+          for file in glob.glob('artifacts/**/rightsizing_*.json', recursive=True):
+              with open(file) as f:
+                  recs = json.load(f)
+                  all_recs.extend(recs)
+
+          if not all_recs:
+              print("\nNo right-sizing opportunities found across all regions!")
+              print("All instances are adequately sized.")
+              with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/null'), 'a') as summary:
+                  summary.write("## :white_check_mark: Right-Sizing Recommendations Report\n\n")
+                  summary.write("No right-sizing opportunities found across all regions.\n")
+              exit(0)
+
+          print(f"\n{'='*100}")
+          print(f"GLOBAL RIGHT-SIZING RECOMMENDATIONS REPORT")
+          print(f"{'='*100}")
+          print(f"Total recommendations: {len(all_recs)}")
+
+          by_region = defaultdict(list)
+          for r in all_recs:
+              by_region[r['region']].append(r)
+          region_summary = []
+          for region, items in sorted(by_region.items()):
+              applicable = [i for i in items if i['protected'] == 'NO']
+              region_summary.append([region, len(items), len(applicable), f"${sum(i['monthly_savings'] for i in applicable):.2f}"])
+          print("\nBy Region:")
+          print(tabulate(region_summary, headers=['Region', 'Total', 'Applicable', 'Savings'], tablefmt='grid'))
+
+          by_action = defaultdict(list)
+          for r in all_recs:
+              by_action[r['action']].append(r)
+          action_summary = []
+          for action, items in sorted(by_action.items()):
+              applicable = [i for i in items if i['protected'] == 'NO']
+              action_summary.append([
+                  action.replace('_', ' '), len(items), len(applicable),
+                  f"${sum(i['monthly_savings'] for i in applicable):.2f}",
+                  f"{sum(i['savings_pct'] for i in applicable) / max(len(applicable), 1):.0f}%"
+              ])
+          print("\nBy Action Type:")
+          print(tabulate(action_summary, headers=['Action', 'Total', 'Applicable', 'Savings', 'Avg Savings %'], tablefmt='grid'))
+
+          print("\nTOP 15 SAVINGS OPPORTUNITIES (Applicable):")
+          top15 = sorted([r for r in all_recs if r['protected'] == 'NO'], key=lambda x: x['monthly_savings'], reverse=True)[:15]
+          top_data = []
+          for i, r in enumerate(top15):
+              top_data.append([i+1, r['instance_id'], r['name'][:18], r['region'], r['current_type'], r['recommended_type'],
+                              f"${r['monthly_savings']:.0f}", f"{r['savings_pct']:.0f}%", r['confidence']])
+          print(tabulate(top_data, headers=['#', 'Instance ID', 'Name', 'Region', 'Current', 'New', 'Save $', 'Save %', 'Conf'], tablefmt='grid'))
+
+          total_all = sum(r['monthly_savings'] for r in all_recs)
+          total_applicable = sum(r['monthly_savings'] for r in all_recs if r['protected'] == 'NO')
+          print(f"\n{'='*100}")
+          print(f"TOTAL POTENTIAL MONTHLY SAVINGS: ${total_all:.2f}")
+          print(f"APPLICABLE (unprotected):        ${total_applicable:.2f}")
+          print(f"PROTECTED (manual review):      ${total_all - total_applicable:.2f}")
+          print(f"NOTE: These are RECOMMENDATIONS only. NO changes have been made.")
+          print(f"      Memory metrics require CloudWatch Agent installation.")
+          print(f"{'='*100}\n")
+
+          # Write GitHub Step Summary for Actions UI
+          with open(os.environ.get('GITHUB_STEP_SUMMARY', '/dev/null'), 'a') as summary:
+              summary.write("## :chart_with_upwards_trend: Right-Sizing Recommendations Report\n\n")
+              summary.write(f"**Total recommendations:** {len(all_recs)}\n\n")
+              summary.write("| Region | Total | Applicable | Savings |\n")
+              summary.write("|--------|-------|------------|---------|\n")
+              for region, items in sorted(by_region.items()):
+                  applicable = [i for i in items if i['protected'] == 'NO']
+                  summary.write(f"| {region} | {len(items)} | {len(applicable)} | ${sum(i['monthly_savings'] for i in applicable):.2f} |\n")
+              summary.write("\n")
+              summary.write("| Action | Total | Applicable | Savings |\n")
+              summary.write("|--------|-------|------------|---------|\n")
+              for action, items in sorted(by_action.items()):
+                  applicable = [i for i in items if i['protected'] == 'NO']
+                  summary.write(f"| {action.replace('_', ' ')} | {len(items)} | {len(applicable)} | ${sum(i['monthly_savings'] for i in applicable):.2f} |\n")
+              summary.write("\n")
+              summary.write(f"**Total potential monthly savings:** ${total_all:.2f}\n")
+              summary.write(f"**Applicable (unprotected):** ${total_applicable:.2f}\n")
+              summary.write(f"**Protected (manual review):** ${total_all - total_applicable:.2f}\n")
+              summary.write("\n> :information_source: Memory metrics require CloudWatch Agent installation.\n")
+
+          with open('consolidated_rightsizing_report.json', 'w') as f:
+              json.dump({
+                  'scan_date': datetime.utcnow().isoformat(),
+                  'total_recommendations': len(all_recs),
+                  'total_monthly_savings': total_all,
+                  'applicable_savings': total_applicable,
+                  'recommendations': all_recs
+              }, f, indent=2, default=str)
+          PYEOF
+
+      - name: Upload Consolidated Report
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: consolidated-rightsizing-report
+          path: consolidated_rightsizing_report.json
