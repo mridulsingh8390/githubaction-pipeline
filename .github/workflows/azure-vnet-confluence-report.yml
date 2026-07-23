@@ -5,8 +5,6 @@ name: Azure VNet Report to Confluence
 # both the automation logic and its schedule - no separate .py file to
 # keep in sync in the repo.
 on:
-  schedule:
-    - cron: "0 3 * * *"  # 03:00 UTC daily - adjust to your preferred off-peak hour
   workflow_dispatch: {}
 
 permissions:
