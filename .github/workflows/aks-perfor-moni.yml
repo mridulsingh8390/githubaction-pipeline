@@ -1,7 +1,6 @@
 name: AKS Performance Monitoring
 
 on:
-  
   workflow_dispatch:
     inputs:
       cluster:
