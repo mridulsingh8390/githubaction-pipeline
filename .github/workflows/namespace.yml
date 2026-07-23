@@ -2,8 +2,6 @@ name: Cluster details from repo
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 2 * * *"
 jobs:
   cluster-details:
     runs-on:
